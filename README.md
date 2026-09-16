@@ -32,7 +32,11 @@ Server chạy tại `http://localhost:8080`.
 Ví dụ tạo tin nhắn:
 
 ```bash
-curl -X POST http://localhost:8080/messages -H "Content-Type: application/json" -d '{"sender":"alice","receiver":"bob","content":"hello"}'
+curl.exe -X POST http://localhost:8080/messages -H "Content-Type: application/json" -d "{\"sender\":\"alice\",\"receiver\":\"bob\",\"content\":\"hello\"}"
+
+curl.exe http://localhost:8080/messages
+
+curl.exe http://localhost:8080/health
 ```
 
 ## Chạy test

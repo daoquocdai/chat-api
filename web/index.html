@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chat API Demo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>Chat API Demo</h1>
+      <p>Chọn người dùng để giả lập danh tính trong từng tab.</p>
+    </header>
+
+    <section class="card create-user">
+      <h2>Tạo người dùng</h2>
+      <form id="user-form">
+        <label for="username">Username</label>
+        <div class="row">
+          <input id="username" name="username" autocomplete="off" required>
+          <button type="submit">Tạo</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card identity">
+      <div>
+        <label for="current-user">Tôi là</label>
+        <select id="current-user"></select>
+      </div>
+      <div>
+        <label for="peer-user">Nhắn cho</label>
+        <select id="peer-user"></select>
+      </div>
+    </section>
+
+    <p id="error" class="error" role="alert" hidden></p>
+
+    <section class="card chat">
+      <div id="history" class="history" aria-live="polite">
+        <p class="empty">Hãy chọn hai người dùng để bắt đầu.</p>
+      </div>
+
+      <form id="message-form" class="message-form">
+        <label for="content">Tin nhắn</label>
+        <div class="row">
+          <input id="content" name="content" autocomplete="off" required disabled>
+          <button id="send-button" type="submit" disabled>Gửi</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

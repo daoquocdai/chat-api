@@ -18,6 +18,8 @@ type Repository interface {
 		ctx context.Context,
 		externalID string,
 	) (model.User, error)
+
+	List(ctx context.Context) ([]model.User, error)
 }
 
 type Service struct {
@@ -54,4 +56,8 @@ func (s *Service) GetByExternalID(
 	}
 
 	return s.repository.GetByExternalID(ctx, externalID)
+}
+
+func (s *Service) List(ctx context.Context) ([]model.User, error) {
+	return s.repository.List(ctx)
 }

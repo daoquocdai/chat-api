@@ -63,6 +63,20 @@ func (r *PostgresRepository) GetByExternalID(
 	return toModel(user), nil
 }
 
+func (r *PostgresRepository) List(ctx context.Context) ([]model.User, error) {
+	users, err := r.queries.ListUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]model.User, len(users))
+	for i, user := range users {
+		result[i] = toModel(user)
+	}
+
+	return result, nil
+}
+
 func toModel(user sqlc.User) model.User {
 	return model.User{
 		ID:         user.ID,

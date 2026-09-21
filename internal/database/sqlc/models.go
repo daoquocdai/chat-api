@@ -8,6 +8,15 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type Message struct {
+	ID         int64
+	ExternalID pgtype.UUID
+	SenderID   int64
+	ReceiverID int64
+	Content    string
+	CreatedAt  pgtype.Timestamptz
+}
+
 type User struct {
 	ID         int64
 	ExternalID pgtype.UUID

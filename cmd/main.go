@@ -7,9 +7,12 @@ import (
 
 	"github.com/daoquocdai/chat-api/config"
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
-	"github.com/daoquocdai/chat-api/internal/module/user/handler"
-	"github.com/daoquocdai/chat-api/internal/module/user/repository"
-	"github.com/daoquocdai/chat-api/internal/module/user/service"
+	messagehandler "github.com/daoquocdai/chat-api/internal/module/message/handler"
+	messagerepository "github.com/daoquocdai/chat-api/internal/module/message/repository"
+	messageservice "github.com/daoquocdai/chat-api/internal/module/message/service"
+	userhandler "github.com/daoquocdai/chat-api/internal/module/user/handler"
+	userrepository "github.com/daoquocdai/chat-api/internal/module/user/repository"
+	userservice "github.com/daoquocdai/chat-api/internal/module/user/service"
 	"github.com/daoquocdai/chat-api/internal/route"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -40,11 +43,15 @@ func run() error {
 
 	queries := sqlc.New(pool)
 
-	userRepository := repository.New(queries)
-	userService := service.New(userRepository)
-	userHandler := handler.New(userService)
+	userRepository := userrepository.New(queries)
+	userService := userservice.New(userRepository)
+	userHandler := userhandler.New(userService)
 
-	router := route.New(userHandler)
+	messageRepository := messagerepository.New(queries)
+	messageService := messageservice.New(messageRepository, userService)
+	messageHandler := messagehandler.New(messageService)
+
+	router := route.New(userHandler, messageHandler)
 
 	log.Printf("starting HTTP server on %s", cfg.HTTPAddress)
 	return router.Run(cfg.HTTPAddress)

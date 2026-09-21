@@ -14,6 +14,11 @@ import (
 type fakeRepository struct {
 	create func(context.Context, string) (model.User, error)
 	get    func(context.Context, string) (model.User, error)
+	list   func(context.Context) ([]model.User, error)
+}
+
+func (r *fakeRepository) List(ctx context.Context) ([]model.User, error) {
+	return r.list(ctx)
 }
 
 func (r *fakeRepository) Create(
@@ -265,5 +270,36 @@ func TestGetByExternalID(t *testing.T) {
 				t.Fatalf("user = %+v, want %+v", got, savedUser)
 			}
 		})
+	}
+}
+
+func TestList(t *testing.T) {
+	ctx := context.Background()
+	want := []model.User{
+		{ID: 1, ExternalID: "11111111-1111-1111-1111-111111111111", Username: "alice"},
+		{ID: 2, ExternalID: "22222222-2222-2222-2222-222222222222", Username: "bob"},
+	}
+
+	repo := &fakeRepository{
+		list: func(gotCtx context.Context) ([]model.User, error) {
+			if gotCtx != ctx {
+				t.Fatal("context was not passed to repository")
+			}
+			return want, nil
+		},
+	}
+
+	svc := service.New(repo)
+	got, err := svc.List(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("users length = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("user %d = %+v, want %+v", i, got[i], want[i])
+		}
 	}
 }

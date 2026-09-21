@@ -14,11 +14,27 @@ import (
 	"github.com/daoquocdai/chat-api/internal/module/user/handler"
 	"github.com/daoquocdai/chat-api/internal/module/user/model"
 	"github.com/daoquocdai/chat-api/internal/route"
+	"github.com/gin-gonic/gin"
 )
 
 type fakeService struct {
 	create func(context.Context, string) (model.User, error)
 	get    func(context.Context, string) (model.User, error)
+	list   func(context.Context) ([]model.User, error)
+}
+
+func (s *fakeService) List(ctx context.Context) ([]model.User, error) {
+	return s.list(ctx)
+}
+
+type unusedMessageHandler struct{}
+
+func (h *unusedMessageHandler) Create(c *gin.Context) {
+	panic("unexpected message create call")
+}
+
+func (h *unusedMessageHandler) ListBetween(c *gin.Context) {
+	panic("unexpected message list call")
 }
 
 func (s *fakeService) Create(
@@ -55,6 +71,7 @@ func TestUserHandler(t *testing.T) {
 		wantError  string
 		wantCall   string
 		wantArg    string
+		wantList   bool
 	}{
 		{
 			name:       "create user",
@@ -105,6 +122,14 @@ func TestUserHandler(t *testing.T) {
 			wantError:  "internal server error",
 			wantCall:   "create",
 			wantArg:    "alice",
+		},
+		{
+			name:       "list users",
+			method:     http.MethodGet,
+			path:       "/users",
+			wantStatus: http.StatusOK,
+			wantCall:   "list",
+			wantList:   true,
 		},
 		{
 			name:       "get user",
@@ -189,10 +214,20 @@ func TestUserHandler(t *testing.T) {
 				) (model.User, error) {
 					return checkCall("get", externalID)
 				},
+				list: func(ctx context.Context) ([]model.User, error) {
+					calls++
+					if tt.wantCall != "list" {
+						t.Fatalf("service method = %q, want %q", "list", tt.wantCall)
+					}
+					if tt.serviceErr != nil {
+						return nil, tt.serviceErr
+					}
+					return []model.User{user}, nil
+				},
 			}
 
 			userHandler := handler.New(svc)
-			router := route.New(userHandler)
+			router := route.New(userHandler, &unusedMessageHandler{})
 
 			request := httptest.NewRequest(
 				tt.method,
@@ -244,6 +279,20 @@ func TestUserHandler(t *testing.T) {
 					)
 				}
 
+				return
+			}
+
+			if tt.wantList {
+				var body []dto.UserSummaryResponse
+				if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+					t.Fatalf("decode user list response: %v", err)
+				}
+				if len(body) != 1 {
+					t.Fatalf("users length = %d, want 1", len(body))
+				}
+				if body[0].ID != user.ExternalID || body[0].Username != user.Username {
+					t.Fatalf("user summary = %+v", body[0])
+				}
 				return
 			}
 

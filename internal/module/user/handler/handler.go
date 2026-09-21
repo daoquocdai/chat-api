@@ -21,6 +21,8 @@ type UserService interface {
 		ctx context.Context,
 		externalID string,
 	) (model.User, error)
+
+	List(ctx context.Context) ([]model.User, error)
 }
 
 type Handler struct {
@@ -68,6 +70,16 @@ func (h *Handler) GetByExternalID(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, dto.ToUserResponse(user))
+}
+
+func (h *Handler) List(c *gin.Context) {
+	users, err := h.service.List(c.Request.Context())
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, dto.ToUserSummaryResponses(users))
 }
 
 func writeError(c *gin.Context, err error) {

@@ -69,6 +69,11 @@ func TestCreate(t *testing.T) {
 			wantError: model.ErrInvalidUsername,
 		},
 		{
+			name:      "username containing NUL",
+			username:  "ali\x00ce",
+			wantError: model.ErrInvalidUsername,
+		},
+		{
 			name:         "duplicate username",
 			username:     "alice",
 			wantUsername: "alice",

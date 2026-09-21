@@ -38,7 +38,7 @@ func (s *Service) Create(
 	username = strings.ToLower(username)
 
 	length := utf8.RuneCountInString(username)
-	if length == 0 || length > 50 {
+	if length == 0 || length > 50 || strings.ContainsRune(username, '\x00') {
 		return model.User{}, model.ErrInvalidUsername
 	}
 

@@ -1,0 +1,2 @@
+http_address: ":8080"
+database_url: "postgres://chat:chat@localhost:5432/chat_api?sslmode=disable"

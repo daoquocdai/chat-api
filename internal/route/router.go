@@ -1,28 +1,29 @@
 package route
 
 import (
-	"encoding/json"
 	"net/http"
 
-	messagehandler "github.com/daoquocdai/chat-api/internal/module/message/handler"
+	"github.com/daoquocdai/chat-api/internal/module/message/handler"
+	"github.com/gin-gonic/gin"
 )
 
-func New(messageHandler *messagehandler.Handler) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/messages", messageHandler.Messages)
-	return mux
+func New(messageHandler *handler.Handler) *gin.Engine {
+	router := gin.Default()
+	if err := router.SetTrustedProxies(nil); err != nil {
+		panic(err)
+	}
+	router.HandleMethodNotAllowed = true
+	router.NoMethod(noMethodHandler)
+	router.GET("/health", healthHandler)
+	router.GET("/messages", messageHandler.List)
+	router.POST("/messages", messageHandler.Create)
+	return router
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func noMethodHandler(c *gin.Context) {
+	c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method not allowed"})
+}
 
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+func healthHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }

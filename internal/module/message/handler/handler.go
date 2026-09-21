@@ -2,11 +2,11 @@ package handler
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
 	"github.com/daoquocdai/chat-api/internal/module/message"
 	"github.com/daoquocdai/chat-api/internal/module/message/dto"
+	"github.com/gin-gonic/gin"
 )
 
 type MessageService interface {
@@ -22,44 +22,27 @@ func New(messageService MessageService) *Handler {
 	return &Handler{service: messageService}
 }
 
-func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		messages := h.service.List()
-		writeJSON(w, http.StatusOK, dto.ToMessageResponses(messages))
-
-	case http.MethodPost:
-		var request dto.CreateMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
-			return
-		}
-
-		message, err := h.service.Create(
-			request.Sender,
-			request.Receiver,
-			request.Content,
-		)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, dto.ToMessageResponse(message))
-
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+func (h *Handler) Create(c *gin.Context) {
+	var request dto.CreateMessageRequest
+	if err := json.NewDecoder(c.Request.Body).Decode(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
+		return
 	}
+
+	message, err := h.service.Create(
+		request.Sender,
+		request.Receiver,
+		request.Content,
+	)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, dto.ToMessageResponse(message))
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
-		log.Printf("encode JSON: %v", err)
-	}
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+func (h *Handler) List(c *gin.Context) {
+	messages := h.service.List()
+	c.JSON(http.StatusOK, dto.ToMessageResponses(messages))
 }

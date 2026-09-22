@@ -10,25 +10,12 @@ import (
 )
 
 type Repository interface {
-	Create(
-		ctx context.Context,
-		senderID int64,
-		receiverID int64,
-		content string,
-	) (model.Message, error)
-
-	ListBetween(
-		ctx context.Context,
-		userOneID int64,
-		userTwoID int64,
-	) ([]model.Message, error)
+	Create(ctx context.Context, senderID, receiverID int64, content string) (model.Message, error)
+	ListBetween(ctx context.Context, userOneID, userTwoID int64) ([]model.Message, error)
 }
 
 type UserFinder interface {
-	GetByExternalID(
-		ctx context.Context,
-		externalID string,
-	) (usermodel.User, error)
+	GetByExternalID(ctx context.Context, externalID string) (usermodel.User, error)
 }
 
 type Service struct {
@@ -37,10 +24,7 @@ type Service struct {
 }
 
 func New(repository Repository, users UserFinder) *Service {
-	return &Service{
-		repository: repository,
-		users:      users,
-	}
+	return &Service{repository: repository, users: users}
 }
 
 func (s *Service) Create(
@@ -49,28 +33,17 @@ func (s *Service) Create(
 	receiverExternalID string,
 	content string,
 ) (model.Message, error) {
-	senderExternalID = strings.TrimSpace(senderExternalID)
-	receiverExternalID = strings.TrimSpace(receiverExternalID)
+	senderExternalID, receiverExternalID, err := normalizeUserIDs(senderExternalID, receiverExternalID)
+	if err != nil {
+		return model.Message{}, err
+	}
+
 	content = strings.TrimSpace(content)
-
-	if senderExternalID == "" || receiverExternalID == "" {
-		return model.Message{}, model.ErrUserIDsRequired
-	}
-
-	if senderExternalID == receiverExternalID {
-		return model.Message{}, model.ErrSameUser
-	}
-
-	length := utf8.RuneCountInString(content)
-	if length == 0 || length > 1000 {
+	if length := utf8.RuneCountInString(content); length == 0 || length > 1000 {
 		return model.Message{}, model.ErrInvalidContent
 	}
 
-	sender, receiver, err := s.findUsers(
-		ctx,
-		senderExternalID,
-		receiverExternalID,
-	)
+	sender, receiver, err := s.findUsers(ctx, senderExternalID, receiverExternalID)
 	if err != nil {
 		return model.Message{}, err
 	}
@@ -83,15 +56,9 @@ func (s *Service) ListBetween(
 	userExternalID string,
 	peerExternalID string,
 ) ([]model.Message, error) {
-	userExternalID = strings.TrimSpace(userExternalID)
-	peerExternalID = strings.TrimSpace(peerExternalID)
-
-	if userExternalID == "" || peerExternalID == "" {
-		return nil, model.ErrUserIDsRequired
-	}
-
-	if userExternalID == peerExternalID {
-		return nil, model.ErrSameUser
+	userExternalID, peerExternalID, err := normalizeUserIDs(userExternalID, peerExternalID)
+	if err != nil {
+		return nil, err
 	}
 
 	user, peer, err := s.findUsers(ctx, userExternalID, peerExternalID)
@@ -102,10 +69,23 @@ func (s *Service) ListBetween(
 	return s.repository.ListBetween(ctx, user.ID, peer.ID)
 }
 
+func normalizeUserIDs(first, second string) (string, string, error) {
+	first = strings.TrimSpace(first)
+	second = strings.TrimSpace(second)
+
+	if first == "" || second == "" {
+		return "", "", model.ErrUserIDsRequired
+	}
+	if first == second {
+		return "", "", model.ErrSameUser
+	}
+
+	return first, second, nil
+}
+
 func (s *Service) findUsers(
 	ctx context.Context,
-	firstExternalID string,
-	secondExternalID string,
+	firstExternalID, secondExternalID string,
 ) (usermodel.User, usermodel.User, error) {
 	first, err := s.users.GetByExternalID(ctx, firstExternalID)
 	if err != nil {

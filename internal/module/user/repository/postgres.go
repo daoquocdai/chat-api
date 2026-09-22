@@ -16,15 +16,10 @@ type PostgresRepository struct {
 }
 
 func New(queries *sqlc.Queries) *PostgresRepository {
-	return &PostgresRepository{
-		queries: queries,
-	}
+	return &PostgresRepository{queries: queries}
 }
 
-func (r *PostgresRepository) Create(
-	ctx context.Context,
-	username string,
-) (model.User, error) {
+func (r *PostgresRepository) Create(ctx context.Context, username string) (model.User, error) {
 	user, err := r.queries.CreateUser(ctx, username)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -41,10 +36,7 @@ func (r *PostgresRepository) Create(
 	return toModel(user), nil
 }
 
-func (r *PostgresRepository) GetByExternalID(
-	ctx context.Context,
-	externalID string,
-) (model.User, error) {
+func (r *PostgresRepository) GetByExternalID(ctx context.Context, externalID string) (model.User, error) {
 	var id pgtype.UUID
 
 	if err := id.Scan(externalID); err != nil {

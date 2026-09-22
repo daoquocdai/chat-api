@@ -18,8 +18,7 @@ func New(queries *sqlc.Queries) *PostgresRepository {
 
 func (r *PostgresRepository) Create(
 	ctx context.Context,
-	senderID int64,
-	receiverID int64,
+	senderID, receiverID int64,
 	content string,
 ) (model.Message, error) {
 	message, err := r.queries.CreateMessage(ctx, sqlc.CreateMessageParams{
@@ -43,8 +42,7 @@ func (r *PostgresRepository) Create(
 
 func (r *PostgresRepository) ListBetween(
 	ctx context.Context,
-	userOneID int64,
-	userTwoID int64,
+	userOneID, userTwoID int64,
 ) ([]model.Message, error) {
 	messages, err := r.queries.ListMessagesBetween(
 		ctx,

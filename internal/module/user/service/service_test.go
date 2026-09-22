@@ -10,7 +10,6 @@ import (
 	"github.com/daoquocdai/chat-api/internal/module/user/service"
 )
 
-// Repository giả: mỗi bài kiểm thử tự quyết định kết quả trả về.
 type fakeRepository struct {
 	create func(context.Context, string) (model.User, error)
 	get    func(context.Context, string) (model.User, error)
@@ -21,17 +20,11 @@ func (r *fakeRepository) List(ctx context.Context) ([]model.User, error) {
 	return r.list(ctx)
 }
 
-func (r *fakeRepository) Create(
-	ctx context.Context,
-	username string,
-) (model.User, error) {
+func (r *fakeRepository) Create(ctx context.Context, username string) (model.User, error) {
 	return r.create(ctx, username)
 }
 
-func (r *fakeRepository) GetByExternalID(
-	ctx context.Context,
-	externalID string,
-) (model.User, error) {
+func (r *fakeRepository) GetByExternalID(ctx context.Context, externalID string) (model.User, error) {
 	return r.get(ctx, externalID)
 }
 

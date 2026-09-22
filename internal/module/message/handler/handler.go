@@ -13,18 +13,8 @@ import (
 )
 
 type MessageService interface {
-	Create(
-		ctx context.Context,
-		senderExternalID string,
-		receiverExternalID string,
-		content string,
-	) (model.Message, error)
-
-	ListBetween(
-		ctx context.Context,
-		userExternalID string,
-		peerExternalID string,
-	) ([]model.Message, error)
+	Create(ctx context.Context, senderExternalID, receiverExternalID, content string) (model.Message, error)
+	ListBetween(ctx context.Context, userExternalID, peerExternalID string) ([]model.Message, error)
 }
 
 type Handler struct {

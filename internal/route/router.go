@@ -28,9 +28,7 @@ func New(userHandler UserHandler, messageHandler MessageHandler) *gin.Engine {
 	router.NoMethod(noMethodHandler)
 
 	router.GET("/health", healthHandler)
-	router.GET("/", func(c *gin.Context) {
-		c.File("web/index.html")
-	})
+	router.GET("/", indexHandler)
 	router.StaticFile("/app.js", "web/app.js")
 	router.StaticFile("/style.css", "web/style.css")
 
@@ -43,14 +41,14 @@ func New(userHandler UserHandler, messageHandler MessageHandler) *gin.Engine {
 	return router
 }
 
+func indexHandler(c *gin.Context) {
+	c.File("web/index.html")
+}
+
 func healthHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"status": "ok",
-	})
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func noMethodHandler(c *gin.Context) {
-	c.JSON(http.StatusMethodNotAllowed, gin.H{
-		"error": "method not allowed",
-	})
+	c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "method not allowed"})
 }

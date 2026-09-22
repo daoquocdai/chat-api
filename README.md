@@ -1,57 +1,47 @@
 # Chat API
 
-Chat API là HTTP server viết bằng Go, dùng Gin để định tuyến và PostgreSQL để lưu dữ liệu của module user. Docker Compose khởi tạo cả PostgreSQL và Redis; ở phiên bản hiện tại, ứng dụng chưa kết nối Redis và chưa phát sự kiện qua Redis.
+Chat API là bản demo nhắn tin 1–1 viết bằng Go, Gin và PostgreSQL. Giao diện dùng HTML/CSS/JavaScript thuần, được Gin phục vụ cùng origin với API nên không cần npm hoặc bước build frontend.
 
-## Trạng thái hiện tại
+Docker Compose khởi tạo PostgreSQL và Redis. Phiên bản hiện tại lưu user và message trong PostgreSQL; Redis chưa được ứng dụng sử dụng.
 
-API đang có:
+## Chức năng hiện có
 
 | Method | Path | Chức năng |
 | --- | --- | --- |
-| `GET` | `/health` | Kiểm tra server đang hoạt động |
-| `POST` | `/users` | Tạo người dùng |
-| `GET` | `/users/:id` | Lấy người dùng theo `external_id` |
+| `GET` | `/health` | Kiểm tra server |
+| `POST` | `/users` | Tạo user |
+| `GET` | `/users` | Lấy danh sách user công khai |
+| `GET` | `/users/:id` | Lấy user theo `external_id` |
+| `POST` | `/messages` | Gửi tin nhắn |
+| `GET` | `/messages?user_id=...&peer_id=...` | Lấy lịch sử giữa hai user |
+| `GET` | `/` | Mở giao diện demo |
 
-Trường `id` trong JSON response là `external_id` dạng UUID dùng bên ngoài API, không phải cột số tự tăng `users.id` trong PostgreSQL. Dự án chưa có đăng nhập/JWT và chưa có giao tiếp realtime (WebSocket hoặc cơ chế tương tự).
-
-Luồng chi tiết của `POST /users` được ghi tại [docs/request-flow.md](docs/request-flow.md).
+Các trường `id`, `sender_id` và `receiver_id` qua API đều là `external_id` dạng UUID. ID số tự tăng chỉ dùng nội bộ trong PostgreSQL.
 
 ## Chạy từ bản clone mới
 
-### Công cụ cần có
-
-- Go theo phiên bản ghi trong `go.mod`.
-- Docker Desktop hoặc Docker Engine có Docker Compose.
-- [Goose](https://github.com/pressly/goose) để chạy migration.
-- GNU Make nếu muốn dùng các tác vụ trong `Makefile`; Windows có thể dùng trực tiếp các lệnh ở phần dưới.
-- sqlc chỉ cần thiết khi sửa file query và cần sinh lại code, không cần để chạy bản code đã clone.
-
-Cài Goose và sqlc khi cần:
+Cần cài Go theo phiên bản trong `go.mod`, Docker có Docker Compose và [Goose](https://github.com/pressly/goose). GNU Make là tùy chọn.
 
 ```bash
 go install github.com/pressly/goose/v3/cmd/goose@latest
 go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
 ```
 
-Bảo đảm thư mục chứa Go binary (thường là `GOPATH/bin`) nằm trong `PATH`.
-
-### Chuẩn bị và chạy
-
-Sao chép config mẫu. Trên Windows CMD:
-
-```bat
-copy config\config.yml.example config\config.yml
-```
-
-Trên macOS/Linux:
+Sao chép config mẫu:
 
 ```bash
 cp config/config.yml.example config/config.yml
 ```
 
-Không thêm `config/config.yml` vào Git vì đây là config cục bộ và có thể chứa thông tin kết nối nhạy cảm; file này đã được khai báo trong `.gitignore`.
+Trên Windows CMD:
 
-Cài các Go module, khởi động dịch vụ Docker, chạy migration rồi chạy server:
+```bat
+copy config\config.yml.example config\config.yml
+```
+
+Không đưa `config/config.yml` vào Git. File này đã có trong `.gitignore` và có thể chứa thông tin kết nối cục bộ.
+
+Khởi động database, chạy migration và server:
 
 ```bash
 go mod download
@@ -60,7 +50,7 @@ make migrate
 make run
 ```
 
-Nếu Windows chưa có `make`, chạy các lệnh tương ứng trong CMD:
+Nếu Windows chưa có `make`, chạy trong CMD:
 
 ```bat
 go mod download
@@ -70,52 +60,27 @@ goose -dir db/migrations postgres "%DATABASE_URL%" up
 go run ./cmd
 ```
 
-Server mặc định chạy tại `http://localhost:8080`.
+Ứng dụng đọc `database_url` từ `config/config.yml`, còn Goose trong Makefile dùng `DATABASE_URL`. Hai giá trị phải trỏ đến cùng database.
 
-Ứng dụng đọc `database_url` từ `config/config.yml`. Tác vụ `make migrate` của Goose lại đọc biến môi trường `DATABASE_URL` (hoặc dùng giá trị mặc định trong `Makefile`). Hai giá trị này phải trỏ tới cùng một database.
+## Demo bằng hai tab
 
-Các tác vụ Makefile hiện có và lệnh trực tiếp tương ứng:
+1. Mở `http://localhost:8080` ở hai tab.
+2. Tạo hoặc chọn hai user khác nhau.
+3. Ở mỗi tab, chọn một user trong **Tôi là** và chọn user còn lại trong **Nhắn cho**.
+4. Gửi tin nhắn từ cả hai phía. Giao diện tự lấy lịch sử mỗi giây.
+5. Khởi động lại server và chọn lại hai user để thấy lịch sử vẫn còn trong PostgreSQL.
 
-| Tác vụ | Lệnh trực tiếp |
-| --- | --- |
-| `make run` | `go run ./cmd` |
-| `make test` | `go test ./...` |
-| `make build` | `go build ./...` |
-| `make up` | `docker compose up -d` |
-| `make migrate` | `goose -dir db/migrations postgres "%DATABASE_URL%" up` |
-| `make migrate-status` | `goose -dir db/migrations postgres "%DATABASE_URL%" status` |
-| `make sqlc` | `sqlc generate` |
-| `make migrate-create NAME=ten_migration` | `goose -dir db/migrations create ten_migration sql` |
+Việc chọn user chỉ giả lập danh tính cho demo local. Đây không phải đăng nhập hoặc kiểm soát truy cập: client tự gửi `user_id`/`sender_id`, nên không có bảo đảm riêng tư hay xác thực người gửi.
 
-## Thử API trên Windows CMD
+## Giới hạn hiện tại
 
-Kiểm tra server:
-
-```bat
-curl.exe http://localhost:8080/health
-```
-
-Tạo người dùng (đổi username nếu tên đã tồn tại):
-
-```bat
-curl.exe -X POST http://localhost:8080/users -H "Content-Type: application/json" -d "{\"username\":\"alice_readme\"}"
-```
-
-Sao chép giá trị `id` trong response để lấy lại người dùng:
-
-```bat
-curl.exe http://localhost:8080/users/THAY_UUID_VAO_DAY
-```
+- Dùng polling mỗi giây, chưa có WebSocket hoặc realtime push.
+- Mỗi lần chỉ lấy tối đa 100 tin nhắn gần nhất và chưa có phân trang.
+- Chưa có JWT, trạng thái đã đọc, nhóm hoặc E2EE.
+- Chưa có thread/conversation. Bước sau sẽ thêm module `thread` và migration chuyển message từ `sender_id`/`receiver_id` trực tiếp sang thread.
+- Redis đang chạy trong Docker Compose nhưng chưa được dùng để phát sự kiện.
 
 ## Kiểm tra code
-
-Chạy test:
-
-```bash
-make test
-```
-
-Hoặc chạy trực tiếp trên mọi hệ điều hành:
 
 ```bash
 go test ./...
@@ -123,4 +88,12 @@ go vet ./...
 go build ./...
 ```
 
-Các unit test của module user dùng đối tượng giả (fake) cho service hoặc repository. Chúng kiểm tra logic từng lớp nhanh và không cần PostgreSQL, nhưng không chứng minh migration, câu SQL, kết nối database hay toàn bộ luồng HTTP thật đang hoạt động cùng nhau. Muốn kiểm tra các phần đó cần chạy PostgreSQL, migration, server và gọi API thực tế.
+Các unit test dùng repository và user service giả để kiểm tra nghiệp vụ mà không cần PostgreSQL. Chúng không thay thế kiểm tra migration, SQL và luồng HTTP thật với database.
+
+Khi sửa SQL trong `db/queries`, sinh lại code bằng:
+
+```bash
+make sqlc
+```
+
+Không sửa trực tiếp các file trong `internal/database/sqlc` vì chúng do sqlc sinh.

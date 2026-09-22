@@ -7,3 +7,8 @@ RETURNING id, external_id, username, created_at;
 SELECT id, external_id, username, created_at
 FROM users
 WHERE external_id = $1;
+
+-- name: ListUsers :many
+SELECT id, external_id, username, created_at
+FROM users
+ORDER BY username, id;

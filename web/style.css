@@ -1,0 +1,145 @@
+:root {
+  color: #172033;
+  background: #eef2f7;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app {
+  width: min(760px, calc(100% - 32px));
+  margin: 32px auto;
+}
+
+header h1,
+.card h2 {
+  margin-top: 0;
+}
+
+.card {
+  margin-top: 16px;
+  padding: 18px;
+  border: 1px solid #d8deea;
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 8px 24px rgba(31, 48, 78, 0.06);
+}
+
+.identity {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+}
+
+input,
+select,
+button {
+  min-height: 42px;
+  border-radius: 8px;
+  font: inherit;
+}
+
+input,
+select {
+  width: 100%;
+  border: 1px solid #b8c1d1;
+  padding: 8px 10px;
+  background: #ffffff;
+}
+
+button {
+  border: 0;
+  padding: 8px 18px;
+  color: #ffffff;
+  background: #2563eb;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #9aa7ba;
+  cursor: not-allowed;
+}
+
+.error {
+  margin: 16px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: #991b1b;
+  background: #fee2e2;
+}
+
+.history {
+  display: flex;
+  min-height: 360px;
+  max-height: 55vh;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 12px;
+  border: 1px solid #d8deea;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.empty {
+  margin: auto;
+  color: #64748b;
+}
+
+.message {
+  max-width: 75%;
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.message p {
+  margin: 0 0 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message small {
+  opacity: 0.72;
+}
+
+.received {
+  align-self: flex-start;
+  background: #e2e8f0;
+}
+
+.sent {
+  align-self: flex-end;
+  color: #ffffff;
+  background: #2563eb;
+}
+
+.message-form {
+  margin-top: 14px;
+}
+
+@media (max-width: 560px) {
+  .identity {
+    grid-template-columns: 1fr;
+  }
+
+  .message {
+    max-width: 88%;
+  }
+}

@@ -1,38 +1,79 @@
-# Luồng request tạo người dùng
+# Luồng request trong Chat API
 
-Ghi chú này mô tả ngắn luồng `POST /users` để đọc hiểu code và tự trình bày lại với mentor.
+## Vai trò các tầng
+
+* **DTO**: định nghĩa JSON đầu vào và đầu ra.
+* **Handler**: đọc HTTP request, gọi service và trả response.
+* **Service**: chuẩn hóa dữ liệu và xử lý nghiệp vụ.
+* **Repository**: gọi sqlc và chuyển dữ liệu thành domain model.
+* **sqlc**: sinh Go code từ các câu SQL.
+* **PostgreSQL**: lưu user và message.
+
+## Luồng chung
 
 ```mermaid
-flowchart LR
-    C[HTTP client] -->|POST /users| R[Router]
-    R --> H[Handler + DTO]
+flowchart TD
+    C[Client] --> R[Gin router]
+    R --> H[Handler]
     H --> S[Service]
     S --> P[Repository]
     P --> Q[sqlc]
     Q --> DB[(PostgreSQL)]
-    DB --> Q --> P --> S --> H
-    H -->|JSON + HTTP status| C
+
+    DB --> Q
+    Q --> P
+    P --> S
+    S --> H
+    H -->|JSON và HTTP status| C
 ```
 
-## Chiều request đi vào
+Request đi theo chiều:
 
-1. **Router** (bộ định tuyến) trong `internal/route/router.go` ghép `POST /users` với hàm `Handler.Create`.
-2. **Handler** (lớp xử lý HTTP) dùng Gin đọc JSON vào `dto.CreateUserRequest`. JSON sai định dạng được trả ngay với HTTP `400`. Nếu đọc được, handler chuyển `username` và `context` sang service; handler không làm nghiệp vụ hoặc truy cập database.
-3. **Service** (lớp nghiệp vụ) chuẩn hóa username bằng cách bỏ khoảng trắng ở hai đầu với `TrimSpace`, rồi chuyển sang chữ thường. Sau đó service kiểm tra độ dài từ 1 đến 50 điểm mã Unicode và từ chối ký tự NUL. Dữ liệu không hợp lệ trả `model.ErrInvalidUsername` mà không gọi repository.
-4. **Repository** (lớp truy cập dữ liệu) gọi phương thức do sqlc sinh từ query `CreateUser`. Repository cũng chuyển lỗi unique constraint của PostgreSQL thành `model.ErrUsernameTaken`, để các lớp phía trên không cần biết chi tiết pgx/PostgreSQL.
-5. **sqlc** là công cụ sinh Go code có kiểu dữ liệu rõ ràng từ SQL. Câu `INSERT` chỉ truyền `username`; PostgreSQL tự sinh `id` số tăng, `external_id` dạng UUID và `created_at`.
+```text
+Client → Gin → handler → service → repository → sqlc → PostgreSQL
+```
 
-## Chiều kết quả đi ra
+Kết quả được trả ngược lại:
 
-PostgreSQL trả bản ghi mới qua sqlc cho repository. Repository chuyển `sqlc.User` thành `model.User`; bước này đổi UUID và thời gian từ kiểu của pgx sang kiểu model. Service trả kết quả cho handler. Cuối cùng, `dto.ToUserResponse` tạo JSON response và cố ý dùng `external_id` làm trường `id`; cột số tự tăng nội bộ không được đưa ra API. Khi thành công, client nhận HTTP `201 Created`.
+```text
+PostgreSQL → sqlc → repository → service → handler → client
+```
 
-## Ánh xạ lỗi sang HTTP
+## `POST /users`
 
-| Trường hợp | Lỗi model | HTTP |
-| --- | --- | --- |
-| JSON, username hoặc ID không hợp lệ | `ErrInvalidUsername` / `ErrInvalidUserID` | `400 Bad Request` |
-| Username đã tồn tại | `ErrUsernameTaken` | `409 Conflict` |
-| Không tìm thấy user theo `external_id` | `ErrUserNotFound` | `404 Not Found` |
-| Lỗi ngoài dự kiến, ví dụ mất kết nối database | lỗi khác | `500 Internal Server Error` |
+1. Gin chuyển request đến `user.Handler.Create`.
+2. Handler đọc `username` từ JSON bằng DTO.
+3. Service bỏ khoảng trắng, chuyển username thành chữ thường và kiểm tra dữ liệu.
+4. Repository gọi `CreateUser` do sqlc sinh.
+5. PostgreSQL tạo user và trả bản ghi về.
+6. Handler chuyển `model.User` thành JSON và trả `201 Created`.
 
-Handler chỉ trả thông báo chung cho lỗi `500` và ghi lỗi thật vào log, tránh làm lộ chi tiết nội bộ cho client.
+## `POST /messages`
+
+1. Handler đọc `sender_id`, `receiver_id` và `content` từ JSON.
+2. Message service kiểm tra hai user phải khác nhau và nội dung phải hợp lệ.
+3. Message service gọi user service để tìm sender và receiver theo UUID.
+4. User repository dùng sqlc lấy ID `bigint` nội bộ của hai user.
+5. Message repository gọi `CreateMessage` để lưu tin nhắn.
+6. Kết quả đi ngược qua sqlc → repository → service → handler.
+7. Handler chuyển `model.Message` thành JSON và trả `201 Created`.
+
+Message service dùng user service thay vì gọi thẳng user repository để giữ phụ thuộc đúng tầng và dùng lại logic tìm user.
+
+## `GET /messages`
+
+Ví dụ:
+
+```text
+GET /messages?user_id=<UUID>&peer_id=<UUID>
+```
+
+Handler lấy hai UUID từ query string. Service tìm hai user rồi gọi repository bằng ID nội bộ. sqlc lấy tối đa 100 tin nhắn gần nhất giữa hai người và trả theo thứ tự cũ đến mới. Handler trả danh sách JSON với HTTP `200 OK`.
+
+## Quy ước ID
+
+* ID `bigint` chỉ dùng nội bộ trong PostgreSQL.
+* `external_id` dạng UUID được dùng trong API.
+* Các trường `id`, `sender_id`, `receiver_id`, `user_id` và `peer_id` mà client sử dụng đều là UUID.
+
+Hiện tại ứng dụng chưa có đăng nhập, thread hoặc WebSocket. Giao diện chọn user thủ công và lấy tin nhắn mới bằng polling mỗi giây.

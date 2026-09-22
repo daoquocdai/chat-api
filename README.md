@@ -18,6 +18,8 @@ Docker Compose khởi tạo PostgreSQL và Redis. Phiên bản hiện tại lưu
 
 Các trường `id`, `sender_id` và `receiver_id` qua API đều là `external_id` dạng UUID. ID số tự tăng chỉ dùng nội bộ trong PostgreSQL.
 
+Xem [luồng xử lý request](docs/request-flow.md) để hiểu vai trò của router, DTO, handler, service, repository, sqlc và PostgreSQL.
+
 ## Chạy từ bản clone mới
 
 Cần cài Go theo phiên bản trong `go.mod`, Docker có Docker Compose và [Goose](https://github.com/pressly/goose). GNU Make là tùy chọn.
@@ -70,14 +72,13 @@ go run ./cmd
 4. Gửi tin nhắn từ cả hai phía. Giao diện tự lấy lịch sử mỗi giây.
 5. Khởi động lại server và chọn lại hai user để thấy lịch sử vẫn còn trong PostgreSQL.
 
-Việc chọn user chỉ giả lập danh tính cho demo local. Đây không phải đăng nhập hoặc kiểm soát truy cập: client tự gửi `user_id`/`sender_id`, nên không có bảo đảm riêng tư hay xác thực người gửi.
+Hiện chưa có đăng nhập hoặc JWT. Người dùng được chọn thủ công trên giao diện để giả lập danh tính cho demo local; client tự gửi `user_id`/`sender_id`, nên không có bảo đảm riêng tư hay xác thực người gửi.
 
 ## Giới hạn hiện tại
 
 - Dùng polling mỗi giây, chưa có WebSocket hoặc realtime push.
 - Mỗi lần chỉ lấy tối đa 100 tin nhắn gần nhất và chưa có phân trang.
-- Chưa có JWT, trạng thái đã đọc, nhóm hoặc E2EE.
-- Chưa có thread/conversation. Bước sau sẽ thêm module `thread` và migration chuyển message từ `sender_id`/`receiver_id` trực tiếp sang thread.
+- Chưa có thread/conversation, trạng thái đã đọc hoặc E2EE.
 - Redis đang chạy trong Docker Compose nhưng chưa được dùng để phát sự kiện.
 
 ## Kiểm tra code

@@ -3,13 +3,20 @@ package config
 import (
 	"errors"
 	"os"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
 
 type Config struct {
-	HTTPAddress string `yaml:"http_address"`
-	DatabaseURL string `yaml:"database_url"`
+	HTTPAddress string     `yaml:"http_address"`
+	DatabaseURL string     `yaml:"database_url"`
+	Auth        AuthConfig `yaml:"auth"`
+}
+
+type AuthConfig struct {
+	JWTSecret string        `yaml:"jwt_secret"`
+	JWTTTL    time.Duration `yaml:"jwt_ttl"`
 }
 
 func Load(path string) (Config, error) {
@@ -29,6 +36,14 @@ func Load(path string) (Config, error) {
 
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("database_url is required")
+	}
+	if cfg.Auth.JWTSecret != "" || cfg.Auth.JWTTTL != 0 {
+		if cfg.Auth.JWTSecret == "" {
+			return Config{}, errors.New("auth.jwt_secret is required when auth is configured")
+		}
+		if cfg.Auth.JWTTTL < time.Second {
+			return Config{}, errors.New("auth.jwt_ttl must be at least one second when auth is configured")
+		}
 	}
 
 	return cfg, nil

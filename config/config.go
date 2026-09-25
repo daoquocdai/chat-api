@@ -37,13 +37,11 @@ func Load(path string) (Config, error) {
 	if cfg.DatabaseURL == "" {
 		return Config{}, errors.New("database_url is required")
 	}
-	if cfg.Auth.JWTSecret != "" || cfg.Auth.JWTTTL != 0 {
-		if cfg.Auth.JWTSecret == "" {
-			return Config{}, errors.New("auth.jwt_secret is required when auth is configured")
-		}
-		if cfg.Auth.JWTTTL < time.Second {
-			return Config{}, errors.New("auth.jwt_ttl must be at least one second when auth is configured")
-		}
+	if cfg.Auth.JWTSecret == "" {
+		return Config{}, errors.New("auth.jwt_secret is required")
+	}
+	if cfg.Auth.JWTTTL < time.Second {
+		return Config{}, errors.New("auth.jwt_ttl must be at least one second")
 	}
 
 	return cfg, nil

@@ -7,17 +7,27 @@ import (
 )
 
 type UserHandler interface {
-	Create(c *gin.Context)
-	GetByExternalID(c *gin.Context)
+	Register(c *gin.Context)
+	Login(c *gin.Context)
+	List(c *gin.Context)
+}
+
+type ThreadHandler interface {
+	CreateOrGetDirect(c *gin.Context)
 	List(c *gin.Context)
 }
 
 type MessageHandler interface {
-	Create(c *gin.Context)
-	ListBetween(c *gin.Context)
+	Send(c *gin.Context)
+	List(c *gin.Context)
 }
 
-func New(userHandler UserHandler, messageHandler MessageHandler) *gin.Engine {
+func New(
+	userHandler UserHandler,
+	threadHandler ThreadHandler,
+	messageHandler MessageHandler,
+	authenticate gin.HandlerFunc,
+) *gin.Engine {
 	router := gin.Default()
 
 	if err := router.SetTrustedProxies(nil); err != nil {
@@ -31,12 +41,16 @@ func New(userHandler UserHandler, messageHandler MessageHandler) *gin.Engine {
 	router.GET("/", indexHandler)
 	router.StaticFile("/app.js", "web/app.js")
 	router.StaticFile("/style.css", "web/style.css")
+	router.POST("/auth/register", userHandler.Register)
+	router.POST("/auth/login", userHandler.Login)
 
-	router.POST("/users", userHandler.Create)
-	router.GET("/users", userHandler.List)
-	router.GET("/users/:id", userHandler.GetByExternalID)
-	router.POST("/messages", messageHandler.Create)
-	router.GET("/messages", messageHandler.ListBetween)
+	authenticated := router.Group("")
+	authenticated.Use(authenticate)
+	authenticated.GET("/users", userHandler.List)
+	authenticated.POST("/threads/direct", threadHandler.CreateOrGetDirect)
+	authenticated.GET("/threads", threadHandler.List)
+	authenticated.POST("/threads/:id/messages", messageHandler.Send)
+	authenticated.GET("/threads/:id/messages", messageHandler.List)
 
 	return router
 }

@@ -9,17 +9,61 @@ import (
 )
 
 type Message struct {
-	ID         int64
-	ExternalID pgtype.UUID
-	SenderID   int64
-	ReceiverID int64
-	Content    string
-	CreatedAt  pgtype.Timestamptz
+	ID            int64
+	ExternalID    pgtype.UUID
+	ThreadID      int64
+	SenderID      int64
+	Seq           int64
+	ClientMsgID   pgtype.UUID
+	Kind          string
+	ContentFormat string
+	Content       string
+	Metadata      []byte
+	CreatedAt     pgtype.Timestamptz
+}
+
+type Participant struct {
+	ID          int64
+	ThreadID    int64
+	UserID      int64
+	Role        string
+	JoinedSeq   int64
+	LeftSeq     pgtype.Int8
+	LastReadSeq int64
+	JoinedAt    pgtype.Timestamptz
+	LeftAt      pgtype.Timestamptz
+}
+
+type Prekey struct {
+	ID        int64
+	UserID    int64
+	KeyID     int64
+	Kind      string
+	PublicKey []byte
+	Signature []byte
+	CreatedAt pgtype.Timestamptz
+	RetiredAt pgtype.Timestamptz
+}
+
+type Thread struct {
+	ID               int64
+	ExternalID       pgtype.UUID
+	Kind             string
+	Name             pgtype.Text
+	CreatedBy        int64
+	DirectUserLowID  pgtype.Int8
+	DirectUserHighID pgtype.Int8
+	EncryptionMode   string
+	LastSeq          int64
+	CreatedAt        pgtype.Timestamptz
 }
 
 type User struct {
-	ID         int64
-	ExternalID pgtype.UUID
-	Username   string
-	CreatedAt  pgtype.Timestamptz
+	ID                int64
+	ExternalID        pgtype.UUID
+	Username          string
+	CreatedAt         pgtype.Timestamptz
+	PasswordHash      string
+	IdentityPublicKey []byte
+	LastPrekeyID      int64
 }

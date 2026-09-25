@@ -1,0 +1,145 @@
+### Mini-Hermes direct-chat demo
+### Run from top to bottom in JetBrains HTTP Client or VS Code REST Client.
+### Change @run before rerunning against a database that already has these users.
+
+@baseUrl = http://localhost:8080
+@run = manual01
+@password = Week2-local-demo-2026!
+@aliceMessageID = 11111111-1111-4111-8111-111111111111
+@bobMessageID = 22222222-2222-4222-8222-222222222222
+@malloryMessageID = 33333333-3333-4333-8333-333333333333
+
+### Health is public
+GET {{baseUrl}}/health
+
+### Register Alice
+# @name registerAlice
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{
+  "username": "alice-{{run}}",
+  "password": "{{password}}"
+}
+
+### Register Bob
+# @name registerBob
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{
+  "username": "bob-{{run}}",
+  "password": "{{password}}"
+}
+
+### Register Mallory, who is not in the Alice-Bob thread
+# @name registerMallory
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{
+  "username": "mallory-{{run}}",
+  "password": "{{password}}"
+}
+
+### Login Alice
+# @name loginAlice
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "username": "alice-{{run}}",
+  "password": "{{password}}"
+}
+
+### Login Bob
+# @name loginBob
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "username": "bob-{{run}}",
+  "password": "{{password}}"
+}
+
+### Login Mallory
+# @name loginMallory
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "username": "mallory-{{run}}",
+  "password": "{{password}}"
+}
+
+### Account list without JWT: expect 401 Unauthorized
+GET {{baseUrl}}/users
+
+### Alice lists PostgreSQL accounts
+GET {{baseUrl}}/users
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### Alice creates the direct thread with Bob: expect 201 Created
+# @name aliceBobThread
+POST {{baseUrl}}/threads/direct
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "peer_id": "{{registerBob.response.body.$.id}}"
+}
+
+### Bob opens the same pair in reverse: expect 200 and the same thread id
+# @name bobAliceThread
+POST {{baseUrl}}/threads/direct
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "peer_id": "{{registerAlice.response.body.$.id}}"
+}
+
+### Alice sends a persisted message
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "client_msg_id": "{{aliceMessageID}}",
+  "content": "Chào Bob, tin này được lưu trong PostgreSQL."
+}
+
+### Bob replies
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "client_msg_id": "{{bobMessageID}}",
+  "content": "Chào Alice."
+}
+
+### Bob lists his direct threads
+GET {{baseUrl}}/threads
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+
+### Alice reads the complete history in seq order
+GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### History without JWT: expect 401 Unauthorized
+GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+
+### Mallory cannot read the Alice-Bob thread: expect 403 Forbidden
+GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginMallory.response.body.$.access_token}}
+
+### Mallory cannot send to the Alice-Bob thread: expect 403 Forbidden
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginMallory.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "client_msg_id": "{{malloryMessageID}}",
+  "content": "Tin này phải bị từ chối."
+}

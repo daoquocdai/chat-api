@@ -1,100 +1,105 @@
-# Chat API
+# Mini-Hermes Chat API
 
-Chat API là bản demo nhắn tin 1–1 viết bằng Go, Gin và PostgreSQL. Giao diện dùng HTML/CSS/JavaScript thuần, được Gin phục vụ cùng origin với API nên không cần npm hoặc bước build frontend.
+Mini-Hermes là demo chat 1-1 dùng Go, Gin, PostgreSQL và sqlc. Người dùng đăng ký bằng mật khẩu, đăng nhập nhận JWT, chọn một tài khoản khác và trao đổi tin nhắn được lưu trong PostgreSQL.
 
-Docker Compose khởi tạo PostgreSQL và Redis. Phiên bản hiện tại lưu user và message trong PostgreSQL; Redis chưa được ứng dụng sử dụng.
+ERD 5 bảng vẫn đang chờ mentor duyệt. Migration mới trên nhánh `feat/auth` là bản thử nghiệm để review, chưa nên áp dụng cho môi trường dùng chung hoặc production.
 
-## Chức năng hiện có
+## API
+
+Public:
 
 | Method | Path | Chức năng |
 | --- | --- | --- |
 | `GET` | `/health` | Kiểm tra server |
-| `POST` | `/users` | Tạo user |
-| `GET` | `/users` | Lấy danh sách user công khai |
-| `GET` | `/users/:id` | Lấy user theo `external_id` |
-| `POST` | `/messages` | Gửi tin nhắn |
-| `GET` | `/messages?user_id=...&peer_id=...` | Lấy lịch sử giữa hai user |
-| `GET` | `/` | Mở giao diện demo |
+| `POST` | `/auth/register` | Đăng ký với `username`, `password` |
+| `POST` | `/auth/login` | Nhận JWT access token |
 
-Các trường `id`, `sender_id` và `receiver_id` qua API đều là `external_id` dạng UUID. ID số tự tăng chỉ dùng nội bộ trong PostgreSQL.
+Yêu cầu `Authorization: Bearer <access_token>`:
 
-Xem [luồng xử lý request](docs/request-flow.md) để hiểu vai trò của router, DTO, handler, service, repository, sqlc và PostgreSQL.
+| Method | Path | Chức năng |
+| --- | --- | --- |
+| `GET` | `/users` | Danh sách tài khoản trong PostgreSQL |
+| `POST` | `/threads/direct` | Tạo hoặc mở direct thread với `peer_id` |
+| `GET` | `/threads` | Danh sách direct thread của người gọi |
+| `GET` | `/threads/:id/messages` | Toàn bộ lịch sử theo `seq ASC` |
+| `POST` | `/threads/:id/messages` | Gửi tin plaintext |
 
-## Chạy từ bản clone mới
+JWT chứa external user UUID trong `sub`. Client không được gửi `sender_id` hoặc `user_id` để chọn danh tính. Service tra user nội bộ từ JWT và repository chỉ đọc/ghi khi user là participant đang hoạt động của thread.
 
-Cần cài Go theo phiên bản trong `go.mod`, Docker có Docker Compose và [Goose](https://github.com/pressly/goose). GNU Make là tùy chọn.
+Gửi tin nhận `client_msg_id` UUID và `content`. Retry cùng `client_msg_id` bởi cùng người gửi trong cùng thread trả lại tin đã lưu, không tăng `seq` lần nữa.
 
-```bash
-go install github.com/pressly/goose/v3/cmd/goose@latest
-go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+Không còn `POST /users`, route `/messages` kiểu sender/receiver, read marker, unread count hoặc cursor pagination. Phạm vi hiện tại không có group chat, E2EE, WebSocket hay Redis.
+
+## Chuẩn bị database local
+
+Sao chép cấu hình mẫu và thay JWT secret:
+
+```powershell
+Copy-Item config/config.yml.example config/config.yml
 ```
 
-Sao chép config mẫu:
+`config/config.yml` cần trỏ đến PostgreSQL local và có cấu hình tương tự:
 
-```bash
-cp config/config.yml.example config/config.yml
+```yaml
+auth:
+  jwt_secret: "replace-with-a-long-random-secret"
+  jwt_ttl: 24h
 ```
 
-Trên Windows CMD:
+Runtime từ chối khởi động nếu secret trống hoặc TTL nhỏ hơn một giây.
 
-```bat
-copy config\config.yml.example config\config.yml
-```
+### Cảnh báo dữ liệu legacy
 
-Không đưa `config/config.yml` vào Git. File này đã có trong `.gitignore` và có thể chứa thông tin kết nối cục bộ.
+Migration mới là `db/migrations/20260924090000_create_direct_chat_schema.sql`. Nó thêm `users.password_hash NOT NULL`, sau đó thay bảng `messages` sender/receiver cũ bằng schema theo thread.
 
-Khởi động database, chạy migration và server:
+Câu `ALTER TABLE users ... password_hash NOT NULL` đứng đầu migration và không có default. Nếu còn user legacy, migration sẽ thất bại trước khi `DROP TABLE messages`; không có mật khẩu giả được tạo.
 
-```bash
-go mod download
-make up
-make migrate
-make run
-```
+Chỉ khi chấp nhận bỏ dữ liệu trên database local thử nghiệm, chạy tường minh:
 
-Nếu Windows chưa có `make`, chạy trong CMD:
-
-```bat
-go mod download
+```powershell
 docker compose up -d
-set "DATABASE_URL=postgres://chat:chat@localhost:5432/chat_api?sslmode=disable"
-goose -dir db/migrations postgres "%DATABASE_URL%" up
+docker compose exec postgres psql -U chat -d chat_api -c "TRUNCATE TABLE messages, users RESTART IDENTITY CASCADE;"
+$env:DATABASE_URL = 'postgres://chat:chat@localhost:5432/chat_api?sslmode=disable'
+goose -dir db/migrations postgres $env:DATABASE_URL up
+```
+
+Không chạy lệnh `TRUNCATE` trên database dùng chung, staging hoặc production. `goose down` chỉ phục hồi hình dạng schema cũ, không phục hồi row đã xóa hoặc message cũ đã bị thay thế.
+
+Migration giữ năm bảng trong ERD và thêm các invariant cần cho demo:
+
+- Cặp direct user được sắp `low < high` và có unique index, ngăn hai thread cho cùng cặp khi tạo đồng thời.
+- Thread và hai participant được ghi trong cùng transaction.
+- `threads.last_seq` được khóa, tăng và ghi message trong cùng transaction.
+- `(thread_id, sender_id, client_msg_id)` là ranh giới idempotency.
+- `prekeys` có schema để mentor review nhưng chưa có API hoặc nghiệp vụ E2EE.
+- Các cột membership/read từ ERD vẫn nằm trong schema để review nhưng chưa có API trạng thái đã đọc trong lượt này.
+
+## Chạy thử thủ công
+
+Sau khi migration thành công:
+
+```powershell
 go run ./cmd
 ```
 
-Ứng dụng đọc `database_url` từ `config/config.yml`, còn Goose trong Makefile dùng `DATABASE_URL`. Hai giá trị phải trỏ đến cùng database.
+Mở `http://localhost:8080`:
 
-## Demo bằng hai tab
+1. Đăng ký Alice và Bob.
+2. Đăng nhập Alice, chọn Bob và gửi tin.
+3. Mở một tab độc lập hoặc cửa sổ riêng tư, đăng nhập Bob, chọn Alice và trả lời.
+4. Tải lại trang hoặc khởi động lại server; đăng nhập và chọn lại peer để xem lịch sử còn trong PostgreSQL.
+5. Đăng nhập tài khoản thứ ba để xác nhận tài khoản đó không thể truy cập thread Alice–Bob bằng API.
 
-1. Mở `http://localhost:8080` ở hai tab.
-2. Tạo hoặc chọn hai user khác nhau.
-3. Ở mỗi tab, chọn một user trong **Tôi là** và chọn user còn lại trong **Nhắn cho**.
-4. Gửi tin nhắn từ cả hai phía. Giao diện tự lấy lịch sử mỗi giây.
-5. Khởi động lại server và chọn lại hai user để thấy lịch sử vẫn còn trong PostgreSQL.
+Web lưu JWT trong `sessionStorage` của từng tab, gửi Bearer token cho mọi API user/thread/message và polling lịch sử mỗi 1,5 giây. Reload cùng tab vẫn giữ phiên; đăng xuất hoặc đóng tab sẽ xóa phiên local.
 
-Hiện chưa có đăng nhập hoặc JWT. Người dùng được chọn thủ công trên giao diện để giả lập danh tính cho demo local; client tự gửi `user_id`/`sender_id`, nên không có bảo đảm riêng tư hay xác thực người gửi.
+Collection [docs/week2-chat.http](docs/week2-chat.http) minh họa đầy đủ hai người chat, request thiếu JWT và cả thao tác đọc/gửi bị từ chối với tài khoản thứ ba. Đổi biến `@run`, rồi chạy request từ trên xuống dưới.
 
-## Giới hạn hiện tại
+Xem [docs/request-flow.md](docs/request-flow.md) để biết ranh giới handler/service/repository và transaction.
 
-- Dùng polling mỗi giây, chưa có WebSocket hoặc realtime push.
-- Mỗi lần chỉ lấy tối đa 100 tin nhắn gần nhất và chưa có phân trang.
-- Chưa có thread/conversation, trạng thái đã đọc hoặc E2EE.
-- Redis đang chạy trong Docker Compose nhưng chưa được dùng để phát sự kiện.
+## Chưa có trong scope
 
-## Kiểm tra code
-
-```bash
-go test ./...
-go vet ./...
-go build ./...
-```
-
-Các unit test dùng repository và user service giả để kiểm tra nghiệp vụ mà không cần PostgreSQL. Chúng không thay thế kiểm tra migration, SQL và luồng HTTP thật với database.
-
-Khi sửa SQL trong `db/queries`, sinh lại code bằng:
-
-```bash
-make sqlc
-```
-
-Không sửa trực tiếp các file trong `internal/database/sqlc` vì chúng do sqlc sinh.
+- Group chat, E2EE và API prekey.
+- Read/unread state và cursor pagination.
+- WebSocket/realtime push; web đang polling.
+- Redis.
+- Test cho auth/thread/message sau lần refactor này.

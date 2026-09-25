@@ -1,7 +1,12 @@
--- name: CreateUser :one
-INSERT INTO users (username)
-VALUES ($1)
+-- name: CreateUserWithPassword :one
+INSERT INTO users (username, password_hash)
+VALUES (sqlc.arg(username), sqlc.arg(password_hash))
 RETURNING id, external_id, username, created_at;
+
+-- name: GetUserCredentialsByUsername :one
+SELECT id, external_id, username, password_hash, created_at
+FROM users
+WHERE username = $1;
 
 -- name: GetUserByExternalID :one
 SELECT id, external_id, username, created_at

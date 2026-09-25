@@ -6,10 +6,6 @@ import (
 	"github.com/daoquocdai/chat-api/internal/module/user/model"
 )
 
-type CreateUserRequest struct {
-	Username string `json:"username"`
-}
-
 type RegisterRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`

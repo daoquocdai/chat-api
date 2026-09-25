@@ -3,52 +3,79 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Chat API Demo</title>
+  <title>Mini-Hermes</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <main class="app">
-    <header>
-      <h1>Chat API Demo</h1>
-      <p>Chọn người dùng để giả lập danh tính trong từng tab.</p>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Mini-Hermes</p>
+        <h1>Chat 1-1</h1>
+      </div>
+      <button id="logout-button" class="secondary" type="button" hidden>Đăng xuất</button>
     </header>
 
-    <section class="card create-user">
-      <h2>Tạo người dùng</h2>
-      <form id="user-form">
-        <label for="username">Username</label>
-        <div class="row">
-          <input id="username" name="username" autocomplete="off" required>
-          <button type="submit">Tạo</button>
-        </div>
-      </form>
-    </section>
-
-    <section class="card identity">
-      <div>
-        <label for="current-user">Tôi là</label>
-        <select id="current-user"></select>
-      </div>
-      <div>
-        <label for="peer-user">Nhắn cho</label>
-        <select id="peer-user"></select>
-      </div>
-    </section>
-
+    <p id="notice" class="notice" role="status" hidden></p>
     <p id="error" class="error" role="alert" hidden></p>
 
-    <section class="card chat">
-      <div id="history" class="history" aria-live="polite">
-        <p class="empty">Hãy chọn hai người dùng để bắt đầu.</p>
-      </div>
+    <section id="auth-view" class="auth-grid">
+      <form id="register-form" class="card">
+        <h2>Đăng ký</h2>
+        <label for="register-username">Username</label>
+        <input id="register-username" name="username" autocomplete="username" required>
 
-      <form id="message-form" class="message-form">
-        <label for="content">Tin nhắn</label>
-        <div class="row">
-          <input id="content" name="content" autocomplete="off" required disabled>
-          <button id="send-button" type="submit" disabled>Gửi</button>
-        </div>
+        <label for="register-password">Mật khẩu</label>
+        <input id="register-password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+
+        <button type="submit">Tạo tài khoản</button>
       </form>
+
+      <form id="login-form" class="card">
+        <h2>Đăng nhập</h2>
+        <label for="login-username">Username</label>
+        <input id="login-username" name="username" autocomplete="username" required>
+
+        <label for="login-password">Mật khẩu</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+
+        <button type="submit">Đăng nhập</button>
+      </form>
+    </section>
+
+    <section id="chat-view" class="chat-layout" hidden>
+      <aside class="card sidebar">
+        <div class="session">
+          <span>Đang đăng nhập</span>
+          <strong id="current-username"></strong>
+        </div>
+        <h2>Tài khoản khác</h2>
+        <div id="peer-list" class="peer-list">
+          <p class="empty">Đang tải...</p>
+        </div>
+      </aside>
+
+      <section class="card chat">
+        <div class="chat-heading">
+          <div>
+            <span>Cuộc trò chuyện</span>
+            <h2 id="peer-name">Chọn một tài khoản</h2>
+          </div>
+          <button id="refresh-button" class="secondary" type="button" disabled>Tải lại</button>
+        </div>
+
+        <div id="history" class="history" aria-live="polite">
+          <p class="empty">Chọn một tài khoản để bắt đầu chat.</p>
+        </div>
+
+        <form id="message-form" class="message-form">
+          <label for="content">Tin nhắn</label>
+          <div class="row">
+            <input id="content" name="content" autocomplete="off" maxlength="1000" required disabled>
+            <button id="send-button" type="submit" disabled>Gửi</button>
+          </div>
+        </form>
+      </section>
     </section>
   </main>
 

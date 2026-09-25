@@ -12,10 +12,8 @@ import (
 )
 
 type UserService interface {
-	Create(ctx context.Context, username string) (model.User, error)
 	Register(ctx context.Context, username, password string) (model.User, error)
 	Login(ctx context.Context, username, password string) (string, error)
-	GetByExternalID(ctx context.Context, externalID string) (model.User, error)
 	List(ctx context.Context) ([]model.User, error)
 }
 
@@ -25,23 +23,6 @@ type Handler struct {
 
 func New(service UserService) *Handler {
 	return &Handler{service: service}
-}
-
-func (h *Handler) Create(c *gin.Context) {
-	var request dto.CreateUserRequest
-
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
-		return
-	}
-
-	user, err := h.service.Create(c.Request.Context(), request.Username)
-	if err != nil {
-		writeError(c, err)
-		return
-	}
-
-	c.JSON(http.StatusCreated, dto.ToUserResponse(user))
 }
 
 func (h *Handler) Register(c *gin.Context) {
@@ -77,17 +58,6 @@ func (h *Handler) Login(c *gin.Context) {
 		AccessToken: accessToken,
 		TokenType:   "Bearer",
 	})
-}
-
-func (h *Handler) GetByExternalID(c *gin.Context) {
-	externalID := c.Param("id")
-	user, err := h.service.GetByExternalID(c.Request.Context(), externalID)
-	if err != nil {
-		writeError(c, err)
-		return
-	}
-
-	c.JSON(http.StatusOK, dto.ToUserResponse(user))
 }
 
 func (h *Handler) List(c *gin.Context) {

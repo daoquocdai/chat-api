@@ -6,15 +6,23 @@ import (
 	"log"
 	"net/http"
 
+	authmiddleware "github.com/daoquocdai/chat-api/internal/middleware"
 	"github.com/daoquocdai/chat-api/internal/module/message/dto"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
+	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 	"github.com/gin-gonic/gin"
 )
 
 type MessageService interface {
-	Create(ctx context.Context, senderExternalID, receiverExternalID, content string) (model.Message, error)
-	ListBetween(ctx context.Context, userExternalID, peerExternalID string) ([]model.Message, error)
+	Send(
+		ctx context.Context,
+		actorExternalID, threadExternalID, clientMessageID, content string,
+	) (model.Message, bool, error)
+	List(
+		ctx context.Context,
+		actorExternalID, threadExternalID string,
+	) ([]model.Message, error)
 }
 
 type Handler struct {
@@ -25,17 +33,24 @@ func New(service MessageService) *Handler {
 	return &Handler{service: service}
 }
 
-func (h *Handler) Create(c *gin.Context) {
-	var request dto.CreateMessageRequest
+func (h *Handler) Send(c *gin.Context) {
+	actorExternalID, ok := authenticatedUserID(c)
+	if !ok || actorExternalID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var request dto.SendMessageRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
 		return
 	}
 
-	message, err := h.service.Create(
+	message, created, err := h.service.Send(
 		c.Request.Context(),
-		request.SenderID,
-		request.ReceiverID,
+		actorExternalID,
+		c.Param("id"),
+		request.ClientMessageID,
 		request.Content,
 	)
 	if err != nil {
@@ -43,14 +58,24 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, dto.ToMessageResponse(message))
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	c.JSON(status, dto.ToMessageResponse(message))
 }
 
-func (h *Handler) ListBetween(c *gin.Context) {
-	messages, err := h.service.ListBetween(
+func (h *Handler) List(c *gin.Context) {
+	actorExternalID, ok := authenticatedUserID(c)
+	if !ok || actorExternalID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	messages, err := h.service.List(
 		c.Request.Context(),
-		c.Query("user_id"),
-		c.Query("peer_id"),
+		actorExternalID,
+		c.Param("id"),
 	)
 	if err != nil {
 		writeError(c, err)
@@ -60,16 +85,27 @@ func (h *Handler) ListBetween(c *gin.Context) {
 	c.JSON(http.StatusOK, dto.ToMessageResponses(messages))
 }
 
+func authenticatedUserID(c *gin.Context) (string, bool) {
+	return authmiddleware.AuthenticatedUserID(c)
+}
+
 func writeError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, model.ErrUserIDsRequired),
-		errors.Is(err, model.ErrSameUser),
-		errors.Is(err, model.ErrInvalidContent),
-		errors.Is(err, usermodel.ErrInvalidUserID):
+	case errors.Is(err, model.ErrThreadIDRequired),
+		errors.Is(err, model.ErrInvalidThreadID),
+		errors.Is(err, model.ErrClientMessageIDRequired),
+		errors.Is(err, model.ErrInvalidClientMessageID),
+		errors.Is(err, model.ErrInvalidContent):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
-	case errors.Is(err, usermodel.ErrUserNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": usermodel.ErrUserNotFound.Error()})
+	case errors.Is(err, threadmodel.ErrThreadNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": threadmodel.ErrThreadNotFound.Error()})
+
+	case errors.Is(err, threadmodel.ErrNotParticipant):
+		c.JSON(http.StatusForbidden, gin.H{"error": threadmodel.ErrNotParticipant.Error()})
+
+	case errors.Is(err, usermodel.ErrUserNotFound), errors.Is(err, usermodel.ErrInvalidUserID):
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 
 	default:
 		log.Printf("message handler: %v", err)

@@ -11,104 +11,243 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createMessage = `-- name: CreateMessage :one
+const createThreadMessage = `-- name: CreateThreadMessage :one
 WITH created AS (
-    INSERT INTO messages (sender_id, receiver_id, content)
-    VALUES ($1, $2, $3)
-    RETURNING id, external_id, sender_id, receiver_id, content, created_at
+    INSERT INTO messages (
+        thread_id,
+        sender_id,
+        seq,
+        client_msg_id,
+        kind,
+        content_format,
+        content
+    )
+    VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        'text',
+        'plaintext',
+        $5
+    )
+    RETURNING id, external_id, thread_id, sender_id, seq,
+              client_msg_id, kind, content_format, content, created_at
 )
 SELECT
     created.id,
     created.external_id,
+    thread.external_id AS thread_external_id,
     sender.external_id AS sender_external_id,
-    receiver.external_id AS receiver_external_id,
+    created.seq,
+    created.client_msg_id,
+    created.kind,
+    created.content_format,
     created.content,
     created.created_at
 FROM created
+JOIN threads AS thread ON thread.id = created.thread_id
 JOIN users AS sender ON sender.id = created.sender_id
-JOIN users AS receiver ON receiver.id = created.receiver_id
 `
 
-type CreateMessageParams struct {
-	SenderID   int64
-	ReceiverID int64
-	Content    string
+type CreateThreadMessageParams struct {
+	ThreadID    int64
+	SenderID    int64
+	Seq         int64
+	ClientMsgID pgtype.UUID
+	Content     string
 }
 
-type CreateMessageRow struct {
-	ID                 int64
-	ExternalID         pgtype.UUID
-	SenderExternalID   pgtype.UUID
-	ReceiverExternalID pgtype.UUID
-	Content            string
-	CreatedAt          pgtype.Timestamptz
+type CreateThreadMessageRow struct {
+	ID               int64
+	ExternalID       pgtype.UUID
+	ThreadExternalID pgtype.UUID
+	SenderExternalID pgtype.UUID
+	Seq              int64
+	ClientMsgID      pgtype.UUID
+	Kind             string
+	ContentFormat    string
+	Content          string
+	CreatedAt        pgtype.Timestamptz
 }
 
-func (q *Queries) CreateMessage(ctx context.Context, arg CreateMessageParams) (CreateMessageRow, error) {
-	row := q.db.QueryRow(ctx, createMessage, arg.SenderID, arg.ReceiverID, arg.Content)
-	var i CreateMessageRow
+func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessageParams) (CreateThreadMessageRow, error) {
+	row := q.db.QueryRow(ctx, createThreadMessage,
+		arg.ThreadID,
+		arg.SenderID,
+		arg.Seq,
+		arg.ClientMsgID,
+		arg.Content,
+	)
+	var i CreateThreadMessageRow
 	err := row.Scan(
 		&i.ID,
 		&i.ExternalID,
+		&i.ThreadExternalID,
 		&i.SenderExternalID,
-		&i.ReceiverExternalID,
+		&i.Seq,
+		&i.ClientMsgID,
+		&i.Kind,
+		&i.ContentFormat,
 		&i.Content,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
-const listMessagesBetween = `-- name: ListMessagesBetween :many
-SELECT
-    recent.id,
-    recent.external_id,
-    sender.external_id AS sender_external_id,
-    receiver.external_id AS receiver_external_id,
-    recent.content,
-    recent.created_at
-FROM (
-    SELECT id, external_id, sender_id, receiver_id, content, created_at
-    FROM messages
-    WHERE
-        (sender_id = $1 AND receiver_id = $2)
-        OR
-        (sender_id = $2 AND receiver_id = $1)
-    ORDER BY id DESC
-    LIMIT 100
-) AS recent
-JOIN users AS sender ON sender.id = recent.sender_id
-JOIN users AS receiver ON receiver.id = recent.receiver_id
-ORDER BY recent.id
+const getActiveThreadAccess = `-- name: GetActiveThreadAccess :one
+SELECT t.id
+FROM threads AS t
+JOIN participants AS p
+  ON p.thread_id = t.id
+ AND p.user_id = $1
+ AND p.left_seq IS NULL
+WHERE t.external_id = $2
 `
 
-type ListMessagesBetweenParams struct {
-	UserOneID int64
-	UserTwoID int64
+type GetActiveThreadAccessParams struct {
+	UserID           int64
+	ThreadExternalID pgtype.UUID
 }
 
-type ListMessagesBetweenRow struct {
-	ID                 int64
-	ExternalID         pgtype.UUID
-	SenderExternalID   pgtype.UUID
-	ReceiverExternalID pgtype.UUID
-	Content            string
-	CreatedAt          pgtype.Timestamptz
+func (q *Queries) GetActiveThreadAccess(ctx context.Context, arg GetActiveThreadAccessParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getActiveThreadAccess, arg.UserID, arg.ThreadExternalID)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
 }
 
-func (q *Queries) ListMessagesBetween(ctx context.Context, arg ListMessagesBetweenParams) ([]ListMessagesBetweenRow, error) {
-	rows, err := q.db.Query(ctx, listMessagesBetween, arg.UserOneID, arg.UserTwoID)
+const getMessageByClientID = `-- name: GetMessageByClientID :one
+SELECT
+    m.id,
+    m.external_id,
+    t.external_id AS thread_external_id,
+    sender.external_id AS sender_external_id,
+    m.seq,
+    m.client_msg_id,
+    m.kind,
+    m.content_format,
+    m.content,
+    m.created_at
+FROM messages AS m
+JOIN threads AS t ON t.id = m.thread_id
+JOIN users AS sender ON sender.id = m.sender_id
+WHERE m.thread_id = $1
+  AND m.sender_id = $2
+  AND m.client_msg_id = $3
+`
+
+type GetMessageByClientIDParams struct {
+	ThreadID    int64
+	SenderID    int64
+	ClientMsgID pgtype.UUID
+}
+
+type GetMessageByClientIDRow struct {
+	ID               int64
+	ExternalID       pgtype.UUID
+	ThreadExternalID pgtype.UUID
+	SenderExternalID pgtype.UUID
+	Seq              int64
+	ClientMsgID      pgtype.UUID
+	Kind             string
+	ContentFormat    string
+	Content          string
+	CreatedAt        pgtype.Timestamptz
+}
+
+func (q *Queries) GetMessageByClientID(ctx context.Context, arg GetMessageByClientIDParams) (GetMessageByClientIDRow, error) {
+	row := q.db.QueryRow(ctx, getMessageByClientID, arg.ThreadID, arg.SenderID, arg.ClientMsgID)
+	var i GetMessageByClientIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.ExternalID,
+		&i.ThreadExternalID,
+		&i.SenderExternalID,
+		&i.Seq,
+		&i.ClientMsgID,
+		&i.Kind,
+		&i.ContentFormat,
+		&i.Content,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const incrementThreadSequence = `-- name: IncrementThreadSequence :one
+UPDATE threads
+SET last_seq = last_seq + 1
+WHERE id = $1
+RETURNING last_seq
+`
+
+func (q *Queries) IncrementThreadSequence(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRow(ctx, incrementThreadSequence, id)
+	var last_seq int64
+	err := row.Scan(&last_seq)
+	return last_seq, err
+}
+
+const listThreadMessages = `-- name: ListThreadMessages :many
+SELECT
+    m.id,
+    m.external_id,
+    t.external_id AS thread_external_id,
+    sender.external_id AS sender_external_id,
+    m.seq,
+    m.client_msg_id,
+    m.kind,
+    m.content_format,
+    m.content,
+    m.created_at
+FROM messages AS m
+JOIN threads AS t ON t.id = m.thread_id
+JOIN users AS sender ON sender.id = m.sender_id
+JOIN participants AS participant
+  ON participant.thread_id = t.id
+ AND participant.user_id = $1
+ AND participant.left_seq IS NULL
+WHERE t.external_id = $2
+  AND m.seq >= participant.joined_seq
+ORDER BY m.seq ASC
+`
+
+type ListThreadMessagesParams struct {
+	UserID           int64
+	ThreadExternalID pgtype.UUID
+}
+
+type ListThreadMessagesRow struct {
+	ID               int64
+	ExternalID       pgtype.UUID
+	ThreadExternalID pgtype.UUID
+	SenderExternalID pgtype.UUID
+	Seq              int64
+	ClientMsgID      pgtype.UUID
+	Kind             string
+	ContentFormat    string
+	Content          string
+	CreatedAt        pgtype.Timestamptz
+}
+
+func (q *Queries) ListThreadMessages(ctx context.Context, arg ListThreadMessagesParams) ([]ListThreadMessagesRow, error) {
+	rows, err := q.db.Query(ctx, listThreadMessages, arg.UserID, arg.ThreadExternalID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListMessagesBetweenRow
+	var items []ListThreadMessagesRow
 	for rows.Next() {
-		var i ListMessagesBetweenRow
+		var i ListThreadMessagesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.ExternalID,
+			&i.ThreadExternalID,
 			&i.SenderExternalID,
-			&i.ReceiverExternalID,
+			&i.Seq,
+			&i.ClientMsgID,
+			&i.Kind,
+			&i.ContentFormat,
 			&i.Content,
 			&i.CreatedAt,
 		); err != nil {
@@ -120,4 +259,40 @@ func (q *Queries) ListMessagesBetween(ctx context.Context, arg ListMessagesBetwe
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockThreadForParticipant = `-- name: LockThreadForParticipant :one
+SELECT t.id
+FROM threads AS t
+JOIN participants AS p
+  ON p.thread_id = t.id
+ AND p.user_id = $1
+ AND p.left_seq IS NULL
+WHERE t.external_id = $2
+FOR UPDATE OF t
+`
+
+type LockThreadForParticipantParams struct {
+	UserID           int64
+	ThreadExternalID pgtype.UUID
+}
+
+func (q *Queries) LockThreadForParticipant(ctx context.Context, arg LockThreadForParticipantParams) (int64, error) {
+	row := q.db.QueryRow(ctx, lockThreadForParticipant, arg.UserID, arg.ThreadExternalID)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const threadExistsByExternalID = `-- name: ThreadExistsByExternalID :one
+SELECT EXISTS (
+    SELECT 1 FROM threads WHERE external_id = $1
+)
+`
+
+func (q *Queries) ThreadExistsByExternalID(ctx context.Context, externalID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, threadExistsByExternalID, externalID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }

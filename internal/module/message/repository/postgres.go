@@ -101,10 +101,12 @@ func (r *PostgresRepository) List(
 	ctx context.Context,
 	threadExternalID string,
 	userID int64,
-) ([]model.Message, error) {
+	beforeSeq *int64,
+	limit int,
+) (model.Page, error) {
 	threadID, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
 	if err != nil {
-		return nil, err
+		return model.Page{}, err
 	}
 	queries := sqlc.New(r.pool)
 	if _, err := queries.GetActiveThreadAccess(ctx, sqlc.GetActiveThreadAccessParams{
@@ -112,19 +114,29 @@ func (r *PostgresRepository) List(
 		ThreadExternalID: threadID,
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, classifyThreadAccess(ctx, queries, threadID)
+			return model.Page{}, classifyThreadAccess(ctx, queries, threadID)
 		}
-		return nil, err
+		return model.Page{}, err
 	}
 
-	rows, err := queries.ListThreadMessages(ctx, sqlc.ListThreadMessagesParams{
+	before := pgtype.Int8{}
+	if beforeSeq != nil {
+		before = pgtype.Int8{Int64: *beforeSeq, Valid: true}
+	}
+	rows, err := queries.ListThreadMessagesPage(ctx, sqlc.ListThreadMessagesPageParams{
 		UserID:           userID,
 		ThreadExternalID: threadID,
+		BeforeSeq:        before,
+		PageSize:         int32(limit),
 	})
 	if err != nil {
-		return nil, err
+		return model.Page{}, err
 	}
 
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
 	messages := make([]model.Message, len(rows))
 	for i, row := range rows {
 		messages[i] = messageFromValues(
@@ -133,7 +145,14 @@ func (r *PostgresRepository) List(
 			row.Kind, row.ContentFormat, row.Content, row.CreatedAt,
 		)
 	}
-	return messages, nil
+
+	var nextCursor *int64
+	if hasMore {
+		cursor := messages[len(messages)-1].Seq
+		nextCursor = &cursor
+	}
+
+	return model.Page{Messages: messages, NextCursor: nextCursor}, nil
 }
 
 func classifyThreadAccess(ctx context.Context, queries *sqlc.Queries, threadID pgtype.UUID) error {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 
 	authmiddleware "github.com/daoquocdai/chat-api/internal/middleware"
 	"github.com/daoquocdai/chat-api/internal/module/message/dto"
@@ -22,7 +23,9 @@ type MessageService interface {
 	List(
 		ctx context.Context,
 		actorExternalID, threadExternalID string,
-	) ([]model.Message, error)
+		beforeSeq *int64,
+		limit int,
+	) (model.Page, error)
 }
 
 type Handler struct {
@@ -72,17 +75,55 @@ func (h *Handler) List(c *gin.Context) {
 		return
 	}
 
-	messages, err := h.service.List(
+	beforeSeq, limit, err := listQuery(c)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+
+	page, err := h.service.List(
 		c.Request.Context(),
 		actorExternalID,
 		c.Param("id"),
+		beforeSeq,
+		limit,
 	)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, dto.ToMessageResponses(messages))
+	c.JSON(http.StatusOK, dto.ToMessagePageResponse(page))
+}
+
+func listQuery(c *gin.Context) (*int64, int, error) {
+	limit := model.DefaultPageLimit
+	query := c.Request.URL.Query()
+
+	if values, ok := query["limit"]; ok {
+		if len(values) != 1 {
+			return nil, 0, model.ErrInvalidLimit
+		}
+		parsed, err := strconv.ParseInt(values[0], 10, 32)
+		if err != nil || parsed < 1 || parsed > model.MaximumPageLimit {
+			return nil, 0, model.ErrInvalidLimit
+		}
+		limit = int(parsed)
+	}
+
+	var beforeSeq *int64
+	if values, ok := query["before_seq"]; ok {
+		if len(values) != 1 {
+			return nil, 0, model.ErrInvalidBeforeSeq
+		}
+		parsed, err := strconv.ParseInt(values[0], 10, 64)
+		if err != nil || parsed <= 0 {
+			return nil, 0, model.ErrInvalidBeforeSeq
+		}
+		beforeSeq = &parsed
+	}
+
+	return beforeSeq, limit, nil
 }
 
 func authenticatedUserID(c *gin.Context) (string, bool) {
@@ -95,7 +136,9 @@ func writeError(c *gin.Context, err error) {
 		errors.Is(err, model.ErrInvalidThreadID),
 		errors.Is(err, model.ErrClientMessageIDRequired),
 		errors.Is(err, model.ErrInvalidClientMessageID),
-		errors.Is(err, model.ErrInvalidContent):
+		errors.Is(err, model.ErrInvalidContent),
+		errors.Is(err, model.ErrInvalidBeforeSeq),
+		errors.Is(err, model.ErrInvalidLimit):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
 	case errors.Is(err, threadmodel.ErrThreadNotFound):

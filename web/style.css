@@ -149,10 +149,25 @@ button:disabled {
 }
 
 .peer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   width: 100%;
   color: #334155;
   text-align: left;
   background: #f1f5f9;
+}
+
+.unread-badge {
+  min-width: 24px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #ffffff;
+  background: #dc2626;
+  font-size: 0.78rem;
+  font-weight: 750;
+  text-align: center;
 }
 
 .peer:hover,
@@ -163,6 +178,18 @@ button:disabled {
 
 .chat-heading {
   margin-bottom: 14px;
+}
+
+.history-actions {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+
+.history-actions button {
+  min-height: 34px;
+  padding: 5px 14px;
+  font-size: 0.9rem;
 }
 
 .history {

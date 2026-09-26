@@ -15,11 +15,14 @@ type LastMessage struct {
 }
 
 type Thread struct {
-	ID          int64
-	ExternalID  string
-	Kind        string
-	Peer        Peer
-	LastSeq     int64
-	LastMessage *LastMessage
-	CreatedAt   time.Time
+	ID              int64
+	ExternalID      string
+	Kind            string
+	Peer            Peer
+	LastSeq         int64
+	LastReadSeq     int64
+	PeerLastReadSeq int64
+	UnreadCount     int64
+	LastMessage     *LastMessage
+	CreatedAt       time.Time
 }

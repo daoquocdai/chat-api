@@ -23,6 +23,11 @@ type MessageResponse struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
+type MessagePageResponse struct {
+	Messages   []MessageResponse `json:"messages"`
+	NextCursor *int64            `json:"next_cursor"`
+}
+
 func ToMessageResponse(message model.Message) MessageResponse {
 	return MessageResponse{
 		ID:              message.ExternalID,
@@ -44,4 +49,11 @@ func ToMessageResponses(messages []model.Message) []MessageResponse {
 	}
 
 	return responses
+}
+
+func ToMessagePageResponse(page model.Page) MessagePageResponse {
+	return MessagePageResponse{
+		Messages:   ToMessageResponses(page.Messages),
+		NextCursor: page.NextCursor,
+	}
 }

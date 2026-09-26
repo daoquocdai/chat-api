@@ -87,6 +87,9 @@ func (r *PostgresRepository) CreateOrGetDirect(
 			summary.PeerExternalID,
 			summary.PeerUsername,
 			summary.LastSeq,
+			summary.LastReadSeq,
+			summary.PeerLastReadSeq,
+			summary.UnreadCount,
 			summary.LastMessageSeq,
 			summary.LastMessageSenderExternalID,
 			summary.LastMessageContent,
@@ -117,6 +120,9 @@ func (r *PostgresRepository) ListByUser(ctx context.Context, userID int64) ([]mo
 			row.PeerExternalID,
 			row.PeerUsername,
 			row.LastSeq,
+			row.LastReadSeq,
+			row.PeerLastReadSeq,
+			row.UnreadCount,
 			row.LastMessageSeq,
 			row.LastMessageSenderExternalID,
 			row.LastMessageContent,
@@ -135,6 +141,9 @@ func threadFromValues(
 	peerExternalID pgtype.UUID,
 	peerUsername string,
 	lastSeq int64,
+	lastReadSeq int64,
+	peerLastReadSeq int64,
+	unreadCount int64,
 	lastMessageSeq pgtype.Int8,
 	lastMessageSenderExternalID pgtype.UUID,
 	lastMessageContent pgtype.Text,
@@ -142,12 +151,15 @@ func threadFromValues(
 	createdAt pgtype.Timestamptz,
 ) model.Thread {
 	thread := model.Thread{
-		ID:         id,
-		ExternalID: externalID.String(),
-		Kind:       kind,
-		Peer:       model.Peer{ExternalID: peerExternalID.String(), Username: peerUsername},
-		LastSeq:    lastSeq,
-		CreatedAt:  createdAt.Time,
+		ID:              id,
+		ExternalID:      externalID.String(),
+		Kind:            kind,
+		Peer:            model.Peer{ExternalID: peerExternalID.String(), Username: peerUsername},
+		LastSeq:         lastSeq,
+		LastReadSeq:     lastReadSeq,
+		PeerLastReadSeq: peerLastReadSeq,
+		UnreadCount:     unreadCount,
+		CreatedAt:       createdAt.Time,
 	}
 
 	if lastMessageSeq.Valid {
@@ -160,4 +172,53 @@ func threadFromValues(
 	}
 
 	return thread
+}
+
+func (r *PostgresRepository) MarkRead(
+	ctx context.Context,
+	threadExternalID string,
+	userID, lastReadSeq int64,
+) (int64, error) {
+	threadID, err := parseThreadUUID(threadExternalID)
+	if err != nil {
+		return 0, err
+	}
+	queries := sqlc.New(r.pool)
+	stored, err := queries.MarkThreadRead(ctx, sqlc.MarkThreadReadParams{
+		LastReadSeq:      lastReadSeq,
+		UserID:           userID,
+		ThreadExternalID: threadID,
+	})
+	if err == nil {
+		return stored, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+
+	if _, accessErr := queries.GetThreadReadBounds(ctx, sqlc.GetThreadReadBoundsParams{
+		UserID:           userID,
+		ThreadExternalID: threadID,
+	}); accessErr == nil {
+		return 0, model.ErrInvalidReadSequence
+	} else if !errors.Is(accessErr, pgx.ErrNoRows) {
+		return 0, accessErr
+	}
+
+	exists, err := queries.ThreadExistsByExternalID(ctx, threadID)
+	if err != nil {
+		return 0, err
+	}
+	if exists {
+		return 0, model.ErrNotParticipant
+	}
+	return 0, model.ErrThreadNotFound
+}
+
+func parseThreadUUID(value string) (pgtype.UUID, error) {
+	var id pgtype.UUID
+	if err := id.Scan(value); err != nil {
+		return pgtype.UUID{}, model.ErrInvalidThreadID
+	}
+	return id, nil
 }

@@ -22,7 +22,9 @@ type Repository interface {
 		ctx context.Context,
 		threadExternalID string,
 		userID int64,
-	) ([]model.Message, error)
+		beforeSeq *int64,
+		limit int,
+	) (model.Page, error)
 }
 
 type UserFinder interface {
@@ -67,29 +69,39 @@ func (s *Service) Send(
 func (s *Service) List(
 	ctx context.Context,
 	actorExternalID, threadExternalID string,
-) ([]model.Message, error) {
+	beforeSeq *int64,
+	limit int,
+) (model.Page, error) {
 	threadExternalID = strings.TrimSpace(threadExternalID)
 	if threadExternalID == "" {
-		return nil, model.ErrThreadIDRequired
+		return model.Page{}, model.ErrThreadIDRequired
+	}
+	if beforeSeq != nil && *beforeSeq <= 0 {
+		return model.Page{}, model.ErrInvalidBeforeSeq
+	}
+	if limit < 1 || limit > model.MaximumPageLimit {
+		return model.Page{}, model.ErrInvalidLimit
 	}
 
 	actor, err := s.users.GetByExternalID(ctx, actorExternalID)
 	if err != nil {
-		return nil, err
+		return model.Page{}, err
 	}
 
-	messages, err := s.repository.List(
+	page, err := s.repository.List(
 		ctx,
 		threadExternalID,
 		actor.ID,
+		beforeSeq,
+		limit,
 	)
 	if err != nil {
-		return nil, err
+		return model.Page{}, err
 	}
 
-	if messages == nil {
-		messages = []model.Message{}
+	if page.Messages == nil {
+		page.Messages = []model.Message{}
 	}
 
-	return messages, nil
+	return page, nil
 }

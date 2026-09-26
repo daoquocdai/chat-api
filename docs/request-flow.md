@@ -47,25 +47,25 @@ Thread tồn tại nhưng actor không phải participant trả `403`; thread kh
 
 ## Đọc lịch sử
 
-`GET /threads/:id/messages` tra actor từ JWT và chỉ query khi actor là participant đang hoạt động. Response là mảng message theo `seq ASC`, phù hợp trực tiếp với web demo:
+`GET /threads/:id/messages` tra actor từ JWT và chỉ query khi actor là participant đang hoạt động. `limit` mặc định 30, nằm trong `1..100`; `before_seq` nếu có phải dương. Repository query `seq DESC`, lấy `limit + 1`, giữ điều kiện `seq >= joined_seq` và không dùng `OFFSET`, timestamp hay message ID toàn cục.
 
 ```json
-[
-  {
-    "id": "message-uuid",
-    "thread_id": "thread-uuid",
-    "sender_id": "user-uuid",
-    "seq": 1,
-    "client_msg_id": "client-uuid",
-    "kind": "text",
-    "content_format": "plaintext",
-    "content": "Xin chào",
-    "created_at": "2026-09-25T00:00:00Z"
-  }
-]
+{
+  "messages": [
+    { "seq": 5, "content": "Tin 5" },
+    { "seq": 4, "content": "Tin 4" }
+  ],
+  "next_cursor": 4
+}
 ```
 
-Lượt này cố ý chưa có cursor, limit, read marker hoặc unread count.
+Trang tiếp theo gọi `?before_seq=4&limit=2` và chỉ nhận message có `seq < 4`. `next_cursor` là `null` khi không còn trang cũ hơn.
+
+## Read marker và unread
+
+`PUT /threads/:id/read` nhận `{ "last_read_seq": N }`; actor không bao giờ đến từ body. SQL chỉ update participant đang hoạt động khi `joined_seq - 1 <= N <= threads.last_seq`, đồng thời dùng `GREATEST(last_read_seq, N)`. Vì vậy request cũ đến muộn không thể làm marker giảm. Thread rỗng chấp nhận mốc `0`.
+
+Hai query summary thread cùng trả `last_read_seq`, `peer_last_read_seq` và `unread_count`. `unread_count` là `COUNT(*)` trên các message nằm trong phạm vi xem, có `seq > last_read_seq`, do người khác gửi và `kind <> 'system'`; không suy ra từ `last_seq - last_read_seq`. UI dùng `peer_last_read_seq` để hiện “Đã đọc” cho tin mình gửi có `seq` không lớn hơn marker đó.
 
 ## Web demo
 
@@ -75,7 +75,10 @@ Router phục vụ `web/index.html`, `web/app.js` và `web/style.css`. Giao di�
 2. Lưu JWT vào `sessionStorage` của tab và lấy user hiện tại từ claim `sub`.
 3. Gọi `GET /users` bằng Bearer token và chỉ hiển thị các tài khoản khác.
 4. Khi chọn peer, gọi `POST /threads/direct`, sau đó tải lịch sử.
-5. Gửi tin với `client_msg_id` do browser sinh và polling lịch sử mỗi 1,5 giây.
-6. Khi API trả `401`, xóa session local và đưa người dùng về màn hình đăng nhập.
+5. Tải trang mới nhất, đảo sang thứ tự cũ → mới để render; nút **Tin cũ hơn** prepend trang theo `next_cursor` và map theo `seq` loại trùng.
+6. Polling trang mới nhất mỗi 1,5 giây. Nếu trang đó chưa chạm `seq` cao nhất đã biết, web theo `next_cursor` cho đến khi chạm mốc, rồi merge; các trang cũ không bị thay thế.
+7. Chỉ gọi `PUT read` cho chuỗi tin nhận đã xuất hiện trong viewport khi cuộc chat hiện tại và tab đều đang hiển thị. GET nền và thao tác gửi không tự cập nhật marker.
+8. Mọi response bất đồng bộ đều đối chiếu session version, conversation version và thread ID trước khi cập nhật DOM; response muộn sau đổi thread/đăng xuất bị bỏ qua.
+9. Khi API trả `401`, xóa session local và đưa người dùng về màn hình đăng nhập.
 
 Không còn route `/messages` sender/receiver hoặc `POST /users`; client không có đường API để tự khai danh tính người gửi.

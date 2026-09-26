@@ -15,6 +15,7 @@ type UserHandler interface {
 type ThreadHandler interface {
 	CreateOrGetDirect(c *gin.Context)
 	List(c *gin.Context)
+	MarkRead(c *gin.Context)
 }
 
 type MessageHandler interface {
@@ -49,6 +50,7 @@ func New(
 	authenticated.GET("/users", userHandler.List)
 	authenticated.POST("/threads/direct", threadHandler.CreateOrGetDirect)
 	authenticated.GET("/threads", threadHandler.List)
+	authenticated.PUT("/threads/:id/read", threadHandler.MarkRead)
 	authenticated.POST("/threads/:id/messages", messageHandler.Send)
 	authenticated.GET("/threads/:id/messages", messageHandler.List)
 

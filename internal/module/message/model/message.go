@@ -14,3 +14,8 @@ type Message struct {
 	Content          string
 	CreatedAt        time.Time
 }
+
+type Page struct {
+	Messages   []Message
+	NextCursor *int64
+}

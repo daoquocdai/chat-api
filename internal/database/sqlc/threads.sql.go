@@ -100,6 +100,33 @@ func (q *Queries) GetDirectThreadByPair(ctx context.Context, arg GetDirectThread
 	return i, err
 }
 
+const getThreadReadBounds = `-- name: GetThreadReadBounds :one
+SELECT participant.joined_seq, thread.last_seq
+FROM threads AS thread
+JOIN participants AS participant
+  ON participant.thread_id = thread.id
+ AND participant.user_id = $1
+ AND participant.left_seq IS NULL
+WHERE thread.external_id = $2
+`
+
+type GetThreadReadBoundsParams struct {
+	UserID           int64
+	ThreadExternalID pgtype.UUID
+}
+
+type GetThreadReadBoundsRow struct {
+	JoinedSeq int64
+	LastSeq   int64
+}
+
+func (q *Queries) GetThreadReadBounds(ctx context.Context, arg GetThreadReadBoundsParams) (GetThreadReadBoundsRow, error) {
+	row := q.db.QueryRow(ctx, getThreadReadBounds, arg.UserID, arg.ThreadExternalID)
+	var i GetThreadReadBoundsRow
+	err := row.Scan(&i.JoinedSeq, &i.LastSeq)
+	return i, err
+}
+
 const getThreadSummaryForUser = `-- name: GetThreadSummaryForUser :one
 SELECT
     t.id,
@@ -108,6 +135,17 @@ SELECT
     peer.external_id AS peer_external_id,
     peer.username AS peer_username,
     t.last_seq,
+    mine.last_read_seq,
+    other.last_read_seq AS peer_last_read_seq,
+    (
+        SELECT COUNT(*)
+        FROM messages AS unread_message
+        WHERE unread_message.thread_id = t.id
+          AND unread_message.seq >= mine.joined_seq
+          AND unread_message.seq > mine.last_read_seq
+          AND unread_message.sender_id <> mine.user_id
+          AND unread_message.kind <> 'system'
+    ) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
@@ -143,6 +181,9 @@ type GetThreadSummaryForUserRow struct {
 	PeerExternalID              pgtype.UUID
 	PeerUsername                string
 	LastSeq                     int64
+	LastReadSeq                 int64
+	PeerLastReadSeq             int64
+	UnreadCount                 int64
 	LastMessageSeq              pgtype.Int8
 	LastMessageSenderExternalID pgtype.UUID
 	LastMessageContent          pgtype.Text
@@ -160,6 +201,9 @@ func (q *Queries) GetThreadSummaryForUser(ctx context.Context, arg GetThreadSumm
 		&i.PeerExternalID,
 		&i.PeerUsername,
 		&i.LastSeq,
+		&i.LastReadSeq,
+		&i.PeerLastReadSeq,
+		&i.UnreadCount,
 		&i.LastMessageSeq,
 		&i.LastMessageSenderExternalID,
 		&i.LastMessageContent,
@@ -177,6 +221,17 @@ SELECT
     peer.external_id AS peer_external_id,
     peer.username AS peer_username,
     t.last_seq,
+    mine.last_read_seq,
+    other.last_read_seq AS peer_last_read_seq,
+    (
+        SELECT COUNT(*)
+        FROM messages AS unread_message
+        WHERE unread_message.thread_id = t.id
+          AND unread_message.seq >= mine.joined_seq
+          AND unread_message.seq > mine.last_read_seq
+          AND unread_message.sender_id <> mine.user_id
+          AND unread_message.kind <> 'system'
+    ) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
@@ -206,6 +261,9 @@ type ListThreadsForUserRow struct {
 	PeerExternalID              pgtype.UUID
 	PeerUsername                string
 	LastSeq                     int64
+	LastReadSeq                 int64
+	PeerLastReadSeq             int64
+	UnreadCount                 int64
 	LastMessageSeq              pgtype.Int8
 	LastMessageSenderExternalID pgtype.UUID
 	LastMessageContent          pgtype.Text
@@ -229,6 +287,9 @@ func (q *Queries) ListThreadsForUser(ctx context.Context, userID int64) ([]ListT
 			&i.PeerExternalID,
 			&i.PeerUsername,
 			&i.LastSeq,
+			&i.LastReadSeq,
+			&i.PeerLastReadSeq,
+			&i.UnreadCount,
 			&i.LastMessageSeq,
 			&i.LastMessageSenderExternalID,
 			&i.LastMessageContent,
@@ -243,4 +304,30 @@ func (q *Queries) ListThreadsForUser(ctx context.Context, userID int64) ([]ListT
 		return nil, err
 	}
 	return items, nil
+}
+
+const markThreadRead = `-- name: MarkThreadRead :one
+UPDATE participants AS participant
+SET last_read_seq = GREATEST(participant.last_read_seq, $1)
+FROM threads AS thread
+WHERE participant.thread_id = thread.id
+  AND participant.user_id = $2
+  AND participant.left_seq IS NULL
+  AND thread.external_id = $3
+  AND $1 >= participant.joined_seq - 1
+  AND $1 <= thread.last_seq
+RETURNING participant.last_read_seq
+`
+
+type MarkThreadReadParams struct {
+	LastReadSeq      int64
+	UserID           int64
+	ThreadExternalID pgtype.UUID
+}
+
+func (q *Queries) MarkThreadRead(ctx context.Context, arg MarkThreadReadParams) (int64, error) {
+	row := q.db.QueryRow(ctx, markThreadRead, arg.LastReadSeq, arg.UserID, arg.ThreadExternalID)
+	var last_read_seq int64
+	err := row.Scan(&last_read_seq)
+	return last_read_seq, err
 }

@@ -11,6 +11,7 @@ import (
 type Repository interface {
 	CreateOrGetDirect(ctx context.Context, creatorID, peerID int64) (model.Thread, bool, error)
 	ListByUser(ctx context.Context, userID int64) ([]model.Thread, error)
+	MarkRead(ctx context.Context, threadExternalID string, userID, lastReadSeq int64) (int64, error)
 }
 
 type UserFinder interface {
@@ -68,4 +69,25 @@ func (s *Service) List(ctx context.Context, actorExternalID string) ([]model.Thr
 	}
 
 	return threads, nil
+}
+
+func (s *Service) MarkRead(
+	ctx context.Context,
+	actorExternalID, threadExternalID string,
+	lastReadSeq int64,
+) (int64, error) {
+	threadExternalID = strings.TrimSpace(threadExternalID)
+	if threadExternalID == "" {
+		return 0, model.ErrThreadIDRequired
+	}
+	if lastReadSeq < 0 {
+		return 0, model.ErrInvalidReadSequence
+	}
+
+	actor, err := s.users.GetByExternalID(ctx, actorExternalID)
+	if err != nil {
+		return 0, err
+	}
+
+	return s.repository.MarkRead(ctx, threadExternalID, actor.ID, lastReadSeq)
 }

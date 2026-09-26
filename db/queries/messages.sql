@@ -85,7 +85,7 @@ FROM created
 JOIN threads AS thread ON thread.id = created.thread_id
 JOIN users AS sender ON sender.id = created.sender_id;
 
--- name: ListThreadMessages :many
+-- name: ListThreadMessagesPage :many
 SELECT
     m.id,
     m.external_id,
@@ -106,4 +106,9 @@ JOIN participants AS participant
  AND participant.left_seq IS NULL
 WHERE t.external_id = sqlc.arg(thread_external_id)
   AND m.seq >= participant.joined_seq
-ORDER BY m.seq ASC;
+  AND (
+    sqlc.narg(before_seq)::BIGINT IS NULL
+    OR m.seq < sqlc.narg(before_seq)
+  )
+ORDER BY m.seq DESC
+LIMIT sqlc.arg(page_size)::INTEGER + 1;

@@ -8,4 +8,11 @@ var (
 	ErrClientMessageIDRequired = errors.New("client_msg_id is required")
 	ErrInvalidClientMessageID  = errors.New("client_msg_id must be a UUID")
 	ErrInvalidContent          = errors.New("content must be valid UTF-8, contain between 1 and 1000 Unicode characters, and cannot contain NUL")
+	ErrInvalidBeforeSeq        = errors.New("before_seq must be a positive integer")
+	ErrInvalidLimit            = errors.New("limit must be an integer between 1 and 100")
+)
+
+const (
+	DefaultPageLimit = 30
+	MaximumPageLimit = 100
 )

@@ -3,11 +3,14 @@
 ### Change @run before rerunning against a database that already has these users.
 
 @baseUrl = http://localhost:8080
-@run = manual01
+@run = manual02
 @password = Week2-local-demo-2026!
-@aliceMessageID = 11111111-1111-4111-8111-111111111111
-@bobMessageID = 22222222-2222-4222-8222-222222222222
-@malloryMessageID = 33333333-3333-4333-8333-333333333333
+@aliceMessage1ID = 11111111-1111-4111-8111-111111111111
+@aliceMessage2ID = 22222222-2222-4222-8222-222222222222
+@aliceMessage3ID = 33333333-3333-4333-8333-333333333333
+@aliceMessage4ID = 44444444-4444-4444-8444-444444444444
+@aliceMessage5ID = 55555555-5555-4555-8555-555555555555
+@malloryMessageID = 99999999-9999-4999-8999-999999999999
 
 ### Health is public
 GET {{baseUrl}}/health
@@ -79,7 +82,8 @@ GET {{baseUrl}}/users
 GET {{baseUrl}}/users
 Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 
-### Alice creates the direct thread with Bob: expect 201 Created
+### Alice creates the direct thread with Bob: expect 201 Created.
+### The empty thread has last_read_seq=0, peer_last_read_seq=0, unread_count=0.
 # @name aliceBobThread
 POST {{baseUrl}}/threads/direct
 Authorization: Bearer {{loginAlice.response.body.$.access_token}}
@@ -99,40 +103,131 @@ Content-Type: application/json
   "peer_id": "{{registerAlice.response.body.$.id}}"
 }
 
-### Alice sends a persisted message
+### Alice sends seq 1
 POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
 Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{aliceMessageID}}",
-  "content": "Chào Bob, tin này được lưu trong PostgreSQL."
+  "client_msg_id": "{{aliceMessage1ID}}",
+  "content": "Tin thứ nhất"
 }
 
-### Bob replies
+### Alice sends seq 2
 POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
-Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{bobMessageID}}",
-  "content": "Chào Alice."
+  "client_msg_id": "{{aliceMessage2ID}}",
+  "content": "Tin thứ hai"
 }
 
-### Bob lists his direct threads
+### Alice sends seq 3
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "client_msg_id": "{{aliceMessage3ID}}",
+  "content": "Tin thứ ba"
+}
+
+### Alice sends seq 4
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "client_msg_id": "{{aliceMessage4ID}}",
+  "content": "Tin thứ tư"
+}
+
+### Alice sends seq 5
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "client_msg_id": "{{aliceMessage5ID}}",
+  "content": "Tin thứ năm"
+}
+
+### Bob lists threads before reading: expect unread_count=5 and last_read_seq=0
 GET {{baseUrl}}/threads
 Authorization: Bearer {{loginBob.response.body.$.access_token}}
 
-### Alice reads the complete history in seq order
-GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+### First cursor page: expect seq [5, 4] and next_cursor=4
+# @name firstHistoryPage
+GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages?limit=2
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### Second cursor page: expect seq [3, 2] and next_cursor=2
+GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages?limit=2&before_seq={{firstHistoryPage.response.body.$.next_cursor}}
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### Invalid pagination parameter: expect 400 Bad Request
+GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages?limit=101
 Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 
 ### History without JWT: expect 401 Unauthorized
 GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
 
-### Mallory cannot read the Alice-Bob thread: expect 403 Forbidden
+### Bob marks through seq 5 as read: expect {"last_read_seq": 5}
+PUT {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/read
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "last_read_seq": 5
+}
+
+### Bob lists threads after reading: expect unread_count=0 and last_read_seq=5
+GET {{baseUrl}}/threads
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+
+### Alice sees peer_last_read_seq=5, so her sent messages through seq 5 are read
+GET {{baseUrl}}/threads
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### An older concurrent-style marker cannot decrease the stored value: still returns 5
+PUT {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/read
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "last_read_seq": 3
+}
+
+### Marker beyond threads.last_seq: expect 400 Bad Request
+PUT {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/read
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "last_read_seq": 6
+}
+
+### Read marker without JWT: expect 401 Unauthorized
+PUT {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/read
+Content-Type: application/json
+
+{
+  "last_read_seq": 5
+}
+
+### Mallory cannot read the Alice-Bob history: expect 403 Forbidden
 GET {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
 Authorization: Bearer {{loginMallory.response.body.$.access_token}}
+
+### Mallory cannot mark the Alice-Bob thread as read: expect 403 Forbidden
+PUT {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/read
+Authorization: Bearer {{loginMallory.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "last_read_seq": 1
+}
 
 ### Mallory cannot send to the Alice-Bob thread: expect 403 Forbidden
 POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages

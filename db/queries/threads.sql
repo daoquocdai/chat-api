@@ -29,6 +29,17 @@ SELECT
     peer.external_id AS peer_external_id,
     peer.username AS peer_username,
     t.last_seq,
+    mine.last_read_seq,
+    other.last_read_seq AS peer_last_read_seq,
+    (
+        SELECT COUNT(*)
+        FROM messages AS unread_message
+        WHERE unread_message.thread_id = t.id
+          AND unread_message.seq >= mine.joined_seq
+          AND unread_message.seq > mine.last_read_seq
+          AND unread_message.sender_id <> mine.user_id
+          AND unread_message.kind <> 'system'
+    ) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
@@ -59,6 +70,17 @@ SELECT
     peer.external_id AS peer_external_id,
     peer.username AS peer_username,
     t.last_seq,
+    mine.last_read_seq,
+    other.last_read_seq AS peer_last_read_seq,
+    (
+        SELECT COUNT(*)
+        FROM messages AS unread_message
+        WHERE unread_message.thread_id = t.id
+          AND unread_message.seq >= mine.joined_seq
+          AND unread_message.seq > mine.last_read_seq
+          AND unread_message.sender_id <> mine.user_id
+          AND unread_message.kind <> 'system'
+    ) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
@@ -79,3 +101,24 @@ WHERE mine.user_id = sqlc.arg(user_id)
   AND mine.left_seq IS NULL
   AND t.kind = 'direct'
 ORDER BY COALESCE(last_message.created_at, t.created_at) DESC, t.id DESC;
+
+-- name: MarkThreadRead :one
+UPDATE participants AS participant
+SET last_read_seq = GREATEST(participant.last_read_seq, sqlc.arg(last_read_seq))
+FROM threads AS thread
+WHERE participant.thread_id = thread.id
+  AND participant.user_id = sqlc.arg(user_id)
+  AND participant.left_seq IS NULL
+  AND thread.external_id = sqlc.arg(thread_external_id)
+  AND sqlc.arg(last_read_seq) >= participant.joined_seq - 1
+  AND sqlc.arg(last_read_seq) <= thread.last_seq
+RETURNING participant.last_read_seq;
+
+-- name: GetThreadReadBounds :one
+SELECT participant.joined_seq, thread.last_seq
+FROM threads AS thread
+JOIN participants AS participant
+  ON participant.thread_id = thread.id
+ AND participant.user_id = sqlc.arg(user_id)
+ AND participant.left_seq IS NULL
+WHERE thread.external_id = sqlc.arg(thread_external_id);

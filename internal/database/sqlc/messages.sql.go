@@ -188,7 +188,7 @@ func (q *Queries) IncrementThreadSequence(ctx context.Context, id int64) (int64,
 	return last_seq, err
 }
 
-const listThreadMessages = `-- name: ListThreadMessages :many
+const listThreadMessagesPage = `-- name: ListThreadMessagesPage :many
 SELECT
     m.id,
     m.external_id,
@@ -209,15 +209,22 @@ JOIN participants AS participant
  AND participant.left_seq IS NULL
 WHERE t.external_id = $2
   AND m.seq >= participant.joined_seq
-ORDER BY m.seq ASC
+  AND (
+    $3::BIGINT IS NULL
+    OR m.seq < $3
+  )
+ORDER BY m.seq DESC
+LIMIT $4::INTEGER + 1
 `
 
-type ListThreadMessagesParams struct {
+type ListThreadMessagesPageParams struct {
 	UserID           int64
 	ThreadExternalID pgtype.UUID
+	BeforeSeq        pgtype.Int8
+	PageSize         int32
 }
 
-type ListThreadMessagesRow struct {
+type ListThreadMessagesPageRow struct {
 	ID               int64
 	ExternalID       pgtype.UUID
 	ThreadExternalID pgtype.UUID
@@ -230,15 +237,20 @@ type ListThreadMessagesRow struct {
 	CreatedAt        pgtype.Timestamptz
 }
 
-func (q *Queries) ListThreadMessages(ctx context.Context, arg ListThreadMessagesParams) ([]ListThreadMessagesRow, error) {
-	rows, err := q.db.Query(ctx, listThreadMessages, arg.UserID, arg.ThreadExternalID)
+func (q *Queries) ListThreadMessagesPage(ctx context.Context, arg ListThreadMessagesPageParams) ([]ListThreadMessagesPageRow, error) {
+	rows, err := q.db.Query(ctx, listThreadMessagesPage,
+		arg.UserID,
+		arg.ThreadExternalID,
+		arg.BeforeSeq,
+		arg.PageSize,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListThreadMessagesRow
+	var items []ListThreadMessagesPageRow
 	for rows.Next() {
-		var i ListThreadMessagesRow
+		var i ListThreadMessagesPageRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.ExternalID,

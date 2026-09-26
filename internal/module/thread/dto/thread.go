@@ -10,6 +10,14 @@ type CreateDirectRequest struct {
 	PeerID string `json:"peer_id"`
 }
 
+type MarkReadRequest struct {
+	LastReadSeq *int64 `json:"last_read_seq"`
+}
+
+type MarkReadResponse struct {
+	LastReadSeq int64 `json:"last_read_seq"`
+}
+
 type PeerResponse struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
@@ -23,21 +31,27 @@ type LastMessageResponse struct {
 }
 
 type ThreadResponse struct {
-	ID          string               `json:"id"`
-	Kind        string               `json:"kind"`
-	Peer        PeerResponse         `json:"peer"`
-	LastSeq     int64                `json:"last_seq"`
-	LastMessage *LastMessageResponse `json:"last_message"`
-	CreatedAt   time.Time            `json:"created_at"`
+	ID              string               `json:"id"`
+	Kind            string               `json:"kind"`
+	Peer            PeerResponse         `json:"peer"`
+	LastSeq         int64                `json:"last_seq"`
+	LastReadSeq     int64                `json:"last_read_seq"`
+	PeerLastReadSeq int64                `json:"peer_last_read_seq"`
+	UnreadCount     int64                `json:"unread_count"`
+	LastMessage     *LastMessageResponse `json:"last_message"`
+	CreatedAt       time.Time            `json:"created_at"`
 }
 
 func ToThreadResponse(thread model.Thread) ThreadResponse {
 	response := ThreadResponse{
-		ID:        thread.ExternalID,
-		Kind:      thread.Kind,
-		Peer:      PeerResponse{ID: thread.Peer.ExternalID, Username: thread.Peer.Username},
-		LastSeq:   thread.LastSeq,
-		CreatedAt: thread.CreatedAt,
+		ID:              thread.ExternalID,
+		Kind:            thread.Kind,
+		Peer:            PeerResponse{ID: thread.Peer.ExternalID, Username: thread.Peer.Username},
+		LastSeq:         thread.LastSeq,
+		LastReadSeq:     thread.LastReadSeq,
+		PeerLastReadSeq: thread.PeerLastReadSeq,
+		UnreadCount:     thread.UnreadCount,
+		CreatedAt:       thread.CreatedAt,
 	}
 
 	if thread.LastMessage != nil {

@@ -30,16 +30,27 @@ const state = {
   threadID: "",
   conversationVersion: 0,
   messages: new Map(),
+  messageIDs: new Map(),
   messagesLoaded: false,
+  syncedSeq: 0,
   nextCursor: null,
   lastReadSeq: 0,
   peerLastReadSeq: 0,
   seenReceivedSeqs: new Set(),
-  latestRequest: null,
+  initialHistoryRequest: null,
+  syncAfterInitial: false,
+  catchupRequest: null,
+  catchupAgain: false,
   olderRequest: null,
   threadListRequest: null,
+  threadListDirty: false,
   readRequest: null,
   pendingReadSeq: 0,
+  socket: null,
+  socketConnecting: false,
+  socketGeneration: 0,
+  reconnectTimer: null,
+  reconnectDelay: 1000,
 };
 
 function showNotice(message) {
@@ -120,12 +131,17 @@ function resetConversation() {
   state.threadID = "";
   state.conversationVersion += 1;
   state.messages = new Map();
+  state.messageIDs = new Map();
   state.messagesLoaded = false;
+  state.syncedSeq = 0;
   state.nextCursor = null;
   state.lastReadSeq = 0;
   state.peerLastReadSeq = 0;
   state.seenReceivedSeqs = new Set();
-  state.latestRequest = null;
+  state.initialHistoryRequest = null;
+  state.syncAfterInitial = false;
+  state.catchupRequest = null;
+  state.catchupAgain = false;
   state.olderRequest = null;
   state.readRequest = null;
   state.pendingReadSeq = 0;
@@ -140,6 +156,7 @@ function resetConversation() {
 }
 
 function clearSession() {
+  stopWebSocket();
   sessionStorage.removeItem(sessionTokenKey);
   sessionStorage.removeItem(sessionUsernameKey);
   state.sessionVersion += 1;
@@ -149,6 +166,7 @@ function clearSession() {
   state.users = [];
   state.threadsByPeer = new Map();
   state.threadListRequest = null;
+  state.threadListDirty = false;
   resetConversation();
   authView.hidden = false;
   chatView.hidden = true;
@@ -274,6 +292,7 @@ async function loadThreads() {
     state.threadListRequest.sessionVersion === sessionVersion &&
     state.threadListRequest.token === token
   ) {
+    state.threadListDirty = true;
     return;
   }
 
@@ -295,6 +314,10 @@ async function loadThreads() {
   } finally {
     if (state.threadListRequest === request) {
       state.threadListRequest = null;
+      if (state.threadListDirty && currentSessionMatches(sessionVersion, token)) {
+        state.threadListDirty = false;
+        void loadThreads();
+      }
     }
   }
 }
@@ -307,12 +330,7 @@ function displayName(userID) {
 }
 
 function mergeMessages(messages) {
-  for (const message of messages) {
-    const seq = Number(message.seq);
-    if (Number.isSafeInteger(seq) && seq > 0) {
-      state.messages.set(seq, message);
-    }
-  }
+  return MiniHermesRealtime.merge(state.messages, state.messageIDs, messages);
 }
 
 function sortedMessages() {
@@ -388,59 +406,212 @@ function pageURL(threadID, beforeSeq = null) {
   return `/threads/${threadID}/messages?${params}`;
 }
 
-async function pollLatestMessages(initial = false) {
+async function loadInitialHistory() {
   if (!state.threadID || !state.token) {
     return;
   }
   const snapshot = conversationSnapshot();
-  if (
-    state.latestRequest &&
-    state.latestRequest.version === snapshot.version &&
-    state.latestRequest.threadID === snapshot.threadID
-  ) {
+  if (state.initialHistoryRequest) {
+    state.syncAfterInitial = true;
     return;
   }
-
   const request = { ...snapshot };
-  state.latestRequest = request;
-  const knownHighest = highestMessageSeq();
-  const visitedCursors = new Set();
-  let beforeSeq = null;
-  let firstPage = true;
-
+  state.initialHistoryRequest = request;
   try {
-    while (true) {
-      const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
-      if (!currentConversationMatches(snapshot)) {
-        return;
-      }
-
-      const messages = Array.isArray(page.messages) ? page.messages : [];
-      if (initial && firstPage) {
-        state.nextCursor = page.next_cursor ?? null;
-      }
-      mergeMessages(messages);
-
-      const reachedKnownMessage = knownHighest > 0 && messages.some((message) => message.seq <= knownHighest);
-      const nextCursor = page.next_cursor ?? null;
-      if (initial || nextCursor === null || reachedKnownMessage || visitedCursors.has(nextCursor)) {
-        break;
-      }
-      visitedCursors.add(nextCursor);
-      beforeSeq = nextCursor;
-      firstPage = false;
+    const page = await apiRequest(pageURL(snapshot.threadID));
+    if (!currentConversationMatches(snapshot)) {
+      return;
     }
-
+    const messages = Array.isArray(page.messages) ? page.messages : [];
+    mergeMessages(messages);
+    state.nextCursor = page.next_cursor ?? null;
+    state.syncedSeq = Math.max(0, ...messages.map((message) => Number(message.seq) || 0));
     state.messagesLoaded = true;
-    renderMessages(initial ? "initial" : "new");
+    renderMessages("initial");
     showError("");
+    // An event could have arrived while the first REST page was in flight.
+    if (state.syncAfterInitial || highestMessageSeq() > state.syncedSeq) {
+      state.syncAfterInitial = false;
+      await catchUpConversation(snapshot);
+    }
   } catch (error) {
     if (currentConversationMatches(snapshot)) {
       showError(error.message);
     }
   } finally {
-    if (state.latestRequest === request) {
-      state.latestRequest = null;
+    if (state.initialHistoryRequest === request) {
+      state.initialHistoryRequest = null;
+    }
+  }
+}
+
+async function catchUpConversation(snapshot = conversationSnapshot()) {
+  if (!currentConversationMatches(snapshot) || !state.messagesLoaded) {
+    return;
+  }
+  if (state.catchupRequest) {
+    state.catchupAgain = true;
+    return;
+  }
+  const request = { ...snapshot };
+  state.catchupRequest = request;
+  const baseline = state.syncedSeq;
+  const stale = new Error("conversation changed");
+  try {
+    const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
+      async (beforeSeq) => {
+        const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
+        if (!currentConversationMatches(snapshot)) {
+          throw stale;
+        }
+        return page;
+      },
+      baseline,
+      (messages) => mergeMessages(messages),
+    );
+    if (!currentConversationMatches(snapshot)) {
+      return;
+    }
+    state.syncedSeq = Math.max(state.syncedSeq, maxSeq);
+    renderMessages("new");
+    showError("");
+  } catch (error) {
+    if (error !== stale && currentConversationMatches(snapshot)) {
+      showError(error.message);
+    }
+  } finally {
+    if (state.catchupRequest === request) {
+      state.catchupRequest = null;
+      const again = state.catchupAgain;
+      state.catchupAgain = false;
+      if (again && currentConversationMatches(snapshot)) {
+        void catchUpConversation(snapshot);
+      }
+    }
+  }
+}
+
+async function syncCurrentConversation() {
+  if (!state.threadID) {
+    return;
+  }
+  if (!state.messagesLoaded) {
+    await loadInitialHistory();
+  } else {
+    await catchUpConversation();
+  }
+}
+
+function stopWebSocket() {
+  state.socketGeneration += 1;
+  if (state.reconnectTimer !== null) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+  const socket = state.socket;
+  state.socket = null;
+  state.socketConnecting = false;
+  state.reconnectDelay = 1000;
+  if (socket) {
+    socket.close(1000, "session ended");
+  }
+}
+
+function scheduleReconnect(generation, sessionVersion, token) {
+  if (generation !== state.socketGeneration || !currentSessionMatches(sessionVersion, token) ||
+      state.reconnectTimer !== null) {
+    return;
+  }
+  const delay = state.reconnectDelay;
+  state.reconnectDelay = Math.min(delay * 2, 30000);
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null;
+    void connectWebSocket();
+  }, delay);
+}
+
+function handleSocketMessage(data) {
+  let event;
+  try {
+    event = JSON.parse(data);
+  } catch {
+    return;
+  }
+  const seq = Number(event.seq);
+  if (event.type !== "message.created" || event.recipient_id !== state.currentUserID ||
+      typeof event.message_id !== "string" || typeof event.thread_id !== "string" ||
+      !Number.isSafeInteger(seq) || seq <= 0) {
+    return;
+  }
+  if (event.thread_id === state.threadID) {
+    const changed = mergeMessages([event]);
+    if (state.messagesLoaded) {
+      if (seq > state.syncedSeq + 1) {
+        void catchUpConversation();
+      } else {
+        while (state.messages.has(state.syncedSeq + 1)) {
+          state.syncedSeq += 1;
+        }
+      }
+      if (changed) {
+        renderMessages("new");
+      }
+    }
+  }
+  // Summary/unread count is updated by an event-triggered request, never a timer.
+  void loadThreads();
+}
+
+async function connectWebSocket() {
+  if (!state.token || state.socket || state.socketConnecting) {
+    return;
+  }
+  const sessionVersion = state.sessionVersion;
+  const token = state.token;
+  const generation = state.socketGeneration;
+  state.socketConnecting = true;
+  try {
+    const response = await apiRequest("/auth/ws-ticket", { method: "POST" });
+    if (generation !== state.socketGeneration || !currentSessionMatches(sessionVersion, token)) {
+      return;
+    }
+    const url = new URL(response.ws_url);
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+      throw new Error("Địa chỉ WebSocket không hợp lệ.");
+    }
+    url.searchParams.set("ticket", response.ticket);
+    const socket = new WebSocket(url.toString());
+    state.socket = socket;
+    socket.onopen = () => {
+      if (generation !== state.socketGeneration || state.socket !== socket) {
+        socket.close();
+        return;
+      }
+      state.socketConnecting = false;
+      state.reconnectDelay = 1000;
+      showError("");
+      void loadThreads();
+      void syncCurrentConversation();
+    };
+    socket.onmessage = (message) => {
+      if (generation === state.socketGeneration && state.socket === socket) {
+        handleSocketMessage(message.data);
+      }
+    };
+    socket.onerror = () => socket.close();
+    socket.onclose = () => {
+      if (generation !== state.socketGeneration || state.socket !== socket) {
+        return;
+      }
+      state.socket = null;
+      state.socketConnecting = false;
+      scheduleReconnect(generation, sessionVersion, token);
+    };
+  } catch (error) {
+    if (generation === state.socketGeneration && currentSessionMatches(sessionVersion, token)) {
+      state.socketConnecting = false;
+      showError(error.message);
+      scheduleReconnect(generation, sessionVersion, token);
     }
   }
 }
@@ -586,12 +757,17 @@ async function openConversation(peerID) {
   state.peerID = peerID;
   state.threadID = "";
   state.messages = new Map();
+  state.messageIDs = new Map();
   state.messagesLoaded = false;
+  state.syncedSeq = 0;
   state.nextCursor = null;
   state.lastReadSeq = 0;
   state.peerLastReadSeq = 0;
   state.seenReceivedSeqs = new Set();
-  state.latestRequest = null;
+  state.initialHistoryRequest = null;
+  state.syncAfterInitial = false;
+  state.catchupRequest = null;
+  state.catchupAgain = false;
   state.olderRequest = null;
   state.readRequest = null;
   state.pendingReadSeq = 0;
@@ -628,7 +804,7 @@ async function openConversation(peerID) {
     contentInput.disabled = false;
     sendButton.disabled = false;
     refreshButton.disabled = false;
-    await pollLatestMessages(true);
+    await loadInitialHistory();
     if (version === state.conversationVersion && thread.id === state.threadID) {
       contentInput.focus();
     }
@@ -679,6 +855,7 @@ loginForm.addEventListener("submit", async (event) => {
       throw new Error("Token đăng nhập không hợp lệ.");
     }
 
+    stopWebSocket();
     state.sessionVersion += 1;
     state.token = response.access_token;
     state.currentUserID = userID;
@@ -692,6 +869,7 @@ loginForm.addEventListener("submit", async (event) => {
     showChatView();
     await loadUsers();
     await loadThreads();
+    void connectWebSocket();
   } catch (error) {
     showError(error.message);
   }
@@ -714,6 +892,13 @@ messageForm.addEventListener("submit", async (event) => {
     }
     contentInput.value = "";
     mergeMessages([message]);
+    if (Number(message.seq) > state.syncedSeq + 1) {
+      void catchUpConversation(snapshot);
+    } else {
+      while (state.messages.has(state.syncedSeq + 1)) {
+        state.syncedSeq += 1;
+      }
+    }
     renderMessages("bottom", false);
     await loadThreads();
   } catch (error) {
@@ -734,7 +919,7 @@ logoutButton.addEventListener("click", () => {
 });
 
 refreshButton.addEventListener("click", async () => {
-  await Promise.all([loadThreads(), pollLatestMessages()]);
+  await Promise.all([loadThreads(), syncCurrentConversation()]);
 });
 
 loadOlderButton.addEventListener("click", loadOlderMessages);
@@ -751,33 +936,24 @@ historyElement.addEventListener("scroll", () => {
   });
 });
 
-window.addEventListener("focus", async () => {
-  if (!state.token) {
-    return;
-  }
-  try {
-    await loadUsers();
-    await Promise.all([loadThreads(), pollLatestMessages()]);
-  } catch (error) {
-    showError(error.message);
-  }
-});
-
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible" || !state.token) {
     return;
   }
   const snapshot = conversationSnapshot();
   recordVisibleMessages(snapshot);
-  Promise.all([loadThreads(), pollLatestMessages()]).catch((error) => showError(error.message));
 });
 
-setInterval(() => {
-  if (!state.token) {
+window.addEventListener("online", () => {
+  if (!state.token || state.socket || state.socketConnecting) {
     return;
   }
-  Promise.all([loadThreads(), pollLatestMessages()]).catch((error) => showError(error.message));
-}, 1500);
+  if (state.reconnectTimer !== null) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+  void connectWebSocket();
+});
 
 state.token = sessionStorage.getItem(sessionTokenKey) || "";
 state.currentUserID = decodeSubject(state.token);
@@ -785,7 +961,9 @@ state.currentUsername = sessionStorage.getItem(sessionUsernameKey) || "";
 if (state.token && state.currentUserID) {
   state.sessionVersion += 1;
   showChatView();
-  Promise.all([loadUsers(), loadThreads()]).catch((error) => showError(error.message));
+  Promise.all([loadUsers(), loadThreads()])
+    .then(() => connectWebSocket())
+    .catch((error) => showError(error.message));
 } else {
   clearSession();
 }

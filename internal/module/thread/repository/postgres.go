@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
@@ -32,15 +33,37 @@ func (r *PostgresRepository) CreateOrGetDirect(
 	created := false
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		queries := sqlc.New(tx)
-		createParams := sqlc.CreateDirectThreadParams{
-			CreatedBy:        creatorID,
-			DirectUserLowID:  pgtype.Int8{Int64: lowID, Valid: true},
-			DirectUserHighID: pgtype.Int8{Int64: highID, Valid: true},
+		lockedUsers, err := queries.LockUsersForDirectThread(ctx, sqlc.LockUsersForDirectThreadParams{
+			UserLowID:  lowID,
+			UserHighID: highID,
+		})
+		if err != nil {
+			return err
+		}
+		if len(lockedUsers) != 2 {
+			return fmt.Errorf("lock direct thread users: expected 2 users, got %d", len(lockedUsers))
 		}
 
-		thread, err := queries.CreateDirectThread(ctx, createParams)
+		var thread sqlc.CreateDirectThreadRow
+		existing, err := queries.GetDirectThreadByParticipants(
+			ctx,
+			sqlc.GetDirectThreadByParticipantsParams{UserLowID: lowID, UserHighID: highID},
+		)
 		if err == nil {
-			created = true
+			thread = sqlc.CreateDirectThreadRow{
+				ID:         existing.ID,
+				ExternalID: existing.ExternalID,
+				Kind:       existing.Kind,
+				LastSeq:    existing.LastSeq,
+				CreatedAt:  existing.CreatedAt,
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		} else {
+			thread, err = queries.CreateDirectThread(ctx, creatorID)
+			if err != nil {
+				return err
+			}
 			if err := queries.CreateParticipant(ctx, sqlc.CreateParticipantParams{
 				ThreadID: thread.ID,
 				UserID:   lowID,
@@ -53,23 +76,7 @@ func (r *PostgresRepository) CreateOrGetDirect(
 			}); err != nil {
 				return err
 			}
-		} else if errors.Is(err, pgx.ErrNoRows) {
-			existing, getErr := queries.GetDirectThreadByPair(ctx, sqlc.GetDirectThreadByPairParams{
-				DirectUserLowID:  createParams.DirectUserLowID,
-				DirectUserHighID: createParams.DirectUserHighID,
-			})
-			if getErr != nil {
-				return getErr
-			}
-			thread = sqlc.CreateDirectThreadRow{
-				ID:         existing.ID,
-				ExternalID: existing.ExternalID,
-				Kind:       existing.Kind,
-				LastSeq:    existing.LastSeq,
-				CreatedAt:  existing.CreatedAt,
-			}
-		} else {
-			return err
+			created = true
 		}
 
 		summary, err := queries.GetThreadSummaryForUser(ctx, sqlc.GetThreadSummaryForUserParams{

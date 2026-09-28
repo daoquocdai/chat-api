@@ -14,7 +14,6 @@ type Message struct {
 	ThreadID      int64
 	SenderID      int64
 	Seq           int64
-	ClientMsgID   pgtype.UUID
 	Kind          string
 	ContentFormat string
 	Content       string
@@ -46,16 +45,14 @@ type Prekey struct {
 }
 
 type Thread struct {
-	ID               int64
-	ExternalID       pgtype.UUID
-	Kind             string
-	Name             pgtype.Text
-	CreatedBy        int64
-	DirectUserLowID  pgtype.Int8
-	DirectUserHighID pgtype.Int8
-	EncryptionMode   string
-	LastSeq          int64
-	CreatedAt        pgtype.Timestamptz
+	ID             int64
+	ExternalID     pgtype.UUID
+	Kind           string
+	Name           pgtype.Text
+	CreatedBy      int64
+	EncryptionMode string
+	LastSeq        int64
+	CreatedAt      pgtype.Timestamptz
 }
 
 type User struct {

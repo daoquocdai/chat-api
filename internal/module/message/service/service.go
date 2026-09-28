@@ -16,7 +16,7 @@ type Repository interface {
 		ctx context.Context,
 		threadExternalID string,
 		senderID int64,
-		clientMessageID, content string,
+		messageID, content string,
 	) (model.Message, bool, error)
 	List(
 		ctx context.Context,
@@ -42,15 +42,15 @@ func New(repository Repository, users UserFinder) *Service {
 
 func (s *Service) Send(
 	ctx context.Context,
-	actorExternalID, threadExternalID, clientMessageID, content string,
+	actorExternalID, threadExternalID, messageID, content string,
 ) (model.Message, bool, error) {
 	threadExternalID = strings.TrimSpace(threadExternalID)
 	if threadExternalID == "" {
 		return model.Message{}, false, model.ErrThreadIDRequired
 	}
-	clientMessageID = strings.TrimSpace(clientMessageID)
-	if clientMessageID == "" {
-		return model.Message{}, false, model.ErrClientMessageIDRequired
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return model.Message{}, false, model.ErrMessageIDRequired
 	}
 	content = strings.TrimSpace(content)
 	if length := utf8.RuneCountInString(content); !utf8.ValidString(content) ||
@@ -63,7 +63,7 @@ func (s *Service) Send(
 		return model.Message{}, false, err
 	}
 
-	return s.repository.Send(ctx, threadExternalID, actor.ID, clientMessageID, content)
+	return s.repository.Send(ctx, threadExternalID, actor.ID, messageID, content)
 }
 
 func (s *Service) List(

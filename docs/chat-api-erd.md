@@ -7,8 +7,6 @@ Bản nháp để review trước khi viết migration.
 ```mermaid
 erDiagram
     USERS ||--o{ THREADS : "tạo"
-    USERS o|--o{ THREADS : "direct_user_low_id"
-    USERS o|--o{ THREADS : "direct_user_high_id"
     USERS ||--o{ PARTICIPANTS : "tham gia"
     THREADS ||--o{ PARTICIPANTS : "có các đợt tham gia"
     THREADS ||--o{ MESSAGES : "chứa"
@@ -31,8 +29,6 @@ erDiagram
         text kind "direct hoặc group"
         text name "nullable"
         bigint created_by FK
-        bigint direct_user_low_id FK "nullable"
-        bigint direct_user_high_id FK "nullable"
         text encryption_mode "plaintext hoặc e2ee"
         bigint last_seq
         timestamptz created_at
@@ -56,7 +52,6 @@ erDiagram
         bigint thread_id FK
         bigint sender_id FK
         bigint seq
-        uuid client_msg_id "nullable với tin hệ thống"
         text kind "text hoặc system"
         text content_format "plaintext hoặc e2ee_v1"
         text content
@@ -96,7 +91,7 @@ Lưu thông tin mỗi tài khoản một lần. Bài không làm nhiều thiết
 
 ### `threads` — Cuộc trò chuyện
 
-Tập hợp thành viên và lịch sử của một cuộc trò chuyện. Cặp ID nhỏ/lớn giúp database chặn hai thread 1-1 cho cùng một cặp người, dù ai tạo trước.
+Tập hợp metadata và lịch sử của một cuộc trò chuyện. Thành viên direct thread chỉ được lưu ở `participants`, không lặp lại cặp user trong `threads`.
 
 | Tên cột | Kiểu dữ liệu | Giải thích |
 |---|---|---|
@@ -105,8 +100,6 @@ Tập hợp thành viên và lịch sử của một cuộc trò chuyện. Cặp
 | `kind` | `TEXT` | Loại cuộc trò chuyện: direct (1-1) hoặc group (nhóm). |
 | `name` (NULL) | `TEXT` | Tên nhóm, bắt buộc không rỗng với group. Thread direct để NULL. |
 | `created_by` (FK) | `BIGINT` | Tham chiếu users.id: người tạo thread. Quyền hiện tại được xác định bằng participants.role. |
-| `direct_user_low_id` (FK, NULL) | `BIGINT` | Tham chiếu users.id: ID nhỏ hơn trong cặp 1-1. Group để NULL. |
-| `direct_user_high_id` (FK, NULL) | `BIGINT` | Tham chiếu users.id: ID lớn hơn trong cặp 1-1. Group để NULL. |
 | `encryption_mode` | `TEXT` | plaintext hoặc e2ee. Trong phạm vi đề, group chỉ dùng plaintext. |
 | `last_seq` | `BIGINT` | Thứ tự tin cuối đã lưu trong thread, mặc định 0. Việc tăng mốc và ghi tin phải nằm trong cùng transaction. |
 | `created_at` | `TIMESTAMPTZ` | Thời điểm tạo cuộc trò chuyện. |
@@ -134,11 +127,10 @@ Tin người dùng và tin hệ thống dùng chung lịch sử, cùng thứ t�
 | Tên cột | Kiểu dữ liệu | Giải thích |
 |---|---|---|
 | `id` (PK) | `BIGINT` | ID nội bộ của tin nhắn. |
-| `external_id` (UK) | `UUID` | ID công khai của tin do server cấp; client có thể dùng để chống hiển thị lặp. |
+| `external_id` (UK) | `UUID` | ID công khai và khóa retry toàn cục. Client sinh trước mỗi lần gửi logic, dùng lại khi retry; tin hệ thống về sau có thể dùng UUID mặc định do server/PostgreSQL sinh. |
 | `thread_id` (FK) | `BIGINT` | Tham chiếu threads.id: cuộc trò chuyện chứa tin. |
 | `sender_id` (FK) | `BIGINT` | Tham chiếu users.id: người gửi; với tin hệ thống là người thực hiện hành động. |
 | `seq` | `BIGINT` | Thứ tự trong thread, bắt đầu từ 1; dùng sắp lịch sử, cursor và mốc đọc. |
-| `client_msg_id` (NULL) | `UUID` | Client sinh cho mỗi lần chủ động gửi, giữ nguyên khi retry. Bắt buộc với tin text; NULL với tin system. |
 | `kind` | `TEXT` | text: tin người dùng. system: thông báo do backend tạo, ví dụ thêm hoặc xóa thành viên. |
 | `content_format` | `TEXT` | plaintext hoặc e2ee_v1. Phải phù hợp chế độ thread; tin system dùng plaintext. |
 | `content` | `TEXT` | Văn bản hoặc ciphertext biểu diễn dưới dạng Base64. Với E2EE, không lưu bản rõ trong trường này. |

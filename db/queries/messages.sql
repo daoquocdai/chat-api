@@ -22,14 +22,15 @@ JOIN participants AS p
 WHERE t.external_id = sqlc.arg(thread_external_id)
 FOR UPDATE OF t;
 
--- name: GetMessageByClientID :one
+-- name: GetMessageByExternalID :one
 SELECT
     m.id,
     m.external_id,
+    m.thread_id,
+    m.sender_id,
     t.external_id AS thread_external_id,
     sender.external_id AS sender_external_id,
     m.seq,
-    m.client_msg_id,
     m.kind,
     m.content_format,
     m.content,
@@ -37,9 +38,7 @@ SELECT
 FROM messages AS m
 JOIN threads AS t ON t.id = m.thread_id
 JOIN users AS sender ON sender.id = m.sender_id
-WHERE m.thread_id = sqlc.arg(thread_id)
-  AND m.sender_id = sqlc.arg(sender_id)
-  AND m.client_msg_id = sqlc.arg(client_msg_id);
+WHERE m.external_id = sqlc.arg(message_external_id);
 
 -- name: IncrementThreadSequence :one
 UPDATE threads
@@ -50,25 +49,25 @@ RETURNING last_seq;
 -- name: CreateThreadMessage :one
 WITH created AS (
     INSERT INTO messages (
+        external_id,
         thread_id,
         sender_id,
         seq,
-        client_msg_id,
         kind,
         content_format,
         content
     )
     VALUES (
+        sqlc.arg(message_external_id),
         sqlc.arg(thread_id),
         sqlc.arg(sender_id),
         sqlc.arg(seq),
-        sqlc.arg(client_msg_id),
         'text',
         'plaintext',
         sqlc.arg(content)
     )
     RETURNING id, external_id, thread_id, sender_id, seq,
-              client_msg_id, kind, content_format, content, created_at
+              kind, content_format, content, created_at
 )
 SELECT
     created.id,
@@ -76,7 +75,6 @@ SELECT
     thread.external_id AS thread_external_id,
     sender.external_id AS sender_external_id,
     created.seq,
-    created.client_msg_id,
     created.kind,
     created.content_format,
     created.content,
@@ -92,7 +90,6 @@ SELECT
     t.external_id AS thread_external_id,
     sender.external_id AS sender_external_id,
     m.seq,
-    m.client_msg_id,
     m.kind,
     m.content_format,
     m.content,

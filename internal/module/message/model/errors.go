@@ -3,13 +3,14 @@ package model
 import "errors"
 
 var (
-	ErrThreadIDRequired        = errors.New("thread ID is required")
-	ErrInvalidThreadID         = errors.New("thread ID must be a UUID")
-	ErrClientMessageIDRequired = errors.New("client_msg_id is required")
-	ErrInvalidClientMessageID  = errors.New("client_msg_id must be a UUID")
-	ErrInvalidContent          = errors.New("content must be valid UTF-8, contain between 1 and 1000 Unicode characters, and cannot contain NUL")
-	ErrInvalidBeforeSeq        = errors.New("before_seq must be a positive integer")
-	ErrInvalidLimit            = errors.New("limit must be an integer between 1 and 100")
+	ErrThreadIDRequired  = errors.New("thread ID is required")
+	ErrInvalidThreadID   = errors.New("thread ID must be a UUID")
+	ErrMessageIDRequired = errors.New("message_id is required")
+	ErrInvalidMessageID  = errors.New("message_id must be a UUID")
+	ErrMessageIDConflict = errors.New("message_id is already in use")
+	ErrInvalidContent    = errors.New("content must be valid UTF-8, contain between 1 and 1000 Unicode characters, and cannot contain NUL")
+	ErrInvalidBeforeSeq  = errors.New("before_seq must be a positive integer")
+	ErrInvalidLimit      = errors.New("limit must be an integer between 1 and 100")
 )
 
 const (

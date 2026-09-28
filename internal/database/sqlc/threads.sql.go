@@ -12,23 +12,10 @@ import (
 )
 
 const createDirectThread = `-- name: CreateDirectThread :one
-INSERT INTO threads (
-    kind, created_by, direct_user_low_id, direct_user_high_id, encryption_mode
-)
-VALUES (
-    'direct', $1, $2,
-    $3, 'plaintext'
-)
-ON CONFLICT (direct_user_low_id, direct_user_high_id) WHERE kind = 'direct'
-DO NOTHING
+INSERT INTO threads (kind, created_by, encryption_mode)
+VALUES ('direct', $1, 'plaintext')
 RETURNING id, external_id, kind, last_seq, created_at
 `
-
-type CreateDirectThreadParams struct {
-	CreatedBy        int64
-	DirectUserLowID  pgtype.Int8
-	DirectUserHighID pgtype.Int8
-}
 
 type CreateDirectThreadRow struct {
 	ID         int64
@@ -38,8 +25,8 @@ type CreateDirectThreadRow struct {
 	CreatedAt  pgtype.Timestamptz
 }
 
-func (q *Queries) CreateDirectThread(ctx context.Context, arg CreateDirectThreadParams) (CreateDirectThreadRow, error) {
-	row := q.db.QueryRow(ctx, createDirectThread, arg.CreatedBy, arg.DirectUserLowID, arg.DirectUserHighID)
+func (q *Queries) CreateDirectThread(ctx context.Context, createdBy int64) (CreateDirectThreadRow, error) {
+	row := q.db.QueryRow(ctx, createDirectThread, createdBy)
 	var i CreateDirectThreadRow
 	err := row.Scan(
 		&i.ID,
@@ -66,20 +53,27 @@ func (q *Queries) CreateParticipant(ctx context.Context, arg CreateParticipantPa
 	return err
 }
 
-const getDirectThreadByPair = `-- name: GetDirectThreadByPair :one
-SELECT id, external_id, kind, last_seq, created_at
-FROM threads
-WHERE kind = 'direct'
-  AND direct_user_low_id = $1
-  AND direct_user_high_id = $2
+const getDirectThreadByParticipants = `-- name: GetDirectThreadByParticipants :one
+SELECT thread.id, thread.external_id, thread.kind, thread.last_seq, thread.created_at
+FROM threads AS thread
+JOIN participants AS participant
+  ON participant.thread_id = thread.id
+ AND participant.left_seq IS NULL
+WHERE thread.kind = 'direct'
+GROUP BY thread.id
+HAVING COUNT(*) = 2
+   AND MIN(participant.user_id) = $1
+   AND MAX(participant.user_id) = $2
+ORDER BY thread.id
+LIMIT 1
 `
 
-type GetDirectThreadByPairParams struct {
-	DirectUserLowID  pgtype.Int8
-	DirectUserHighID pgtype.Int8
+type GetDirectThreadByParticipantsParams struct {
+	UserLowID  int64
+	UserHighID int64
 }
 
-type GetDirectThreadByPairRow struct {
+type GetDirectThreadByParticipantsRow struct {
 	ID         int64
 	ExternalID pgtype.UUID
 	Kind       string
@@ -87,9 +81,9 @@ type GetDirectThreadByPairRow struct {
 	CreatedAt  pgtype.Timestamptz
 }
 
-func (q *Queries) GetDirectThreadByPair(ctx context.Context, arg GetDirectThreadByPairParams) (GetDirectThreadByPairRow, error) {
-	row := q.db.QueryRow(ctx, getDirectThreadByPair, arg.DirectUserLowID, arg.DirectUserHighID)
-	var i GetDirectThreadByPairRow
+func (q *Queries) GetDirectThreadByParticipants(ctx context.Context, arg GetDirectThreadByParticipantsParams) (GetDirectThreadByParticipantsRow, error) {
+	row := q.db.QueryRow(ctx, getDirectThreadByParticipants, arg.UserLowID, arg.UserHighID)
+	var i GetDirectThreadByParticipantsRow
 	err := row.Scan(
 		&i.ID,
 		&i.ExternalID,
@@ -299,6 +293,39 @@ func (q *Queries) ListThreadsForUser(ctx context.Context, userID int64) ([]ListT
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockUsersForDirectThread = `-- name: LockUsersForDirectThread :many
+SELECT id
+FROM users
+WHERE id IN ($1, $2)
+ORDER BY id
+FOR UPDATE
+`
+
+type LockUsersForDirectThreadParams struct {
+	UserLowID  int64
+	UserHighID int64
+}
+
+func (q *Queries) LockUsersForDirectThread(ctx context.Context, arg LockUsersForDirectThreadParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, lockUsersForDirectThread, arg.UserLowID, arg.UserHighID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

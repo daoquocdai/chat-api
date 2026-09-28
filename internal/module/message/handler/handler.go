@@ -18,7 +18,7 @@ import (
 type MessageService interface {
 	Send(
 		ctx context.Context,
-		actorExternalID, threadExternalID, clientMessageID, content string,
+		actorExternalID, threadExternalID, messageID, content string,
 	) (model.Message, bool, error)
 	List(
 		ctx context.Context,
@@ -53,7 +53,7 @@ func (h *Handler) Send(c *gin.Context) {
 		c.Request.Context(),
 		actorExternalID,
 		c.Param("id"),
-		request.ClientMessageID,
+		request.MessageID,
 		request.Content,
 	)
 	if err != nil {
@@ -134,8 +134,8 @@ func writeError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, model.ErrThreadIDRequired),
 		errors.Is(err, model.ErrInvalidThreadID),
-		errors.Is(err, model.ErrClientMessageIDRequired),
-		errors.Is(err, model.ErrInvalidClientMessageID),
+		errors.Is(err, model.ErrMessageIDRequired),
+		errors.Is(err, model.ErrInvalidMessageID),
 		errors.Is(err, model.ErrInvalidContent),
 		errors.Is(err, model.ErrInvalidBeforeSeq),
 		errors.Is(err, model.ErrInvalidLimit):
@@ -146,6 +146,9 @@ func writeError(c *gin.Context, err error) {
 
 	case errors.Is(err, threadmodel.ErrNotParticipant):
 		c.JSON(http.StatusForbidden, gin.H{"error": threadmodel.ErrNotParticipant.Error()})
+
+	case errors.Is(err, model.ErrMessageIDConflict):
+		c.JSON(http.StatusConflict, gin.H{"error": model.ErrMessageIDConflict.Error()})
 
 	case errors.Is(err, usermodel.ErrUserNotFound), errors.Is(err, usermodel.ErrInvalidUserID):
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})

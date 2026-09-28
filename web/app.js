@@ -66,7 +66,9 @@ function decodeSubject(token) {
 async function readResponse(response) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(body.error || "Yêu cầu không thành công.");
+    const error = new Error(body.error || "Yêu cầu không thành công.");
+    error.status = response.status;
+    throw error;
   }
   return body;
 }
@@ -90,6 +92,27 @@ async function apiRequest(path, options = {}, authenticated = true) {
     throw new Error("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
   }
   return readResponse(response);
+}
+
+async function sendMessageWithRetry(snapshot, messageID, content) {
+  const request = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message_id: messageID, content }),
+  };
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await apiRequest(`/threads/${snapshot.threadID}/messages`, request);
+    } catch (error) {
+      const retryable = error.status === undefined || error.status >= 500;
+      if (attempt === 1 || !retryable || !currentConversationMatches(snapshot)) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error("Không thể gửi tin nhắn.");
 }
 
 function resetConversation() {
@@ -680,17 +703,12 @@ messageForm.addEventListener("submit", async (event) => {
     return;
   }
   const snapshot = conversationSnapshot();
+  const messageID = crypto.randomUUID();
+  const content = contentInput.value;
   sendButton.disabled = true;
   showError("");
   try {
-    const message = await apiRequest(`/threads/${snapshot.threadID}/messages`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_msg_id: crypto.randomUUID(),
-        content: contentInput.value,
-      }),
-    });
+    const message = await sendMessageWithRetry(snapshot, messageID, content);
     if (!currentConversationMatches(snapshot)) {
       return;
     }

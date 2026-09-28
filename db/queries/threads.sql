@@ -1,21 +1,28 @@
 -- name: CreateDirectThread :one
-INSERT INTO threads (
-    kind, created_by, direct_user_low_id, direct_user_high_id, encryption_mode
-)
-VALUES (
-    'direct', sqlc.arg(created_by), sqlc.arg(direct_user_low_id),
-    sqlc.arg(direct_user_high_id), 'plaintext'
-)
-ON CONFLICT (direct_user_low_id, direct_user_high_id) WHERE kind = 'direct'
-DO NOTHING
+INSERT INTO threads (kind, created_by, encryption_mode)
+VALUES ('direct', sqlc.arg(created_by), 'plaintext')
 RETURNING id, external_id, kind, last_seq, created_at;
 
--- name: GetDirectThreadByPair :one
-SELECT id, external_id, kind, last_seq, created_at
-FROM threads
-WHERE kind = 'direct'
-  AND direct_user_low_id = sqlc.arg(direct_user_low_id)
-  AND direct_user_high_id = sqlc.arg(direct_user_high_id);
+-- name: LockUsersForDirectThread :many
+SELECT id
+FROM users
+WHERE id IN (sqlc.arg(user_low_id), sqlc.arg(user_high_id))
+ORDER BY id
+FOR UPDATE;
+
+-- name: GetDirectThreadByParticipants :one
+SELECT thread.id, thread.external_id, thread.kind, thread.last_seq, thread.created_at
+FROM threads AS thread
+JOIN participants AS participant
+  ON participant.thread_id = thread.id
+ AND participant.left_seq IS NULL
+WHERE thread.kind = 'direct'
+GROUP BY thread.id
+HAVING COUNT(*) = 2
+   AND MIN(participant.user_id) = sqlc.arg(user_low_id)
+   AND MAX(participant.user_id) = sqlc.arg(user_high_id)
+ORDER BY thread.id
+LIMIT 1;
 
 -- name: CreateParticipant :exec
 INSERT INTO participants (thread_id, user_id, role, joined_seq, last_read_seq)

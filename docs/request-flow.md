@@ -33,15 +33,23 @@ Một PostgreSQL user repository phục vụ cả đăng ký/đăng nhập, look
 `POST /threads/direct` nhận `peer_id`; actor đến từ JWT.
 
 1. Service tra actor và peer sang ID `BIGINT`, đồng thời chặn chat với chính mình.
-2. Repository sắp cặp ID thành low/high và bắt đầu transaction.
-3. Partial unique index trên cặp direct user bảo đảm chỉ một thread khi hai phía tạo đồng thời.
-4. Request tạo mới ghi thread và hai participant trong cùng transaction. Request gặp conflict đọc lại thread vừa có.
+2. Repository sắp cặp ID thành low/high, bắt đầu transaction và khóa hai dòng `users` theo đúng thứ tự tăng dần. PostgreSQL row lock dùng chung giữa mọi connection/process/instance; thứ tự toàn cục này tránh deadlock khi các cặp giao nhau.
+3. Sau khi có đủ hai khóa, repository tìm direct thread có đúng hai active participant là cặp đó, bất kể ai gửi request trước.
+4. Nếu chưa có, repository ghi thread và hai participant trong cùng transaction. Request đồng thời đợi khóa rồi đọc lại thread vừa commit.
+
+Không còn cột cặp user hay unique index tương ứng trên `threads`. Vì vậy cơ chế chống trùng phụ thuộc mọi đường ghi direct thread đều dùng transaction/khóa trên; thao tác SQL trực tiếp hoặc implementation khác bỏ qua khóa có thể tạo trùng.
 
 ## Gửi tin
 
-`POST /threads/:id/messages` nhận `client_msg_id` và `content`, không nhận sender.
+`POST /threads/:id/messages` nhận `message_id` và `content`, không nhận sender. `message_id` là UUID client đã chọn cho `messages.external_id`; response vẫn trả external ID trong `id`.
 
-Trong một transaction, repository khóa thread đồng thời với việc xác nhận actor là participant đang hoạt động. Nó trả lại message cũ nếu cùng client ID đã tồn tại; nếu chưa, tăng `last_seq` rồi ghi message với sequence đó trước khi commit. Vì vậy hai người gửi đồng thời vẫn nhận sequence khác nhau và retry không tạo bản sao.
+Trong một transaction, repository khóa thread đồng thời với việc xác nhận actor là participant đang hoạt động. Sau đó nó tra `external_id` toàn cục:
+
+1. UUID đã thuộc đúng sender, thread, kind/format và nội dung: trả message cũ, không tăng `last_seq`.
+2. UUID đã gắn với bất kỳ dữ liệu nào khác: trả `409 Conflict` chung, không trả message cũ nên không lộ nội dung/người gửi/thread của người khác.
+3. UUID chưa có: tăng `last_seq`, ghi message với sequence đó và commit.
+
+Unique constraint trên `messages.external_id` xử lý cả race giữa các thread/instance. Nếu insert thua race, toàn transaction (kể cả tăng sequence) rollback và API trả conflict. Hai request retry giống hệt trong cùng thread được serialize bởi khóa thread nên chỉ có một row.
 
 Thread tồn tại nhưng actor không phải participant trả `403`; thread không tồn tại trả `404`.
 

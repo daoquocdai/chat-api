@@ -5,12 +5,12 @@
 @baseUrl = http://localhost:8080
 @run = manual02
 @password = Week2-local-demo-2026!
-@aliceMessage1ID = 11111111-1111-4111-8111-111111111111
-@aliceMessage2ID = 22222222-2222-4222-8222-222222222222
-@aliceMessage3ID = 33333333-3333-4333-8333-333333333333
-@aliceMessage4ID = 44444444-4444-4444-8444-444444444444
-@aliceMessage5ID = 55555555-5555-4555-8555-555555555555
-@malloryMessageID = 99999999-9999-4999-8999-999999999999
+@aliceMessage1ExternalID = 11111111-1111-4111-8111-111111111111
+@aliceMessage2ExternalID = 22222222-2222-4222-8222-222222222222
+@aliceMessage3ExternalID = 33333333-3333-4333-8333-333333333333
+@aliceMessage4ExternalID = 44444444-4444-4444-8444-444444444444
+@aliceMessage5ExternalID = 55555555-5555-4555-8555-555555555555
+@malloryMessageExternalID = 99999999-9999-4999-8999-999999999999
 
 ### Health is public
 GET {{baseUrl}}/health
@@ -109,18 +109,38 @@ Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{aliceMessage1ID}}",
+  "message_id": "{{aliceMessage1ExternalID}}",
   "content": "Tin thứ nhất"
 }
 
-### Alice sends seq 2
+### Retry the same logical send: expect 200, the same id and seq=1 (not a new row)
 POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
 Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{aliceMessage2ID}}",
-  "content": "Tin thứ hai"
+  "message_id": "{{aliceMessage1ExternalID}}",
+  "content": "Tin thứ nhất"
+}
+
+### Reusing the UUID with different content: expect 409 Conflict and no seq increment
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "message_id": "{{aliceMessage1ExternalID}}",
+  "content": "Nội dung khác phải bị từ chối"
+}
+
+### Alice sends seq 2 with identical content but a fresh UUID: this is a separate message
+POST {{baseUrl}}/threads/{{aliceBobThread.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{
+  "message_id": "{{aliceMessage2ExternalID}}",
+  "content": "Tin thứ nhất"
 }
 
 ### Alice sends seq 3
@@ -129,7 +149,7 @@ Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{aliceMessage3ID}}",
+  "message_id": "{{aliceMessage3ExternalID}}",
   "content": "Tin thứ ba"
 }
 
@@ -139,7 +159,7 @@ Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{aliceMessage4ID}}",
+  "message_id": "{{aliceMessage4ExternalID}}",
   "content": "Tin thứ tư"
 }
 
@@ -149,7 +169,7 @@ Authorization: Bearer {{loginAlice.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{aliceMessage5ID}}",
+  "message_id": "{{aliceMessage5ExternalID}}",
   "content": "Tin thứ năm"
 }
 
@@ -235,6 +255,6 @@ Authorization: Bearer {{loginMallory.response.body.$.access_token}}
 Content-Type: application/json
 
 {
-  "client_msg_id": "{{malloryMessageID}}",
+  "message_id": "{{malloryMessageExternalID}}",
   "content": "Tin này phải bị từ chối."
 }

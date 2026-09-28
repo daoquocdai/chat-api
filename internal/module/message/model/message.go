@@ -8,7 +8,6 @@ type Message struct {
 	ThreadExternalID string
 	SenderExternalID string
 	Seq              int64
-	ClientMessageID  string
 	Kind             string
 	ContentFormat    string
 	Content          string

@@ -8,6 +8,7 @@ import (
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -24,13 +25,13 @@ func (r *PostgresRepository) Send(
 	ctx context.Context,
 	threadExternalID string,
 	senderID int64,
-	clientMessageID, content string,
+	messageID, content string,
 ) (model.Message, bool, error) {
 	threadID, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
 	if err != nil {
 		return model.Message{}, false, err
 	}
-	clientID, err := parseUUID(clientMessageID, model.ErrInvalidClientMessageID)
+	messageExternalID, err := parseUUID(messageID, model.ErrInvalidMessageID)
 	if err != nil {
 		return model.Message{}, false, err
 	}
@@ -50,16 +51,17 @@ func (r *PostgresRepository) Send(
 			return err
 		}
 
-		existing, err := queries.GetMessageByClientID(ctx, sqlc.GetMessageByClientIDParams{
-			ThreadID:    threadInternalID,
-			SenderID:    senderID,
-			ClientMsgID: clientID,
-		})
+		existing, err := queries.GetMessageByExternalID(ctx, messageExternalID)
 		if err == nil {
+			if existing.ThreadID != threadInternalID || existing.SenderID != senderID ||
+				existing.Kind != "text" || existing.ContentFormat != "plaintext" ||
+				existing.Content != content {
+				return model.ErrMessageIDConflict
+			}
 			result = messageFromValues(
 				existing.ID, existing.ExternalID, existing.ThreadExternalID,
-				existing.SenderExternalID, existing.Seq, existing.ClientMsgID,
-				existing.Kind, existing.ContentFormat, existing.Content, existing.CreatedAt,
+				existing.SenderExternalID, existing.Seq, existing.Kind,
+				existing.ContentFormat, existing.Content, existing.CreatedAt,
 			)
 			return nil
 		}
@@ -72,11 +74,11 @@ func (r *PostgresRepository) Send(
 			return err
 		}
 		message, err := queries.CreateThreadMessage(ctx, sqlc.CreateThreadMessageParams{
-			ThreadID:    threadInternalID,
-			SenderID:    senderID,
-			Seq:         seq,
-			ClientMsgID: clientID,
-			Content:     content,
+			MessageExternalID: messageExternalID,
+			ThreadID:          threadInternalID,
+			SenderID:          senderID,
+			Seq:               seq,
+			Content:           content,
 		})
 		if err != nil {
 			return err
@@ -85,12 +87,15 @@ func (r *PostgresRepository) Send(
 		created = true
 		result = messageFromValues(
 			message.ID, message.ExternalID, message.ThreadExternalID,
-			message.SenderExternalID, message.Seq, message.ClientMsgID,
-			message.Kind, message.ContentFormat, message.Content, message.CreatedAt,
+			message.SenderExternalID, message.Seq, message.Kind,
+			message.ContentFormat, message.Content, message.CreatedAt,
 		)
 		return nil
 	})
 	if err != nil {
+		if isExternalIDUniqueViolation(err) {
+			return model.Message{}, false, model.ErrMessageIDConflict
+		}
 		return model.Message{}, false, err
 	}
 
@@ -141,8 +146,8 @@ func (r *PostgresRepository) List(
 	for i, row := range rows {
 		messages[i] = messageFromValues(
 			row.ID, row.ExternalID, row.ThreadExternalID,
-			row.SenderExternalID, row.Seq, row.ClientMsgID,
-			row.Kind, row.ContentFormat, row.Content, row.CreatedAt,
+			row.SenderExternalID, row.Seq, row.Kind,
+			row.ContentFormat, row.Content, row.CreatedAt,
 		)
 	}
 
@@ -178,7 +183,6 @@ func messageFromValues(
 	id int64,
 	externalID, threadExternalID, senderExternalID pgtype.UUID,
 	seq int64,
-	clientMessageID pgtype.UUID,
 	kind, contentFormat, content string,
 	createdAt pgtype.Timestamptz,
 ) model.Message {
@@ -188,10 +192,16 @@ func messageFromValues(
 		ThreadExternalID: threadExternalID.String(),
 		SenderExternalID: senderExternalID.String(),
 		Seq:              seq,
-		ClientMessageID:  clientMessageID.String(),
 		Kind:             kind,
 		ContentFormat:    contentFormat,
 		Content:          content,
 		CreatedAt:        createdAt.Time,
 	}
+}
+
+func isExternalIDUniqueViolation(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) &&
+		postgresError.Code == "23505" &&
+		postgresError.ConstraintName == "messages_external_id_key"
 }

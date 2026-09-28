@@ -14,10 +14,10 @@ import (
 const createThreadMessage = `-- name: CreateThreadMessage :one
 WITH created AS (
     INSERT INTO messages (
+        external_id,
         thread_id,
         sender_id,
         seq,
-        client_msg_id,
         kind,
         content_format,
         content
@@ -32,7 +32,7 @@ WITH created AS (
         $5
     )
     RETURNING id, external_id, thread_id, sender_id, seq,
-              client_msg_id, kind, content_format, content, created_at
+              kind, content_format, content, created_at
 )
 SELECT
     created.id,
@@ -40,7 +40,6 @@ SELECT
     thread.external_id AS thread_external_id,
     sender.external_id AS sender_external_id,
     created.seq,
-    created.client_msg_id,
     created.kind,
     created.content_format,
     created.content,
@@ -51,11 +50,11 @@ JOIN users AS sender ON sender.id = created.sender_id
 `
 
 type CreateThreadMessageParams struct {
-	ThreadID    int64
-	SenderID    int64
-	Seq         int64
-	ClientMsgID pgtype.UUID
-	Content     string
+	MessageExternalID pgtype.UUID
+	ThreadID          int64
+	SenderID          int64
+	Seq               int64
+	Content           string
 }
 
 type CreateThreadMessageRow struct {
@@ -64,7 +63,6 @@ type CreateThreadMessageRow struct {
 	ThreadExternalID pgtype.UUID
 	SenderExternalID pgtype.UUID
 	Seq              int64
-	ClientMsgID      pgtype.UUID
 	Kind             string
 	ContentFormat    string
 	Content          string
@@ -73,10 +71,10 @@ type CreateThreadMessageRow struct {
 
 func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessageParams) (CreateThreadMessageRow, error) {
 	row := q.db.QueryRow(ctx, createThreadMessage,
+		arg.MessageExternalID,
 		arg.ThreadID,
 		arg.SenderID,
 		arg.Seq,
-		arg.ClientMsgID,
 		arg.Content,
 	)
 	var i CreateThreadMessageRow
@@ -86,7 +84,6 @@ func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessa
 		&i.ThreadExternalID,
 		&i.SenderExternalID,
 		&i.Seq,
-		&i.ClientMsgID,
 		&i.Kind,
 		&i.ContentFormat,
 		&i.Content,
@@ -117,14 +114,15 @@ func (q *Queries) GetActiveThreadAccess(ctx context.Context, arg GetActiveThread
 	return id, err
 }
 
-const getMessageByClientID = `-- name: GetMessageByClientID :one
+const getMessageByExternalID = `-- name: GetMessageByExternalID :one
 SELECT
     m.id,
     m.external_id,
+    m.thread_id,
+    m.sender_id,
     t.external_id AS thread_external_id,
     sender.external_id AS sender_external_id,
     m.seq,
-    m.client_msg_id,
     m.kind,
     m.content_format,
     m.content,
@@ -132,40 +130,34 @@ SELECT
 FROM messages AS m
 JOIN threads AS t ON t.id = m.thread_id
 JOIN users AS sender ON sender.id = m.sender_id
-WHERE m.thread_id = $1
-  AND m.sender_id = $2
-  AND m.client_msg_id = $3
+WHERE m.external_id = $1
 `
 
-type GetMessageByClientIDParams struct {
-	ThreadID    int64
-	SenderID    int64
-	ClientMsgID pgtype.UUID
-}
-
-type GetMessageByClientIDRow struct {
+type GetMessageByExternalIDRow struct {
 	ID               int64
 	ExternalID       pgtype.UUID
+	ThreadID         int64
+	SenderID         int64
 	ThreadExternalID pgtype.UUID
 	SenderExternalID pgtype.UUID
 	Seq              int64
-	ClientMsgID      pgtype.UUID
 	Kind             string
 	ContentFormat    string
 	Content          string
 	CreatedAt        pgtype.Timestamptz
 }
 
-func (q *Queries) GetMessageByClientID(ctx context.Context, arg GetMessageByClientIDParams) (GetMessageByClientIDRow, error) {
-	row := q.db.QueryRow(ctx, getMessageByClientID, arg.ThreadID, arg.SenderID, arg.ClientMsgID)
-	var i GetMessageByClientIDRow
+func (q *Queries) GetMessageByExternalID(ctx context.Context, messageExternalID pgtype.UUID) (GetMessageByExternalIDRow, error) {
+	row := q.db.QueryRow(ctx, getMessageByExternalID, messageExternalID)
+	var i GetMessageByExternalIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.ExternalID,
+		&i.ThreadID,
+		&i.SenderID,
 		&i.ThreadExternalID,
 		&i.SenderExternalID,
 		&i.Seq,
-		&i.ClientMsgID,
 		&i.Kind,
 		&i.ContentFormat,
 		&i.Content,
@@ -195,7 +187,6 @@ SELECT
     t.external_id AS thread_external_id,
     sender.external_id AS sender_external_id,
     m.seq,
-    m.client_msg_id,
     m.kind,
     m.content_format,
     m.content,
@@ -230,7 +221,6 @@ type ListThreadMessagesPageRow struct {
 	ThreadExternalID pgtype.UUID
 	SenderExternalID pgtype.UUID
 	Seq              int64
-	ClientMsgID      pgtype.UUID
 	Kind             string
 	ContentFormat    string
 	Content          string
@@ -257,7 +247,6 @@ func (q *Queries) ListThreadMessagesPage(ctx context.Context, arg ListThreadMess
 			&i.ThreadExternalID,
 			&i.SenderExternalID,
 			&i.Seq,
-			&i.ClientMsgID,
 			&i.Kind,
 			&i.ContentFormat,
 			&i.Content,

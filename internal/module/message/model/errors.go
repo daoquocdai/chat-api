@@ -1,17 +1,44 @@
 package model
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
-	ErrThreadIDRequired  = errors.New("thread ID is required")
-	ErrInvalidThreadID   = errors.New("thread ID must be a UUID")
-	ErrMessageIDRequired = errors.New("message_id is required")
-	ErrInvalidMessageID  = errors.New("message_id must be a UUID")
-	ErrMessageIDConflict = errors.New("message_id is already in use")
-	ErrInvalidContent    = errors.New("content must be valid UTF-8, contain between 1 and 1000 Unicode characters, and cannot contain NUL")
-	ErrInvalidBeforeSeq  = errors.New("before_seq must be a positive integer")
-	ErrInvalidLimit      = errors.New("limit must be an integer between 1 and 100")
+	ErrThreadIDRequired   = errors.New("thread ID is required")
+	ErrInvalidThreadID    = errors.New("thread ID must be a UUID")
+	ErrMessageIDRequired  = errors.New("message_id is required")
+	ErrInvalidMessageID   = errors.New("message_id must be a UUID")
+	ErrMessageIDConflict  = errors.New("message_id is already in use")
+	ErrEventPublishFailed = errors.New("message was saved but realtime publish was not confirmed; retry with the same message_id and payload")
+	ErrInvalidContent     = errors.New("content must be valid UTF-8, contain between 1 and 1000 Unicode characters, and cannot contain NUL")
+	ErrInvalidBeforeSeq   = errors.New("before_seq must be a positive integer")
+	ErrInvalidLimit       = errors.New("limit must be an integer between 1 and 100")
 )
+
+type EventPublishError struct {
+	MessageID   string
+	ThreadID    string
+	SenderID    string
+	RecipientID string
+	Seq         int64
+	Cause       error
+}
+
+func (e *EventPublishError) Error() string {
+	return "publish message.created failed" +
+		" message_id=" + e.MessageID +
+		" thread_id=" + e.ThreadID +
+		" sender_id=" + e.SenderID +
+		" recipient_id=" + e.RecipientID +
+		" seq=" + fmt.Sprint(e.Seq) +
+		": " + e.Cause.Error()
+}
+
+func (e *EventPublishError) Unwrap() []error {
+	return []error{ErrEventPublishFailed, e.Cause}
+}
 
 const (
 	DefaultPageLimit = 30

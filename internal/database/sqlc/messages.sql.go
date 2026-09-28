@@ -114,6 +114,30 @@ func (q *Queries) GetActiveThreadAccess(ctx context.Context, arg GetActiveThread
 	return id, err
 }
 
+const getDirectRecipientExternalID = `-- name: GetDirectRecipientExternalID :one
+SELECT recipient.external_id
+FROM participants AS participant
+JOIN users AS recipient ON recipient.id = participant.user_id
+JOIN threads AS thread
+  ON thread.id = participant.thread_id
+ AND thread.kind = 'direct'
+WHERE participant.thread_id = $1
+  AND participant.user_id <> $2
+  AND participant.left_seq IS NULL
+`
+
+type GetDirectRecipientExternalIDParams struct {
+	ThreadID int64
+	SenderID int64
+}
+
+func (q *Queries) GetDirectRecipientExternalID(ctx context.Context, arg GetDirectRecipientExternalIDParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getDirectRecipientExternalID, arg.ThreadID, arg.SenderID)
+	var external_id pgtype.UUID
+	err := row.Scan(&external_id)
+	return external_id, err
+}
+
 const getMessageByExternalID = `-- name: GetMessageByExternalID :one
 SELECT
     m.id,

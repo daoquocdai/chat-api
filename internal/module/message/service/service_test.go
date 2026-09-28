@@ -5,7 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	"github.com/daoquocdai/chat-api/internal/module/message/service"
 	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
@@ -51,6 +53,21 @@ type fakeUserFinder struct {
 	calls int
 }
 
+type fakePublisher struct {
+	publish func(context.Context, messageevent.MessageCreated) error
+	calls   int
+	events  []messageevent.MessageCreated
+}
+
+func (p *fakePublisher) Publish(ctx context.Context, event messageevent.MessageCreated) error {
+	p.calls++
+	p.events = append(p.events, event)
+	if p.publish == nil {
+		return nil
+	}
+	return p.publish(ctx, event)
+}
+
 func (f *fakeUserFinder) GetByExternalID(ctx context.Context, externalID string) (usermodel.User, error) {
 	f.calls++
 	return f.get(ctx, externalID)
@@ -60,18 +77,19 @@ func TestSend(t *testing.T) {
 	databaseError := errors.New("database unavailable")
 
 	tests := []struct {
-		name            string
-		threadID        string
-		messageID       string
-		content         string
-		userError       error
-		repositoryError error
-		wantError       error
-		wantContent     string
-		wantUserCalls   int
-		wantRepoCalls   int
+		name             string
+		threadID         string
+		messageID        string
+		content          string
+		userError        error
+		repositoryError  error
+		wantError        error
+		wantContent      string
+		wantUserCalls    int
+		wantRepoCalls    int
+		wantPublishCalls int
 	}{
-		{name: "sends normalized content", threadID: " " + threadExternalID + " ", messageID: " " + messageExternalID + " ", content: "  xin chào  ", wantContent: "xin chào", wantUserCalls: 1, wantRepoCalls: 1},
+		{name: "sends normalized content", threadID: " " + threadExternalID + " ", messageID: " " + messageExternalID + " ", content: "  xin chào  ", wantContent: "xin chào", wantUserCalls: 1, wantRepoCalls: 1, wantPublishCalls: 1},
 		{name: "thread ID required", threadID: " ", messageID: messageExternalID, content: "hello", wantError: model.ErrThreadIDRequired},
 		{name: "message ID required", threadID: threadExternalID, messageID: " ", content: "hello", wantError: model.ErrMessageIDRequired},
 		{name: "empty content", threadID: threadExternalID, messageID: messageExternalID, content: " \t", wantError: model.ErrInvalidContent},
@@ -95,7 +113,18 @@ func TestSend(t *testing.T) {
 				}
 				return usermodel.User{ID: 11, ExternalID: actorExternalID}, nil
 			}}
-			wantMessage := model.Message{ID: 9, ExternalID: messageExternalID, Seq: 1, Content: tt.wantContent}
+			wantMessage := model.Message{
+				ID:                  9,
+				ExternalID:          messageExternalID,
+				ThreadExternalID:    threadExternalID,
+				SenderExternalID:    actorExternalID,
+				RecipientExternalID: "22222222-2222-4222-8222-222222222222",
+				Seq:                 1,
+				Kind:                "text",
+				ContentFormat:       "plaintext",
+				Content:             tt.wantContent,
+				CreatedAt:           time.Date(2026, time.September, 28, 9, 0, 0, 0, time.UTC),
+			}
 			repository := &fakeMessageRepository{send: func(
 				gotCtx context.Context,
 				threadID string,
@@ -108,7 +137,8 @@ func TestSend(t *testing.T) {
 				return wantMessage, true, tt.repositoryError
 			}}
 
-			got, created, err := service.New(repository, users).Send(
+			publisher := &fakePublisher{}
+			got, created, err := service.New(repository, users, publisher, time.Second).Send(
 				ctx,
 				actorExternalID,
 				tt.threadID,
@@ -120,6 +150,9 @@ func TestSend(t *testing.T) {
 			}
 			if users.calls != tt.wantUserCalls || repository.sendCalls != tt.wantRepoCalls {
 				t.Fatalf("calls = (users %d, repository %d), want (%d, %d)", users.calls, repository.sendCalls, tt.wantUserCalls, tt.wantRepoCalls)
+			}
+			if publisher.calls != tt.wantPublishCalls {
+				t.Fatalf("publisher calls = %d, want %d", publisher.calls, tt.wantPublishCalls)
 			}
 			if tt.wantError == nil && (got != wantMessage || !created) {
 				t.Fatalf("result = (%+v, %v), want (%+v, true)", got, created, wantMessage)
@@ -171,7 +204,7 @@ func TestList(t *testing.T) {
 				return model.Page{}, tt.repositoryErr
 			}}
 
-			page, err := service.New(repository, users).List(ctx, actorExternalID, tt.threadID, tt.beforeSeq, tt.limit)
+			page, err := service.New(repository, users, &fakePublisher{}, time.Second).List(ctx, actorExternalID, tt.threadID, tt.beforeSeq, tt.limit)
 			if !errors.Is(err, tt.wantError) {
 				t.Fatalf("error = %v, want %v", err, tt.wantError)
 			}
@@ -182,5 +215,163 @@ func TestList(t *testing.T) {
 				t.Fatal("nil messages were not normalized to an empty slice")
 			}
 		})
+	}
+}
+
+func TestSendPersistenceAndPublishing(t *testing.T) {
+	databaseError := errors.New("transaction failed")
+	redisError := errors.New("redis unavailable")
+	createdAt := time.Date(2026, time.September, 28, 10, 30, 0, 123, time.FixedZone("ICT", 7*60*60))
+	wantMessage := model.Message{
+		ID:                  9,
+		ExternalID:          messageExternalID,
+		ThreadExternalID:    threadExternalID,
+		SenderExternalID:    actorExternalID,
+		RecipientExternalID: "22222222-2222-4222-8222-222222222222",
+		Seq:                 7,
+		Kind:                "text",
+		ContentFormat:       "plaintext",
+		Content:             "hello",
+		CreatedAt:           createdAt,
+	}
+
+	tests := []struct {
+		name             string
+		repositoryError  error
+		publisherError   error
+		wantError        error
+		wantCreated      bool
+		wantPublishCalls int
+	}{
+		{name: "save then publish", wantCreated: true, wantPublishCalls: 1},
+		{name: "transaction error does not publish", repositoryError: databaseError, wantError: databaseError},
+		{name: "publish error reports saved message", publisherError: redisError, wantError: model.ErrEventPublishFailed, wantCreated: true, wantPublishCalls: 1},
+		{name: "UUID conflict does not publish", repositoryError: model.ErrMessageIDConflict, wantError: model.ErrMessageIDConflict},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			order := []string{}
+			users := &fakeUserFinder{get: func(context.Context, string) (usermodel.User, error) {
+				return usermodel.User{ID: 11, ExternalID: actorExternalID}, nil
+			}}
+			repository := &fakeMessageRepository{send: func(
+				context.Context,
+				string,
+				int64,
+				string,
+				string,
+			) (model.Message, bool, error) {
+				order = append(order, "repository")
+				if tt.repositoryError != nil {
+					return model.Message{}, false, tt.repositoryError
+				}
+				return wantMessage, true, nil
+			}}
+			publisher := &fakePublisher{publish: func(gotCtx context.Context, gotEvent messageevent.MessageCreated) error {
+				order = append(order, "publisher")
+				deadline, ok := gotCtx.Deadline()
+				if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > time.Second {
+					t.Fatalf("publisher context deadline = %v, want active deadline within one second", deadline)
+				}
+				wantEvent := messageevent.MessageCreated{
+					MessageID:     wantMessage.ExternalID,
+					ThreadID:      wantMessage.ThreadExternalID,
+					SenderID:      wantMessage.SenderExternalID,
+					RecipientID:   wantMessage.RecipientExternalID,
+					Seq:           wantMessage.Seq,
+					Kind:          wantMessage.Kind,
+					ContentFormat: wantMessage.ContentFormat,
+					Content:       wantMessage.Content,
+					CreatedAt:     wantMessage.CreatedAt,
+				}
+				if gotEvent != wantEvent {
+					t.Fatalf("event = %+v, want %+v", gotEvent, wantEvent)
+				}
+				return tt.publisherError
+			}}
+
+			got, created, err := service.New(repository, users, publisher, time.Second).Send(
+				ctx,
+				actorExternalID,
+				threadExternalID,
+				messageExternalID,
+				"hello",
+			)
+			if !errors.Is(err, tt.wantError) {
+				t.Fatalf("error = %v, want %v", err, tt.wantError)
+			}
+			if created != tt.wantCreated {
+				t.Fatalf("created = %v, want %v", created, tt.wantCreated)
+			}
+			if publisher.calls != tt.wantPublishCalls {
+				t.Fatalf("publisher calls = %d, want %d", publisher.calls, tt.wantPublishCalls)
+			}
+			if tt.repositoryError == nil && got != wantMessage {
+				t.Fatalf("message = %+v, want persisted message %+v", got, wantMessage)
+			}
+			if tt.wantPublishCalls == 1 && strings.Join(order, ",") != "repository,publisher" {
+				t.Fatalf("call order = %v, want repository then publisher", order)
+			}
+		})
+	}
+}
+
+func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *testing.T) {
+	ctx := context.Background()
+	redisError := errors.New("redis unavailable")
+	message := model.Message{
+		ExternalID:          messageExternalID,
+		ThreadExternalID:    threadExternalID,
+		SenderExternalID:    actorExternalID,
+		RecipientExternalID: "22222222-2222-4222-8222-222222222222",
+		Seq:                 4,
+		Kind:                "text",
+		ContentFormat:       "plaintext",
+		Content:             "retry me",
+		CreatedAt:           time.Now(),
+	}
+	repositoryCalls := 0
+	repository := &fakeMessageRepository{send: func(
+		context.Context,
+		string,
+		int64,
+		string,
+		string,
+	) (model.Message, bool, error) {
+		repositoryCalls++
+		return message, repositoryCalls == 1, nil
+	}}
+	users := &fakeUserFinder{get: func(context.Context, string) (usermodel.User, error) {
+		return usermodel.User{ID: 11, ExternalID: actorExternalID}, nil
+	}}
+	publisher := &fakePublisher{}
+	publisher.publish = func(context.Context, messageevent.MessageCreated) error {
+		if publisher.calls == 1 {
+			return redisError
+		}
+		return nil
+	}
+	messageService := service.New(repository, users, publisher, time.Second)
+
+	first, firstCreated, firstError := messageService.Send(
+		ctx, actorExternalID, threadExternalID, messageExternalID, "retry me",
+	)
+	second, secondCreated, secondError := messageService.Send(
+		ctx, actorExternalID, threadExternalID, messageExternalID, "retry me",
+	)
+
+	if !errors.Is(firstError, model.ErrEventPublishFailed) || secondError != nil {
+		t.Fatalf("send errors = (%v, %v), want publish failure then success", firstError, secondError)
+	}
+	if !firstCreated || secondCreated {
+		t.Fatalf("created flags = (%v, %v), want (true, false)", firstCreated, secondCreated)
+	}
+	if first.Seq != 4 || second.Seq != 4 || first.ExternalID != second.ExternalID {
+		t.Fatalf("retry messages = (%+v, %+v), want same UUID and seq", first, second)
+	}
+	if publisher.calls != 2 {
+		t.Fatalf("publisher calls = %d, want 2", publisher.calls)
 	}
 }

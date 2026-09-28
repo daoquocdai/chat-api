@@ -22,6 +22,17 @@ JOIN participants AS p
 WHERE t.external_id = sqlc.arg(thread_external_id)
 FOR UPDATE OF t;
 
+-- name: GetDirectRecipientExternalID :one
+SELECT recipient.external_id
+FROM participants AS participant
+JOIN users AS recipient ON recipient.id = participant.user_id
+JOIN threads AS thread
+  ON thread.id = participant.thread_id
+ AND thread.kind = 'direct'
+WHERE participant.thread_id = sqlc.arg(thread_id)
+  AND participant.user_id <> sqlc.arg(sender_id)
+  AND participant.left_seq IS NULL;
+
 -- name: GetMessageByExternalID :one
 SELECT
     m.id,

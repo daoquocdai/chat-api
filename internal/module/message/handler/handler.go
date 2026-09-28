@@ -150,6 +150,10 @@ func writeError(c *gin.Context, err error) {
 	case errors.Is(err, model.ErrMessageIDConflict):
 		c.JSON(http.StatusConflict, gin.H{"error": model.ErrMessageIDConflict.Error()})
 
+	case errors.Is(err, model.ErrEventPublishFailed):
+		log.Printf("message handler: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": model.ErrEventPublishFailed.Error()})
+
 	case errors.Is(err, usermodel.ErrUserNotFound), errors.Is(err, usermodel.ErrInvalidUserID):
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 

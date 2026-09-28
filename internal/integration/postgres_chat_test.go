@@ -176,7 +176,8 @@ func TestPostgresDirectChatBehavior(t *testing.T) {
 
 		createdCount := 0
 		for result := range results {
-			if result.err != nil || result.message.ExternalID != firstMessageID || result.message.Seq != 1 {
+			if result.err != nil || result.message.ExternalID != firstMessageID || result.message.Seq != 1 ||
+				result.message.RecipientExternalID != bob.externalID {
 				t.Fatalf("retry result = (%+v, %v, %v)", result.message, result.created, result.err)
 			}
 			if result.created {

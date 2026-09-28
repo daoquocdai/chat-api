@@ -50,6 +50,16 @@ func (r *PostgresRepository) Send(
 			}
 			return err
 		}
+		recipientExternalID, err := queries.GetDirectRecipientExternalID(
+			ctx,
+			sqlc.GetDirectRecipientExternalIDParams{
+				ThreadID: threadInternalID,
+				SenderID: senderID,
+			},
+		)
+		if err != nil {
+			return err
+		}
 
 		existing, err := queries.GetMessageByExternalID(ctx, messageExternalID)
 		if err == nil {
@@ -63,6 +73,7 @@ func (r *PostgresRepository) Send(
 				existing.SenderExternalID, existing.Seq, existing.Kind,
 				existing.ContentFormat, existing.Content, existing.CreatedAt,
 			)
+			result.RecipientExternalID = recipientExternalID.String()
 			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -90,6 +101,7 @@ func (r *PostgresRepository) Send(
 			message.SenderExternalID, message.Seq, message.Kind,
 			message.ContentFormat, message.Content, message.CreatedAt,
 		)
+		result.RecipientExternalID = recipientExternalID.String()
 		return nil
 	})
 	if err != nil {

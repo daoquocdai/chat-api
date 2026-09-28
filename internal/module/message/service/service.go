@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"strings"
+	"time"
 	"unicode/utf8"
 
+	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 )
@@ -31,13 +33,29 @@ type UserFinder interface {
 	GetByExternalID(ctx context.Context, externalID string) (usermodel.User, error)
 }
 
-type Service struct {
-	repository Repository
-	users      UserFinder
+type Publisher interface {
+	Publish(ctx context.Context, event messageevent.MessageCreated) error
 }
 
-func New(repository Repository, users UserFinder) *Service {
-	return &Service{repository: repository, users: users}
+type Service struct {
+	repository     Repository
+	users          UserFinder
+	publisher      Publisher
+	publishTimeout time.Duration
+}
+
+func New(
+	repository Repository,
+	users UserFinder,
+	publisher Publisher,
+	publishTimeout time.Duration,
+) *Service {
+	return &Service{
+		repository:     repository,
+		users:          users,
+		publisher:      publisher,
+		publishTimeout: publishTimeout,
+	}
 }
 
 func (s *Service) Send(
@@ -63,7 +81,35 @@ func (s *Service) Send(
 		return model.Message{}, false, err
 	}
 
-	return s.repository.Send(ctx, threadExternalID, actor.ID, messageID, content)
+	message, created, err := s.repository.Send(ctx, threadExternalID, actor.ID, messageID, content)
+	if err != nil {
+		return model.Message{}, false, err
+	}
+
+	publishContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.publishTimeout)
+	defer cancel()
+	if err := s.publisher.Publish(publishContext, messageevent.MessageCreated{
+		MessageID:     message.ExternalID,
+		ThreadID:      message.ThreadExternalID,
+		SenderID:      message.SenderExternalID,
+		RecipientID:   message.RecipientExternalID,
+		Seq:           message.Seq,
+		Kind:          message.Kind,
+		ContentFormat: message.ContentFormat,
+		Content:       message.Content,
+		CreatedAt:     message.CreatedAt,
+	}); err != nil {
+		return message, created, &model.EventPublishError{
+			MessageID:   message.ExternalID,
+			ThreadID:    message.ThreadExternalID,
+			SenderID:    message.SenderExternalID,
+			RecipientID: message.RecipientExternalID,
+			Seq:         message.Seq,
+			Cause:       err,
+		}
+	}
+
+	return message, created, nil
 }
 
 func (s *Service) List(

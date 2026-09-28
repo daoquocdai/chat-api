@@ -23,10 +23,15 @@ type MessageHandler interface {
 	List(c *gin.Context)
 }
 
+type WSTicketHandler interface {
+	Issue(c *gin.Context)
+}
+
 func New(
 	userHandler UserHandler,
 	threadHandler ThreadHandler,
 	messageHandler MessageHandler,
+	wsTicketHandler WSTicketHandler,
 	authenticate gin.HandlerFunc,
 ) *gin.Engine {
 	router := gin.Default()
@@ -41,6 +46,7 @@ func New(
 	router.GET("/health", healthHandler)
 	router.GET("/", indexHandler)
 	router.StaticFile("/app.js", "web/app.js")
+	router.StaticFile("/realtime-core.js", "web/realtime-core.js")
 	router.StaticFile("/style.css", "web/style.css")
 	router.POST("/auth/register", userHandler.Register)
 	router.POST("/auth/login", userHandler.Login)
@@ -48,6 +54,7 @@ func New(
 	authenticated := router.Group("")
 	authenticated.Use(authenticate)
 	authenticated.GET("/users", userHandler.List)
+	authenticated.POST("/auth/ws-ticket", wsTicketHandler.Issue)
 	authenticated.POST("/threads/direct", threadHandler.CreateOrGetDirect)
 	authenticated.GET("/threads", threadHandler.List)
 	authenticated.PUT("/threads/:id/read", threadHandler.MarkRead)

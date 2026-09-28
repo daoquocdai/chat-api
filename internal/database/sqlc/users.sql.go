@@ -11,15 +11,27 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createUser = `-- name: CreateUser :one
-INSERT INTO users (username)
-VALUES ($1)
+const createUserWithPassword = `-- name: CreateUserWithPassword :one
+INSERT INTO users (username, password_hash)
+VALUES ($1, $2)
 RETURNING id, external_id, username, created_at
 `
 
-func (q *Queries) CreateUser(ctx context.Context, username string) (User, error) {
-	row := q.db.QueryRow(ctx, createUser, username)
-	var i User
+type CreateUserWithPasswordParams struct {
+	Username     string
+	PasswordHash string
+}
+
+type CreateUserWithPasswordRow struct {
+	ID         int64
+	ExternalID pgtype.UUID
+	Username   string
+	CreatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) CreateUserWithPassword(ctx context.Context, arg CreateUserWithPasswordParams) (CreateUserWithPasswordRow, error) {
+	row := q.db.QueryRow(ctx, createUserWithPassword, arg.Username, arg.PasswordHash)
+	var i CreateUserWithPasswordRow
 	err := row.Scan(
 		&i.ID,
 		&i.ExternalID,
@@ -35,13 +47,47 @@ FROM users
 WHERE external_id = $1
 `
 
-func (q *Queries) GetUserByExternalID(ctx context.Context, externalID pgtype.UUID) (User, error) {
+type GetUserByExternalIDRow struct {
+	ID         int64
+	ExternalID pgtype.UUID
+	Username   string
+	CreatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) GetUserByExternalID(ctx context.Context, externalID pgtype.UUID) (GetUserByExternalIDRow, error) {
 	row := q.db.QueryRow(ctx, getUserByExternalID, externalID)
-	var i User
+	var i GetUserByExternalIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.ExternalID,
 		&i.Username,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getUserCredentialsByUsername = `-- name: GetUserCredentialsByUsername :one
+SELECT id, external_id, username, password_hash, created_at
+FROM users
+WHERE username = $1
+`
+
+type GetUserCredentialsByUsernameRow struct {
+	ID           int64
+	ExternalID   pgtype.UUID
+	Username     string
+	PasswordHash string
+	CreatedAt    pgtype.Timestamptz
+}
+
+func (q *Queries) GetUserCredentialsByUsername(ctx context.Context, username string) (GetUserCredentialsByUsernameRow, error) {
+	row := q.db.QueryRow(ctx, getUserCredentialsByUsername, username)
+	var i GetUserCredentialsByUsernameRow
+	err := row.Scan(
+		&i.ID,
+		&i.ExternalID,
+		&i.Username,
+		&i.PasswordHash,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -53,15 +99,22 @@ FROM users
 ORDER BY username, id
 `
 
-func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
+type ListUsersRow struct {
+	ID         int64
+	ExternalID pgtype.UUID
+	Username   string
+	CreatedAt  pgtype.Timestamptz
+}
+
+func (q *Queries) ListUsers(ctx context.Context) ([]ListUsersRow, error) {
 	rows, err := q.db.Query(ctx, listUsers)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []User
+	var items []ListUsersRow
 	for rows.Next() {
-		var i User
+		var i ListUsersRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.ExternalID,

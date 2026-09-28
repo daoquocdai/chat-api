@@ -9,9 +9,22 @@ import (
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 )
 
+const maximumContentCharacters = 1000
+
 type Repository interface {
-	Create(ctx context.Context, senderID, receiverID int64, content string) (model.Message, error)
-	ListBetween(ctx context.Context, userOneID, userTwoID int64) ([]model.Message, error)
+	Send(
+		ctx context.Context,
+		threadExternalID string,
+		senderID int64,
+		messageID, content string,
+	) (model.Message, bool, error)
+	List(
+		ctx context.Context,
+		threadExternalID string,
+		userID int64,
+		beforeSeq *int64,
+		limit int,
+	) (model.Page, error)
 }
 
 type UserFinder interface {
@@ -27,79 +40,68 @@ func New(repository Repository, users UserFinder) *Service {
 	return &Service{repository: repository, users: users}
 }
 
-func (s *Service) Create(
+func (s *Service) Send(
 	ctx context.Context,
-	senderExternalID string,
-	receiverExternalID string,
-	content string,
-) (model.Message, error) {
-	senderExternalID, receiverExternalID, err := normalizeUserIDs(senderExternalID, receiverExternalID)
-	if err != nil {
-		return model.Message{}, err
+	actorExternalID, threadExternalID, messageID, content string,
+) (model.Message, bool, error) {
+	threadExternalID = strings.TrimSpace(threadExternalID)
+	if threadExternalID == "" {
+		return model.Message{}, false, model.ErrThreadIDRequired
 	}
-
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return model.Message{}, false, model.ErrMessageIDRequired
+	}
 	content = strings.TrimSpace(content)
-	if length := utf8.RuneCountInString(content); length == 0 || length > 1000 {
-		return model.Message{}, model.ErrInvalidContent
+	if length := utf8.RuneCountInString(content); !utf8.ValidString(content) ||
+		length == 0 || length > maximumContentCharacters || strings.ContainsRune(content, '\x00') {
+		return model.Message{}, false, model.ErrInvalidContent
 	}
 
-	sender, receiver, err := s.findUsers(ctx, senderExternalID, receiverExternalID)
+	actor, err := s.users.GetByExternalID(ctx, actorExternalID)
 	if err != nil {
-		return model.Message{}, err
+		return model.Message{}, false, err
 	}
 
-	return s.repository.Create(ctx, sender.ID, receiver.ID, content)
+	return s.repository.Send(ctx, threadExternalID, actor.ID, messageID, content)
 }
 
-func (s *Service) ListBetween(
+func (s *Service) List(
 	ctx context.Context,
-	userExternalID string,
-	peerExternalID string,
-) ([]model.Message, error) {
-	userExternalID, peerExternalID, err := normalizeUserIDs(userExternalID, peerExternalID)
+	actorExternalID, threadExternalID string,
+	beforeSeq *int64,
+	limit int,
+) (model.Page, error) {
+	threadExternalID = strings.TrimSpace(threadExternalID)
+	if threadExternalID == "" {
+		return model.Page{}, model.ErrThreadIDRequired
+	}
+	if beforeSeq != nil && *beforeSeq <= 0 {
+		return model.Page{}, model.ErrInvalidBeforeSeq
+	}
+	if limit < 1 || limit > model.MaximumPageLimit {
+		return model.Page{}, model.ErrInvalidLimit
+	}
+
+	actor, err := s.users.GetByExternalID(ctx, actorExternalID)
 	if err != nil {
-		return nil, err
+		return model.Page{}, err
 	}
 
-	user, peer, err := s.findUsers(ctx, userExternalID, peerExternalID)
+	page, err := s.repository.List(
+		ctx,
+		threadExternalID,
+		actor.ID,
+		beforeSeq,
+		limit,
+	)
 	if err != nil {
-		return nil, err
+		return model.Page{}, err
 	}
 
-	return s.repository.ListBetween(ctx, user.ID, peer.ID)
-}
-
-func normalizeUserIDs(first, second string) (string, string, error) {
-	first = strings.TrimSpace(first)
-	second = strings.TrimSpace(second)
-
-	if first == "" || second == "" {
-		return "", "", model.ErrUserIDsRequired
-	}
-	if first == second {
-		return "", "", model.ErrSameUser
+	if page.Messages == nil {
+		page.Messages = []model.Message{}
 	}
 
-	return first, second, nil
-}
-
-func (s *Service) findUsers(
-	ctx context.Context,
-	firstExternalID, secondExternalID string,
-) (usermodel.User, usermodel.User, error) {
-	first, err := s.users.GetByExternalID(ctx, firstExternalID)
-	if err != nil {
-		return usermodel.User{}, usermodel.User{}, err
-	}
-
-	second, err := s.users.GetByExternalID(ctx, secondExternalID)
-	if err != nil {
-		return usermodel.User{}, usermodel.User{}, err
-	}
-
-	if first.ID == second.ID {
-		return usermodel.User{}, usermodel.User{}, model.ErrSameUser
-	}
-
-	return first, second, nil
+	return page, nil
 }

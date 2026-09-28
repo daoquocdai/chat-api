@@ -12,8 +12,8 @@ import (
 )
 
 type UserService interface {
-	Create(ctx context.Context, username string) (model.User, error)
-	GetByExternalID(ctx context.Context, externalID string) (model.User, error)
+	Register(ctx context.Context, username, password string) (model.User, error)
+	Login(ctx context.Context, username, password string) (string, error)
 	List(ctx context.Context) ([]model.User, error)
 }
 
@@ -25,15 +25,14 @@ func New(service UserService) *Handler {
 	return &Handler{service: service}
 }
 
-func (h *Handler) Create(c *gin.Context) {
-	var request dto.CreateUserRequest
-
+func (h *Handler) Register(c *gin.Context) {
+	var request dto.RegisterRequest
 	if err := c.ShouldBindJSON(&request); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
 		return
 	}
 
-	user, err := h.service.Create(c.Request.Context(), request.Username)
+	user, err := h.service.Register(c.Request.Context(), request.Username, request.Password)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -42,15 +41,23 @@ func (h *Handler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, dto.ToUserResponse(user))
 }
 
-func (h *Handler) GetByExternalID(c *gin.Context) {
-	externalID := c.Param("id")
-	user, err := h.service.GetByExternalID(c.Request.Context(), externalID)
+func (h *Handler) Login(c *gin.Context) {
+	var request dto.LoginRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
+		return
+	}
+
+	accessToken, err := h.service.Login(c.Request.Context(), request.Username, request.Password)
 	if err != nil {
 		writeError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, dto.ToUserResponse(user))
+	c.JSON(http.StatusOK, dto.TokenResponse{
+		AccessToken: accessToken,
+		TokenType:   "Bearer",
+	})
 }
 
 func (h *Handler) List(c *gin.Context) {
@@ -66,7 +73,8 @@ func (h *Handler) List(c *gin.Context) {
 func writeError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, model.ErrInvalidUsername),
-		errors.Is(err, model.ErrInvalidUserID):
+		errors.Is(err, model.ErrInvalidUserID),
+		errors.Is(err, model.ErrInvalidPassword):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
 	case errors.Is(err, model.ErrUsernameTaken):
@@ -74,6 +82,9 @@ func writeError(c *gin.Context, err error) {
 
 	case errors.Is(err, model.ErrUserNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": model.ErrUserNotFound.Error()})
+
+	case errors.Is(err, model.ErrInvalidCredentials):
+		c.JSON(http.StatusUnauthorized, gin.H{"error": model.ErrInvalidCredentials.Error()})
 
 	default:
 		log.Printf("user handler: %v", err)

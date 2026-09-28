@@ -19,8 +19,14 @@ func New(queries *sqlc.Queries) *PostgresRepository {
 	return &PostgresRepository{queries: queries}
 }
 
-func (r *PostgresRepository) Create(ctx context.Context, username string) (model.User, error) {
-	user, err := r.queries.CreateUser(ctx, username)
+func (r *PostgresRepository) CreateWithPassword(
+	ctx context.Context,
+	username, passwordHash string,
+) (model.User, error) {
+	user, err := r.queries.CreateUserWithPassword(ctx, sqlc.CreateUserWithPasswordParams{
+		Username:     username,
+		PasswordHash: passwordHash,
+	})
 	if err != nil {
 		var pgErr *pgconn.PgError
 
@@ -33,7 +39,26 @@ func (r *PostgresRepository) Create(ctx context.Context, username string) (model
 		return model.User{}, err
 	}
 
-	return toModel(user), nil
+	return toModel(user.ID, user.ExternalID, user.Username, user.CreatedAt), nil
+}
+
+func (r *PostgresRepository) GetCredentialsByUsername(
+	ctx context.Context,
+	username string,
+) (model.Credentials, error) {
+	user, err := r.queries.GetUserCredentialsByUsername(ctx, username)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return model.Credentials{}, model.ErrUserNotFound
+		}
+
+		return model.Credentials{}, err
+	}
+
+	return model.Credentials{
+		User:         toModel(user.ID, user.ExternalID, user.Username, user.CreatedAt),
+		PasswordHash: user.PasswordHash,
+	}, nil
 }
 
 func (r *PostgresRepository) GetByExternalID(ctx context.Context, externalID string) (model.User, error) {
@@ -52,7 +77,7 @@ func (r *PostgresRepository) GetByExternalID(ctx context.Context, externalID str
 		return model.User{}, err
 	}
 
-	return toModel(user), nil
+	return toModel(user.ID, user.ExternalID, user.Username, user.CreatedAt), nil
 }
 
 func (r *PostgresRepository) List(ctx context.Context) ([]model.User, error) {
@@ -63,17 +88,22 @@ func (r *PostgresRepository) List(ctx context.Context) ([]model.User, error) {
 
 	result := make([]model.User, len(users))
 	for i, user := range users {
-		result[i] = toModel(user)
+		result[i] = toModel(user.ID, user.ExternalID, user.Username, user.CreatedAt)
 	}
 
 	return result, nil
 }
 
-func toModel(user sqlc.User) model.User {
+func toModel(
+	id int64,
+	externalID pgtype.UUID,
+	username string,
+	createdAt pgtype.Timestamptz,
+) model.User {
 	return model.User{
-		ID:         user.ID,
-		ExternalID: user.ExternalID.String(),
-		Username:   user.Username,
-		CreatedAt:  user.CreatedAt.Time,
+		ID:         id,
+		ExternalID: externalID.String(),
+		Username:   username,
+		CreatedAt:  createdAt.Time,
 	}
 }

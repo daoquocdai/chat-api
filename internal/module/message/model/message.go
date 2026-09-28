@@ -3,10 +3,18 @@ package model
 import "time"
 
 type Message struct {
-	ID                 int64
-	ExternalID         string
-	SenderExternalID   string
-	ReceiverExternalID string
-	Content            string
-	CreatedAt          time.Time
+	ID               int64
+	ExternalID       string
+	ThreadExternalID string
+	SenderExternalID string
+	Seq              int64
+	Kind             string
+	ContentFormat    string
+	Content          string
+	CreatedAt        time.Time
+}
+
+type Page struct {
+	Messages   []Message
+	NextCursor *int64
 }

@@ -8,36 +8,42 @@ import (
 
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	"github.com/daoquocdai/chat-api/internal/module/message/service"
+	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 )
 
 const (
-	firstExternalID  = "11111111-1111-1111-1111-111111111111"
-	secondExternalID = "22222222-2222-2222-2222-222222222222"
+	actorExternalID   = "11111111-1111-4111-8111-111111111111"
+	threadExternalID  = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	messageExternalID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 )
 
-type fakeRepository struct {
-	create           func(context.Context, int64, int64, string) (model.Message, error)
-	listBetween      func(context.Context, int64, int64) ([]model.Message, error)
-	createCalls      int
-	listBetweenCalls int
+type fakeMessageRepository struct {
+	send      func(context.Context, string, int64, string, string) (model.Message, bool, error)
+	list      func(context.Context, string, int64, *int64, int) (model.Page, error)
+	sendCalls int
+	listCalls int
 }
 
-func (r *fakeRepository) Create(
+func (r *fakeMessageRepository) Send(
 	ctx context.Context,
-	senderID, receiverID int64,
-	content string,
-) (model.Message, error) {
-	r.createCalls++
-	return r.create(ctx, senderID, receiverID, content)
+	threadID string,
+	senderID int64,
+	messageID, content string,
+) (model.Message, bool, error) {
+	r.sendCalls++
+	return r.send(ctx, threadID, senderID, messageID, content)
 }
 
-func (r *fakeRepository) ListBetween(
+func (r *fakeMessageRepository) List(
 	ctx context.Context,
-	userOneID, userTwoID int64,
-) ([]model.Message, error) {
-	r.listBetweenCalls++
-	return r.listBetween(ctx, userOneID, userTwoID)
+	threadID string,
+	userID int64,
+	beforeSeq *int64,
+	limit int,
+) (model.Page, error) {
+	r.listCalls++
+	return r.list(ctx, threadID, userID, beforeSeq, limit)
 }
 
 type fakeUserFinder struct {
@@ -50,290 +56,130 @@ func (f *fakeUserFinder) GetByExternalID(ctx context.Context, externalID string)
 	return f.get(ctx, externalID)
 }
 
-func newFakeUserFinder(
-	t *testing.T,
-	wantContext context.Context,
-	userErrors map[string]error,
-	sameInternalUser bool,
-) *fakeUserFinder {
-	t.Helper()
-
-	return &fakeUserFinder{get: func(ctx context.Context, externalID string) (usermodel.User, error) {
-		if ctx != wantContext {
-			t.Fatal("context was not passed to user service")
-		}
-		if err := userErrors[externalID]; err != nil {
-			return usermodel.User{}, err
-		}
-
-		switch externalID {
-		case firstExternalID:
-			return usermodel.User{ID: 11, ExternalID: firstExternalID}, nil
-		case secondExternalID:
-			id := int64(22)
-			if sameInternalUser {
-				id = 11
-			}
-			return usermodel.User{ID: id, ExternalID: secondExternalID}, nil
-		default:
-			t.Fatalf("unexpected external ID: %q", externalID)
-			return usermodel.User{}, nil
-		}
-	}}
-}
-
-func TestCreate(t *testing.T) {
-	repositoryError := errors.New("database unavailable")
+func TestSend(t *testing.T) {
+	databaseError := errors.New("database unavailable")
 
 	tests := []struct {
-		name             string
-		senderID         string
-		receiverID       string
-		content          string
-		userErrors       map[string]error
-		sameInternalUser bool
-		repositoryError  error
-		wantError        error
-		wantContent      string
-		wantUserCalls    int
-		wantRepoCalls    int
+		name            string
+		threadID        string
+		messageID       string
+		content         string
+		userError       error
+		repositoryError error
+		wantError       error
+		wantContent     string
+		wantUserCalls   int
+		wantRepoCalls   int
 	}{
-		{
-			name:          "normalize valid message",
-			senderID:      "  " + firstExternalID,
-			receiverID:    secondExternalID + "\t",
-			content:       "  Xin chào  ",
-			wantContent:   "Xin chào",
-			wantUserCalls: 2,
-			wantRepoCalls: 1,
-		},
-		{
-			name:       "missing IDs take priority over same ID and invalid content",
-			senderID:   " ",
-			receiverID: "\t",
-			content:    " ",
-			wantError:  model.ErrUserIDsRequired,
-		},
-		{
-			name:       "same external ID takes priority over invalid content",
-			senderID:   firstExternalID,
-			receiverID: " " + firstExternalID + " ",
-			content:    " ",
-			wantError:  model.ErrSameUser,
-		},
-		{
-			name:       "empty content",
-			senderID:   firstExternalID,
-			receiverID: secondExternalID,
-			content:    " \t\n ",
-			wantError:  model.ErrInvalidContent,
-		},
-		{
-			name:       "content longer than 1000 unicode characters",
-			senderID:   firstExternalID,
-			receiverID: secondExternalID,
-			content:    strings.Repeat("đ", 1001),
-			wantError:  model.ErrInvalidContent,
-		},
-		{
-			name:          "receiver not found",
-			senderID:      firstExternalID,
-			receiverID:    secondExternalID,
-			content:       "hello",
-			userErrors:    map[string]error{secondExternalID: usermodel.ErrUserNotFound},
-			wantError:     usermodel.ErrUserNotFound,
-			wantUserCalls: 2,
-		},
-		{
-			name:             "different external IDs resolve to same user",
-			senderID:         firstExternalID,
-			receiverID:       secondExternalID,
-			content:          "hello",
-			sameInternalUser: true,
-			wantError:        model.ErrSameUser,
-			wantUserCalls:    2,
-		},
-		{
-			name:            "repository error",
-			senderID:        firstExternalID,
-			receiverID:      secondExternalID,
-			content:         "hello",
-			repositoryError: repositoryError,
-			wantError:       repositoryError,
-			wantContent:     "hello",
-			wantUserCalls:   2,
-			wantRepoCalls:   1,
-		},
+		{name: "sends normalized content", threadID: " " + threadExternalID + " ", messageID: " " + messageExternalID + " ", content: "  xin chào  ", wantContent: "xin chào", wantUserCalls: 1, wantRepoCalls: 1},
+		{name: "thread ID required", threadID: " ", messageID: messageExternalID, content: "hello", wantError: model.ErrThreadIDRequired},
+		{name: "message ID required", threadID: threadExternalID, messageID: " ", content: "hello", wantError: model.ErrMessageIDRequired},
+		{name: "empty content", threadID: threadExternalID, messageID: messageExternalID, content: " \t", wantError: model.ErrInvalidContent},
+		{name: "content too long", threadID: threadExternalID, messageID: messageExternalID, content: strings.Repeat("đ", 1001), wantError: model.ErrInvalidContent},
+		{name: "content contains NUL", threadID: threadExternalID, messageID: messageExternalID, content: "hello\x00", wantError: model.ErrInvalidContent},
+		{name: "actor lookup fails", threadID: threadExternalID, messageID: messageExternalID, content: "hello", userError: usermodel.ErrUserNotFound, wantError: usermodel.ErrUserNotFound, wantUserCalls: 1},
+		{name: "conflict is preserved", threadID: threadExternalID, messageID: messageExternalID, content: "hello", repositoryError: model.ErrMessageIDConflict, wantError: model.ErrMessageIDConflict, wantContent: "hello", wantUserCalls: 1, wantRepoCalls: 1},
+		{name: "third party is rejected", threadID: threadExternalID, messageID: messageExternalID, content: "hello", repositoryError: threadmodel.ErrNotParticipant, wantError: threadmodel.ErrNotParticipant, wantContent: "hello", wantUserCalls: 1, wantRepoCalls: 1},
+		{name: "database error", threadID: threadExternalID, messageID: messageExternalID, content: "hello", repositoryError: databaseError, wantError: databaseError, wantContent: "hello", wantUserCalls: 1, wantRepoCalls: 1},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			users := newFakeUserFinder(t, ctx, tt.userErrors, tt.sameInternalUser)
-
-			savedMessage := model.Message{
-				ID:                 1,
-				ExternalID:         "33333333-3333-3333-3333-333333333333",
-				SenderExternalID:   firstExternalID,
-				ReceiverExternalID: secondExternalID,
-				Content:            tt.wantContent,
-			}
-
-			repository := &fakeRepository{create: func(
+			users := &fakeUserFinder{get: func(gotCtx context.Context, externalID string) (usermodel.User, error) {
+				if gotCtx != ctx || externalID != actorExternalID {
+					t.Fatalf("unexpected user lookup: %q", externalID)
+				}
+				if tt.userError != nil {
+					return usermodel.User{}, tt.userError
+				}
+				return usermodel.User{ID: 11, ExternalID: actorExternalID}, nil
+			}}
+			wantMessage := model.Message{ID: 9, ExternalID: messageExternalID, Seq: 1, Content: tt.wantContent}
+			repository := &fakeMessageRepository{send: func(
 				gotCtx context.Context,
-				senderID, receiverID int64,
-				content string,
-			) (model.Message, error) {
-				if gotCtx != ctx {
-					t.Fatal("context was not passed to repository")
+				threadID string,
+				senderID int64,
+				messageID, content string,
+			) (model.Message, bool, error) {
+				if gotCtx != ctx || threadID != threadExternalID || senderID != 11 || messageID != messageExternalID || content != tt.wantContent {
+					t.Fatalf("unexpected Send arguments: %q %d %q %q", threadID, senderID, messageID, content)
 				}
-				if senderID != 11 || receiverID != 22 {
-					t.Fatalf("user IDs = (%d, %d), want (11, 22)", senderID, receiverID)
-				}
-				if content != tt.wantContent {
-					t.Fatalf("content = %q, want %q", content, tt.wantContent)
-				}
-				if tt.repositoryError != nil {
-					return model.Message{}, tt.repositoryError
-				}
-				return savedMessage, nil
+				return wantMessage, true, tt.repositoryError
 			}}
 
-			messageService := service.New(repository, users)
-			got, err := messageService.Create(ctx, tt.senderID, tt.receiverID, tt.content)
-
+			got, created, err := service.New(repository, users).Send(
+				ctx,
+				actorExternalID,
+				tt.threadID,
+				tt.messageID,
+				tt.content,
+			)
 			if !errors.Is(err, tt.wantError) {
 				t.Fatalf("error = %v, want %v", err, tt.wantError)
 			}
-			if users.calls != tt.wantUserCalls {
-				t.Fatalf("user service calls = %d, want %d", users.calls, tt.wantUserCalls)
+			if users.calls != tt.wantUserCalls || repository.sendCalls != tt.wantRepoCalls {
+				t.Fatalf("calls = (users %d, repository %d), want (%d, %d)", users.calls, repository.sendCalls, tt.wantUserCalls, tt.wantRepoCalls)
 			}
-			if repository.createCalls != tt.wantRepoCalls {
-				t.Fatalf("repository calls = %d, want %d", repository.createCalls, tt.wantRepoCalls)
-			}
-
-			if tt.wantError != nil {
-				if got != (model.Message{}) {
-					t.Fatalf("message = %+v, want empty message", got)
-				}
-				return
-			}
-			if got != savedMessage {
-				t.Fatalf("message = %+v, want %+v", got, savedMessage)
+			if tt.wantError == nil && (got != wantMessage || !created) {
+				t.Fatalf("result = (%+v, %v), want (%+v, true)", got, created, wantMessage)
 			}
 		})
 	}
 }
 
-func TestListBetween(t *testing.T) {
-	repositoryError := errors.New("database unavailable")
-	wantMessages := []model.Message{{
-		ID:                 9,
-		ExternalID:         "33333333-3333-3333-3333-333333333333",
-		SenderExternalID:   secondExternalID,
-		ReceiverExternalID: firstExternalID,
-		Content:            "hello",
-	}}
+func TestList(t *testing.T) {
+	beforeFive := int64(5)
+	zero := int64(0)
 
 	tests := []struct {
-		name             string
-		userID           string
-		peerID           string
-		userErrors       map[string]error
-		sameInternalUser bool
-		repositoryError  error
-		wantError        error
-		wantUserCalls    int
-		wantRepoCalls    int
+		name          string
+		threadID      string
+		beforeSeq     *int64
+		limit         int
+		repositoryErr error
+		wantError     error
+		wantRepoCalls int
 	}{
-		{
-			name:          "normalize IDs and list messages",
-			userID:        " " + firstExternalID,
-			peerID:        secondExternalID + " ",
-			wantUserCalls: 2,
-			wantRepoCalls: 1,
-		},
-		{
-			name:      "missing peer ID",
-			userID:    firstExternalID,
-			peerID:    " ",
-			wantError: model.ErrUserIDsRequired,
-		},
-		{
-			name:      "same external ID",
-			userID:    firstExternalID,
-			peerID:    firstExternalID,
-			wantError: model.ErrSameUser,
-		},
-		{
-			name:          "peer not found",
-			userID:        firstExternalID,
-			peerID:        secondExternalID,
-			userErrors:    map[string]error{secondExternalID: usermodel.ErrUserNotFound},
-			wantError:     usermodel.ErrUserNotFound,
-			wantUserCalls: 2,
-		},
-		{
-			name:             "different external IDs resolve to same user",
-			userID:           firstExternalID,
-			peerID:           secondExternalID,
-			sameInternalUser: true,
-			wantError:        model.ErrSameUser,
-			wantUserCalls:    2,
-		},
-		{
-			name:            "repository error",
-			userID:          firstExternalID,
-			peerID:          secondExternalID,
-			repositoryError: repositoryError,
-			wantError:       repositoryError,
-			wantUserCalls:   2,
-			wantRepoCalls:   1,
-		},
+		{name: "forwards cursor", threadID: " " + threadExternalID + " ", beforeSeq: &beforeFive, limit: 2, wantRepoCalls: 1},
+		{name: "empty thread ID", threadID: " ", limit: 2, wantError: model.ErrThreadIDRequired},
+		{name: "zero cursor", threadID: threadExternalID, beforeSeq: &zero, limit: 2, wantError: model.ErrInvalidBeforeSeq},
+		{name: "zero limit", threadID: threadExternalID, limit: 0, wantError: model.ErrInvalidLimit},
+		{name: "limit too large", threadID: threadExternalID, limit: 101, wantError: model.ErrInvalidLimit},
+		{name: "third party is rejected", threadID: threadExternalID, limit: 2, repositoryErr: threadmodel.ErrNotParticipant, wantError: threadmodel.ErrNotParticipant, wantRepoCalls: 1},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			users := newFakeUserFinder(t, ctx, tt.userErrors, tt.sameInternalUser)
-
-			repository := &fakeRepository{listBetween: func(
+			users := &fakeUserFinder{get: func(context.Context, string) (usermodel.User, error) {
+				return usermodel.User{ID: 11, ExternalID: actorExternalID}, nil
+			}}
+			repository := &fakeMessageRepository{list: func(
 				gotCtx context.Context,
-				userOneID, userTwoID int64,
-			) ([]model.Message, error) {
-				if gotCtx != ctx {
-					t.Fatal("context was not passed to repository")
+				threadID string,
+				userID int64,
+				beforeSeq *int64,
+				limit int,
+			) (model.Page, error) {
+				if gotCtx != ctx || threadID != threadExternalID || userID != 11 || limit != tt.limit {
+					t.Fatalf("unexpected List arguments: %q %d %d", threadID, userID, limit)
 				}
-				if userOneID != 11 || userTwoID != 22 {
-					t.Fatalf("user IDs = (%d, %d), want (11, 22)", userOneID, userTwoID)
+				if (beforeSeq == nil) != (tt.beforeSeq == nil) || (beforeSeq != nil && *beforeSeq != *tt.beforeSeq) {
+					t.Fatalf("beforeSeq = %v, want %v", beforeSeq, tt.beforeSeq)
 				}
-				if tt.repositoryError != nil {
-					return nil, tt.repositoryError
-				}
-				return wantMessages, nil
+				return model.Page{}, tt.repositoryErr
 			}}
 
-			messageService := service.New(repository, users)
-			got, err := messageService.ListBetween(ctx, tt.userID, tt.peerID)
-
+			page, err := service.New(repository, users).List(ctx, actorExternalID, tt.threadID, tt.beforeSeq, tt.limit)
 			if !errors.Is(err, tt.wantError) {
 				t.Fatalf("error = %v, want %v", err, tt.wantError)
 			}
-			if users.calls != tt.wantUserCalls {
-				t.Fatalf("user service calls = %d, want %d", users.calls, tt.wantUserCalls)
+			if repository.listCalls != tt.wantRepoCalls {
+				t.Fatalf("repository calls = %d, want %d", repository.listCalls, tt.wantRepoCalls)
 			}
-			if repository.listBetweenCalls != tt.wantRepoCalls {
-				t.Fatalf("repository calls = %d, want %d", repository.listBetweenCalls, tt.wantRepoCalls)
-			}
-
-			if tt.wantError != nil {
-				if got != nil {
-					t.Fatalf("messages = %+v, want nil", got)
-				}
-				return
-			}
-			if len(got) != len(wantMessages) || got[0] != wantMessages[0] {
-				t.Fatalf("messages = %+v, want %+v", got, wantMessages)
+			if tt.wantError == nil && page.Messages == nil {
+				t.Fatal("nil messages were not normalized to an empty slice")
 			}
 		})
 	}

@@ -2,88 +2,206 @@ package repository
 
 import (
 	"context"
+	"errors"
 
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
+	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type PostgresRepository struct {
-	queries *sqlc.Queries
+	pool *pgxpool.Pool
 }
 
-func New(queries *sqlc.Queries) *PostgresRepository {
-	return &PostgresRepository{queries: queries}
+func New(pool *pgxpool.Pool) *PostgresRepository {
+	return &PostgresRepository{pool: pool}
 }
 
-func (r *PostgresRepository) Create(
+func (r *PostgresRepository) Send(
 	ctx context.Context,
-	senderID, receiverID int64,
-	content string,
-) (model.Message, error) {
-	message, err := r.queries.CreateMessage(ctx, sqlc.CreateMessageParams{
-		SenderID:   senderID,
-		ReceiverID: receiverID,
-		Content:    content,
+	threadExternalID string,
+	senderID int64,
+	messageID, content string,
+) (model.Message, bool, error) {
+	threadID, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
+	if err != nil {
+		return model.Message{}, false, err
+	}
+	messageExternalID, err := parseUUID(messageID, model.ErrInvalidMessageID)
+	if err != nil {
+		return model.Message{}, false, err
+	}
+
+	var result model.Message
+	created := false
+	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		queries := sqlc.New(tx)
+		threadInternalID, err := queries.LockThreadForParticipant(ctx, sqlc.LockThreadForParticipantParams{
+			UserID:           senderID,
+			ThreadExternalID: threadID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return classifyThreadAccess(ctx, queries, threadID)
+			}
+			return err
+		}
+
+		existing, err := queries.GetMessageByExternalID(ctx, messageExternalID)
+		if err == nil {
+			if existing.ThreadID != threadInternalID || existing.SenderID != senderID ||
+				existing.Kind != "text" || existing.ContentFormat != "plaintext" ||
+				existing.Content != content {
+				return model.ErrMessageIDConflict
+			}
+			result = messageFromValues(
+				existing.ID, existing.ExternalID, existing.ThreadExternalID,
+				existing.SenderExternalID, existing.Seq, existing.Kind,
+				existing.ContentFormat, existing.Content, existing.CreatedAt,
+			)
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		seq, err := queries.IncrementThreadSequence(ctx, threadInternalID)
+		if err != nil {
+			return err
+		}
+		message, err := queries.CreateThreadMessage(ctx, sqlc.CreateThreadMessageParams{
+			MessageExternalID: messageExternalID,
+			ThreadID:          threadInternalID,
+			SenderID:          senderID,
+			Seq:               seq,
+			Content:           content,
+		})
+		if err != nil {
+			return err
+		}
+
+		created = true
+		result = messageFromValues(
+			message.ID, message.ExternalID, message.ThreadExternalID,
+			message.SenderExternalID, message.Seq, message.Kind,
+			message.ContentFormat, message.Content, message.CreatedAt,
+		)
+		return nil
 	})
 	if err != nil {
-		return model.Message{}, err
+		if isExternalIDUniqueViolation(err) {
+			return model.Message{}, false, model.ErrMessageIDConflict
+		}
+		return model.Message{}, false, err
 	}
 
-	return toModel(
-		message.ID,
-		message.ExternalID,
-		message.SenderExternalID,
-		message.ReceiverExternalID,
-		message.Content,
-		message.CreatedAt,
-	), nil
+	return result, created, nil
 }
 
-func (r *PostgresRepository) ListBetween(
+func (r *PostgresRepository) List(
 	ctx context.Context,
-	userOneID, userTwoID int64,
-) ([]model.Message, error) {
-	messages, err := r.queries.ListMessagesBetween(
-		ctx,
-		sqlc.ListMessagesBetweenParams{
-			UserOneID: userOneID,
-			UserTwoID: userTwoID,
-		},
-	)
+	threadExternalID string,
+	userID int64,
+	beforeSeq *int64,
+	limit int,
+) (model.Page, error) {
+	threadID, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
 	if err != nil {
-		return nil, err
+		return model.Page{}, err
+	}
+	queries := sqlc.New(r.pool)
+	if _, err := queries.GetActiveThreadAccess(ctx, sqlc.GetActiveThreadAccessParams{
+		UserID:           userID,
+		ThreadExternalID: threadID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return model.Page{}, classifyThreadAccess(ctx, queries, threadID)
+		}
+		return model.Page{}, err
 	}
 
-	result := make([]model.Message, len(messages))
-	for i, message := range messages {
-		result[i] = toModel(
-			message.ID,
-			message.ExternalID,
-			message.SenderExternalID,
-			message.ReceiverExternalID,
-			message.Content,
-			message.CreatedAt,
+	before := pgtype.Int8{}
+	if beforeSeq != nil {
+		before = pgtype.Int8{Int64: *beforeSeq, Valid: true}
+	}
+	rows, err := queries.ListThreadMessagesPage(ctx, sqlc.ListThreadMessagesPageParams{
+		UserID:           userID,
+		ThreadExternalID: threadID,
+		BeforeSeq:        before,
+		PageSize:         int32(limit),
+	})
+	if err != nil {
+		return model.Page{}, err
+	}
+
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	messages := make([]model.Message, len(rows))
+	for i, row := range rows {
+		messages[i] = messageFromValues(
+			row.ID, row.ExternalID, row.ThreadExternalID,
+			row.SenderExternalID, row.Seq, row.Kind,
+			row.ContentFormat, row.Content, row.CreatedAt,
 		)
 	}
 
-	return result, nil
+	var nextCursor *int64
+	if hasMore {
+		cursor := messages[len(messages)-1].Seq
+		nextCursor = &cursor
+	}
+
+	return model.Page{Messages: messages, NextCursor: nextCursor}, nil
 }
 
-func toModel(
+func classifyThreadAccess(ctx context.Context, queries *sqlc.Queries, threadID pgtype.UUID) error {
+	exists, err := queries.ThreadExistsByExternalID(ctx, threadID)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return threadmodel.ErrNotParticipant
+	}
+	return threadmodel.ErrThreadNotFound
+}
+
+func parseUUID(value string, invalidError error) (pgtype.UUID, error) {
+	var id pgtype.UUID
+	if err := id.Scan(value); err != nil {
+		return pgtype.UUID{}, invalidError
+	}
+	return id, nil
+}
+
+func messageFromValues(
 	id int64,
-	externalID pgtype.UUID,
-	senderExternalID pgtype.UUID,
-	receiverExternalID pgtype.UUID,
-	content string,
+	externalID, threadExternalID, senderExternalID pgtype.UUID,
+	seq int64,
+	kind, contentFormat, content string,
 	createdAt pgtype.Timestamptz,
 ) model.Message {
 	return model.Message{
-		ID:                 id,
-		ExternalID:         externalID.String(),
-		SenderExternalID:   senderExternalID.String(),
-		ReceiverExternalID: receiverExternalID.String(),
-		Content:            content,
-		CreatedAt:          createdAt.Time,
+		ID:               id,
+		ExternalID:       externalID.String(),
+		ThreadExternalID: threadExternalID.String(),
+		SenderExternalID: senderExternalID.String(),
+		Seq:              seq,
+		Kind:             kind,
+		ContentFormat:    contentFormat,
+		Content:          content,
+		CreatedAt:        createdAt.Time,
 	}
+}
+
+func isExternalIDUniqueViolation(err error) bool {
+	var postgresError *pgconn.PgError
+	return errors.As(err, &postgresError) &&
+		postgresError.Code == "23505" &&
+		postgresError.ConstraintName == "messages_external_id_key"
 }

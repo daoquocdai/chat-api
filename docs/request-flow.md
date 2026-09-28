@@ -1,79 +1,92 @@
-# Luồng request trong Chat API
+# Luồng request Mini-Hermes
 
-## Vai trò các tầng
+## Ranh giới các tầng
 
-* **DTO**: định nghĩa JSON đầu vào và đầu ra.
-* **Handler**: đọc HTTP request, gọi service và trả response.
-* **Service**: chuẩn hóa dữ liệu và xử lý nghiệp vụ.
-* **Repository**: gọi sqlc và chuyển dữ liệu thành domain model.
-* **sqlc**: sinh Go code từ các câu SQL.
-* **PostgreSQL**: lưu user và message.
-
-## Luồng chung
+- DTO chỉ định nghĩa JSON HTTP; không chứa `password_hash` hoặc ID `BIGINT` nội bộ.
+- Handler bind request, lấy external user ID đã xác thực từ Gin context và ánh xạ lỗi HTTP.
+- Service chuẩn hóa username, kiểm tra input, băm/so mật khẩu và tra actor nội bộ; không phụ thuộc Gin.
+- Repository dùng sqlc/PostgreSQL, kiểm tra participant và giữ transaction.
+- JWT manager trong `internal/token` ký/xác minh token, không phụ thuộc Gin.
+- Bearer middleware chỉ xác minh token và đặt external user ID từ `sub` vào context; không truy vấn database.
 
 ```mermaid
-flowchart TD
-    C[Client] --> R[Gin router]
-    R --> H[Handler]
+flowchart LR
+    C[Web hoặc HTTP client] --> R[Gin router]
+    R --> M[Bearer middleware]
+    M --> H[Handler]
     H --> S[Service]
     S --> P[Repository]
     P --> Q[sqlc]
     Q --> DB[(PostgreSQL)]
-
-    DB --> Q
-    Q --> P
-    P --> S
-    S --> H
-    H -->|JSON và HTTP status| C
 ```
 
-Request đi theo chiều:
+## Auth
 
-```text
-Client → Gin → handler → service → repository → sqlc → PostgreSQL
+`POST /auth/register` dùng chung `NormalizeUsername`, kiểm tra password, băm bcrypt rồi ghi `password_hash`. Response không chứa mật khẩu hoặc hash.
+
+`POST /auth/login` chuẩn hóa username, lấy credentials và so bcrypt. Sai username và sai password trả cùng `invalid username or password`. JWT HS256 chứa external UUID trong `sub`, cùng `iat` và `exp`; secret/TTL đến từ config runtime.
+
+Một PostgreSQL user repository phục vụ cả đăng ký/đăng nhập, lookup user và danh sách user. Không còn constructor truyền cùng repository hai lần và không còn luồng tạo user thiếu password.
+
+## Tạo hoặc mở direct thread
+
+`POST /threads/direct` nhận `peer_id`; actor đến từ JWT.
+
+1. Service tra actor và peer sang ID `BIGINT`, đồng thời chặn chat với chính mình.
+2. Repository sắp cặp ID thành low/high, bắt đầu transaction và khóa hai dòng `users` theo đúng thứ tự tăng dần. PostgreSQL row lock dùng chung giữa mọi connection/process/instance; thứ tự toàn cục này tránh deadlock khi các cặp giao nhau.
+3. Sau khi có đủ hai khóa, repository tìm direct thread có đúng hai active participant là cặp đó, bất kể ai gửi request trước.
+4. Nếu chưa có, repository ghi thread và hai participant trong cùng transaction. Request đồng thời đợi khóa rồi đọc lại thread vừa commit.
+
+Không còn cột cặp user hay unique index tương ứng trên `threads`. Vì vậy cơ chế chống trùng phụ thuộc mọi đường ghi direct thread đều dùng transaction/khóa trên; thao tác SQL trực tiếp hoặc implementation khác bỏ qua khóa có thể tạo trùng.
+
+## Gửi tin
+
+`POST /threads/:id/messages` nhận `message_id` và `content`, không nhận sender. `message_id` là UUID client đã chọn cho `messages.external_id`; response vẫn trả external ID trong `id`.
+
+Trong một transaction, repository khóa thread đồng thời với việc xác nhận actor là participant đang hoạt động. Sau đó nó tra `external_id` toàn cục:
+
+1. UUID đã thuộc đúng sender, thread, kind/format và nội dung: trả message cũ, không tăng `last_seq`.
+2. UUID đã gắn với bất kỳ dữ liệu nào khác: trả `409 Conflict` chung, không trả message cũ nên không lộ nội dung/người gửi/thread của người khác.
+3. UUID chưa có: tăng `last_seq`, ghi message với sequence đó và commit.
+
+Unique constraint trên `messages.external_id` xử lý cả race giữa các thread/instance. Nếu insert thua race, toàn transaction (kể cả tăng sequence) rollback và API trả conflict. Hai request retry giống hệt trong cùng thread được serialize bởi khóa thread nên chỉ có một row.
+
+Thread tồn tại nhưng actor không phải participant trả `403`; thread không tồn tại trả `404`.
+
+## Đọc lịch sử
+
+`GET /threads/:id/messages` tra actor từ JWT và chỉ query khi actor là participant đang hoạt động. `limit` mặc định 30, nằm trong `1..100`; `before_seq` nếu có phải dương. Repository query `seq DESC`, lấy `limit + 1`, giữ điều kiện `seq >= joined_seq` và không dùng `OFFSET`, timestamp hay message ID toàn cục.
+
+```json
+{
+  "messages": [
+    { "seq": 5, "content": "Tin 5" },
+    { "seq": 4, "content": "Tin 4" }
+  ],
+  "next_cursor": 4
+}
 ```
 
-Kết quả được trả ngược lại:
+Trang tiếp theo gọi `?before_seq=4&limit=2` và chỉ nhận message có `seq < 4`. `next_cursor` là `null` khi không còn trang cũ hơn.
 
-```text
-PostgreSQL → sqlc → repository → service → handler → client
-```
+## Read marker và unread
 
-## `POST /users`
+`PUT /threads/:id/read` nhận `{ "last_read_seq": N }`; actor không bao giờ đến từ body. SQL chỉ update participant đang hoạt động khi `joined_seq - 1 <= N <= threads.last_seq`, đồng thời dùng `GREATEST(last_read_seq, N)`. Vì vậy request cũ đến muộn không thể làm marker giảm. Thread rỗng chấp nhận mốc `0`.
 
-1. Gin chuyển request đến `user.Handler.Create`.
-2. Handler đọc `username` từ JSON bằng DTO.
-3. Service bỏ khoảng trắng, chuyển username thành chữ thường và kiểm tra dữ liệu.
-4. Repository gọi `CreateUser` do sqlc sinh.
-5. PostgreSQL tạo user và trả bản ghi về.
-6. Handler chuyển `model.User` thành JSON và trả `201 Created`.
+Hai query summary thread cùng trả `last_read_seq`, `peer_last_read_seq` và `unread_count`. `unread_count` là `COUNT(*)` trên các message nằm trong phạm vi xem, có `seq > last_read_seq`, do người khác gửi và `kind <> 'system'`; không suy ra từ `last_seq - last_read_seq`. UI dùng `peer_last_read_seq` để hiện “Đã đọc” cho tin mình gửi có `seq` không lớn hơn marker đó.
 
-## `POST /messages`
+## Web demo
 
-1. Handler đọc `sender_id`, `receiver_id` và `content` từ JSON.
-2. Message service kiểm tra hai user phải khác nhau và nội dung phải hợp lệ.
-3. Message service gọi user service để tìm sender và receiver theo UUID.
-4. User repository dùng sqlc lấy ID `bigint` nội bộ của hai user.
-5. Message repository gọi `CreateMessage` để lưu tin nhắn.
-6. Kết quả đi ngược qua sqlc → repository → service → handler.
-7. Handler chuyển `model.Message` thành JSON và trả `201 Created`.
+Router phục vụ `web/index.html`, `web/app.js` và `web/style.css`. Giao diện:
 
-Message service dùng user service thay vì gọi thẳng user repository để giữ phụ thuộc đúng tầng và dùng lại logic tìm user.
+1. Đăng ký rồi đăng nhập.
+2. Lưu JWT vào `sessionStorage` của tab và lấy user hiện tại từ claim `sub`.
+3. Gọi `GET /users` bằng Bearer token và chỉ hiển thị các tài khoản khác.
+4. Khi chọn peer, gọi `POST /threads/direct`, sau đó tải lịch sử.
+5. Tải trang mới nhất, đảo sang thứ tự cũ → mới để render; nút **Tin cũ hơn** prepend trang theo `next_cursor` và map theo `seq` loại trùng.
+6. Polling trang mới nhất mỗi 1,5 giây. Nếu trang đó chưa chạm `seq` cao nhất đã biết, web theo `next_cursor` cho đến khi chạm mốc, rồi merge; các trang cũ không bị thay thế.
+7. Chỉ gọi `PUT read` cho chuỗi tin nhận đã xuất hiện trong viewport khi cuộc chat hiện tại và tab đều đang hiển thị. GET nền và thao tác gửi không tự cập nhật marker.
+8. Mọi response bất đồng bộ đều đối chiếu session version, conversation version và thread ID trước khi cập nhật DOM; response muộn sau đổi thread/đăng xuất bị bỏ qua.
+9. Khi API trả `401`, xóa session local và đưa người dùng về màn hình đăng nhập.
 
-## `GET /messages`
-
-Ví dụ:
-
-```text
-GET /messages?user_id=<UUID>&peer_id=<UUID>
-```
-
-Handler lấy hai UUID từ query string. Service tìm hai user rồi gọi repository bằng ID nội bộ. sqlc lấy tối đa 100 tin nhắn gần nhất giữa hai người và trả theo thứ tự cũ đến mới. Handler trả danh sách JSON với HTTP `200 OK`.
-
-## Quy ước ID
-
-* ID `bigint` chỉ dùng nội bộ trong PostgreSQL.
-* `external_id` dạng UUID được dùng trong API.
-* Các trường `id`, `sender_id`, `receiver_id`, `user_id` và `peer_id` mà client sử dụng đều là UUID.
-
-Hiện tại ứng dụng chưa có đăng nhập, thread hoặc WebSocket. Giao diện chọn user thủ công và lấy tin nhắn mới bằng polling mỗi giây.
+Không còn route `/messages` sender/receiver hoặc `POST /users`; client không có đường API để tự khai danh tính người gửi.

@@ -6,8 +6,14 @@ import (
 	"github.com/daoquocdai/chat-api/internal/module/user/model"
 )
 
-type CreateUserRequest struct {
+type RegisterRequest struct {
 	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type UserResponse struct {
@@ -19,6 +25,11 @@ type UserResponse struct {
 type UserSummaryResponse struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
+}
+
+type TokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
 }
 
 func ToUserResponse(user model.User) UserResponse {

@@ -19,6 +19,7 @@ Yêu cầu `Authorization: Bearer <access_token>`:
 | Method | Path | Chức năng |
 | --- | --- | --- |
 | `GET` | `/users` | Danh sách tài khoản trong PostgreSQL |
+| `POST` | `/auth/ws-ticket` | Cấp vé WebSocket ngắn hạn, dùng một lần |
 | `POST` | `/threads/direct` | Tạo hoặc mở direct thread với `peer_id` |
 | `GET` | `/threads` | Danh sách direct thread của người gọi |
 | `GET` | `/threads/:id/messages` | Một trang lịch sử theo cursor `before_seq`, `limit` |
@@ -33,7 +34,44 @@ Gửi tin nhận `message_id` UUID và `content`. `message_id` chính là `messa
 
 `PUT /threads/:id/read` chỉ nhận `last_read_seq`; danh tính luôn đến từ JWT. Marker chỉ tăng, phải nằm trong phạm vi participant được xem và không vượt `threads.last_seq`.
 
-Phạm vi hiện tại không có group chat, E2EE, WebSocket hay Redis.
+Phạm vi hiện tại vẫn chỉ có chat 1-1, chưa có group chat hay E2EE. Web demo nhận tin mới qua `ws-gateway`, không dò REST theo chu kỳ.
+
+## Redis Stream `message.created`
+
+Sau khi transaction PostgreSQL của `POST /threads/:id/messages` commit thành công, service gọi `XADD` vào stream cấu hình tại `redis.stream` (mặc định mẫu: `mini-hermes:events`). Mỗi entry có `event=message.created` và các field:
+
+| Field | Giá trị |
+| --- | --- |
+| `message_id` | External UUID của message, chính là `message_id` client gửi |
+| `thread_id` | External UUID của thread |
+| `sender_id` | External UUID của sender đã xác thực |
+| `recipient_id` | External UUID lấy từ active participant còn lại trong PostgreSQL |
+| `seq` | Sequence trong thread |
+| `kind` | `text` hoặc `system` |
+| `content_format` | `plaintext` hoặc định dạng hỗ trợ về sau |
+| `content` | Nội dung đã lưu |
+| `created_at` | UTC RFC3339 với độ chính xác nano giây |
+
+Publisher không nhận recipient từ request. Repository lấy recipient từ `participants` trong transaction gửi tin và trả external UUID nội bộ cho service; DTO REST không thêm trường mới.
+
+Nếu commit thất bại, request không có quyền hoặc UUID conflict thì không publish. Nếu commit đã thành công nhưng `XADD` lỗi/timeout, API trả `503 Service Unavailable` với hướng dẫn retry đúng `message_id` và payload cũ. Retry hợp lệ đọc lại cùng message/`seq` rồi thử `XADD` lần nữa. Vì kết quả XADD có thể đã tới Redis trước khi client nhận lỗi, stream có thể có nhiều entry cho cùng `message_id`. Gateway chuyển tiếp từng entry, kể cả entry trùng; client phải khử trùng theo `message_id` và dùng `seq` từ PostgreSQL để sắp thứ tự trong thread. Thiết kế này không bảo đảm exactly-once và không bảo đảm realtime nếu client không retry.
+
+## WebSocket gateway và vé một lần
+
+Chạy `chat-api` và gateway ở hai tiến trình, dùng cùng `config/config.yml`:
+
+```powershell
+go run ./cmd
+go run ./cmd/ws-gateway
+```
+
+Gateway mặc định nghe tại `:8081` (`ws_address`); endpoint là `GET /ws`. Web dùng JWT hiện có trong header Bearer để gọi `POST /auth/ws-ticket`. API trả `{ "ticket": "...", "ws_url": "..." }`; vé ngẫu nhiên 32 byte có TTL 30 giây và không phải JWT. Web kết nối `ws_url?ticket=<vé>`. Gateway dùng Redis `GETDEL` để tiêu thụ vé nguyên tử **trước** khi upgrade, nên vé không thể dùng hai lần. CLI vẫn có thể gửi `Authorization: Bearer <JWT>` trực tiếp. Không đưa JWT dài hạn vào URL. Reverse proxy nên tránh ghi query string chứa vé vào log; production phải dùng `wss://` và cấu hình origin chính xác.
+
+Gateway không kết nối PostgreSQL. Một user có thể mở nhiều kết nối và mọi kết nối của recipient đang mở đều nhận JSON `message.created` với `message_id`, `thread_id`, `sender_id`, `recipient_id`, `seq`, `kind`, `content_format`, `content`, `created_at`. Kết nối chậm bị đóng khi hàng đợi đầy hoặc ghi/ping timeout; client cần tải bù qua REST.
+
+Gateway tạo consumer group `ws-gateway` cho `redis.stream` nếu chưa có, từ ID `0` để không bỏ qua entry có trước lúc khởi động. Chỉ hỗ trợ **một gateway instance** và dùng consumer name cố định `gateway-1`. Khi khởi động/reconnect, nó đọc lại pending của chính consumer này bằng `XREADGROUP ... 0` trước khi đọc entry mới bằng `XREADGROUP ... >`. Nếu Redis tạm lỗi, gateway thử lại; không cần restart thủ công. Mỗi entry được `XACK` sau khi đã đưa vào hàng đợi kết nối hiện có; Bob offline cũng được `XACK`. `XACK` không xác nhận Bob đã nhận/đọc tin, và trường hợp gateway chết trước `XACK` có thể phát lại cùng event. PostgreSQL/REST vẫn là nguồn lịch sử tin nhắn.
+
+`ws_public_url` là URL mà browser nhìn thấy; mặc định local `ws://localhost:8081/ws`. `ws_allowed_origins` cho phép origin web `localhost:8080`/`127.0.0.1:8080` trong demo. Khi triển khai ở host khác, phải đổi cả hai giá trị. Vé và event đi qua Redis; gateway vẫn không cần repository PostgreSQL.
 
 ## Chuẩn bị database local
 
@@ -46,12 +84,22 @@ Copy-Item config/config.yml.example config/config.yml
 `config/config.yml` cần trỏ đến PostgreSQL local và có cấu hình tương tự:
 
 ```yaml
+ws_address: ":8081"
+ws_public_url: "ws://localhost:8081/ws"
+ws_allowed_origins: ["localhost:8080", "127.0.0.1:8080"]
+ws_ticket_ttl: 30s
 auth:
   jwt_secret: "replace-with-a-long-random-secret"
   jwt_ttl: 24h
+redis:
+  address: "localhost:6379"
+  password: ""
+  database: 0
+  stream: "mini-hermes:events"
+  publish_timeout: 2s
 ```
 
-Runtime từ chối khởi động nếu secret trống hoặc TTL nhỏ hơn một giây.
+Runtime từ chối khởi động nếu secret trống, TTL nhỏ hơn một giây, hoặc cấu hình Redis thiếu address/stream hay có publish timeout không dương. Khi khởi động, ứng dụng cũng `PING` PostgreSQL và Redis trước khi phục vụ HTTP.
 
 ### Cảnh báo dữ liệu legacy
 
@@ -86,17 +134,18 @@ Sau khi migration thành công:
 
 ```powershell
 go run ./cmd
+go run ./cmd/ws-gateway  # chạy ở terminal thứ hai
 ```
 
 Mở `http://localhost:8080`:
 
 1. Đăng ký Alice và Bob.
-2. Đăng nhập Alice, chọn Bob và gửi tin.
-3. Mở một tab độc lập hoặc cửa sổ riêng tư, đăng nhập Bob, chọn Alice và trả lời.
+2. Mở hai tab độc lập hoặc cửa sổ riêng tư, đăng nhập Alice và Bob, chọn nhau.
+3. Alice gửi tin qua REST; Bob nhận ngay qua WebSocket. Ngắt gateway hoặc đưa Bob offline, gửi thêm hơn 30 tin, sau đó kết nối lại để kiểm tra web lấy bù hết các trang lịch sử.
 4. Tải lại trang hoặc khởi động lại server; đăng nhập và chọn lại peer để xem lịch sử còn trong PostgreSQL.
 5. Đăng nhập tài khoản thứ ba để xác nhận tài khoản đó không thể truy cập thread Alice–Bob bằng API.
 
-Web lưu JWT trong `sessionStorage` của từng tab, gửi Bearer token cho mọi API user/thread/message và polling mỗi 1,5 giây. Mỗi lần người dùng submit tạo một `message_id` mới, kể cả nội dung giống hệt; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload của lần gửi đó. Trang mới nhất được hợp nhất theo `seq`, các trang cũ đã tải được giữ lại và nút **Tin cũ hơn** dùng `next_cursor`. Nếu hơn một trang tin đến giữa hai lần poll, client tiếp tục đi ngược cursor đến message mới nhất đã biết để không tạo khoảng trống. Web chỉ gửi read marker khi cuộc chat đang mở, tab đang hiển thị và các tin nhận liên tiếp đã thực sự xuất hiện trong viewport. Reload cùng tab vẫn giữ phiên; đăng xuất hoặc đóng tab sẽ xóa phiên local.
+Web lưu JWT trong `sessionStorage` của từng tab, dùng Bearer token cho REST và đổi vé ngắn hạn để mở WebSocket. Mỗi lần người dùng submit tạo một `message_id` mới, kể cả nội dung giống hệt; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload của lần gửi đó. Tin mới đi qua WebSocket; khi mở thread, kết nối lại hoặc thấy gap `seq`, web lấy bù bằng REST và đi ngược `next_cursor` cho đến mốc đã biết. Tin từ REST/event được gộp theo `message_id`, render theo `seq`; nút **Tin cũ hơn** vẫn tải lịch sử cũ theo cursor. Web chỉ gửi read marker khi cuộc chat đang mở, tab đang hiển thị và các tin nhận liên tiếp đã thực sự xuất hiện trong viewport. Đăng xuất/đổi tài khoản đóng socket và hủy lịch reconnect cũ.
 
 Collection [docs/week2-chat.http](docs/week2-chat.http) minh họa đầy đủ hai người chat, request thiếu JWT và cả thao tác đọc/gửi bị từ chối với tài khoản thứ ba. Đổi biến `@run`, rồi chạy request từ trên xuống dưới.
 
@@ -107,10 +156,20 @@ $env:TEST_DATABASE_URL = 'postgres://chat:chat@localhost:5432/chat_api_test?sslm
 go test ./internal/integration -v
 ```
 
+Test tích hợp Redis dùng một stream tạm riêng và bị skip nếu chưa đặt `TEST_REDIS_ADDR`:
+
+```powershell
+$env:TEST_REDIS_ADDR = 'localhost:6379'
+go test ./internal/module/message/publisher -run Integration -v
+go test ./internal/gateway -run Integration -v
+go test ./internal/wsticket -run Integration -v
+```
+
+Kiểm tra logic browser không cần backend: `node --test web/*.test.cjs` và `node --check web/app.js`.
+
 Xem [docs/request-flow.md](docs/request-flow.md) để biết ranh giới handler/service/repository và transaction.
 
 ## Chưa có trong scope
 
 - Group chat, E2EE và API prekey.
-- WebSocket/realtime push; web đang polling.
-- Redis.
+- CLI demo, ADR và chính sách retention/trim stream.

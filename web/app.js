@@ -1,6 +1,10 @@
 const sessionTokenKey = "mini-hermes.access-token";
 const sessionUsernameKey = "mini-hermes.username";
 const messagePageLimit = 30;
+const threadSummaryDebounceMs = 750;
+const websocketConnectTimeoutMs = 10000;
+const websocketHeartbeatTimeoutMs = 15000;
+const websocketResumeGraceMs = 5000;
 
 const authView = document.querySelector("#auth-view");
 const chatView = document.querySelector("#chat-view");
@@ -14,7 +18,6 @@ const historyElement = document.querySelector("#history");
 const messageForm = document.querySelector("#message-form");
 const contentInput = document.querySelector("#content");
 const sendButton = document.querySelector("#send-button");
-const refreshButton = document.querySelector("#refresh-button");
 const loadOlderButton = document.querySelector("#load-older-button");
 const noticeElement = document.querySelector("#notice");
 const errorElement = document.querySelector("#error");
@@ -26,6 +29,8 @@ const state = {
   currentUsername: "",
   users: [],
   threadsByPeer: new Map(),
+  threadEventSeqs: new Map(),
+  threadSummaryBaseSeqs: new Map(),
   peerID: "",
   threadID: "",
   conversationVersion: 0,
@@ -44,11 +49,16 @@ const state = {
   olderRequest: null,
   threadListRequest: null,
   threadListDirty: false,
+  threadSummaryTimer: null,
   readRequest: null,
   pendingReadSeq: 0,
   socket: null,
   socketConnecting: false,
   socketGeneration: 0,
+  socketTicketAbort: null,
+  socketHealthTimer: null,
+  socketLastActivityAt: 0,
+  socketSummaryStale: false,
   reconnectTimer: null,
   reconnectDelay: 1000,
 };
@@ -150,7 +160,6 @@ function resetConversation() {
   contentInput.value = "";
   contentInput.disabled = true;
   sendButton.disabled = true;
-  refreshButton.disabled = true;
   loadOlderButton.hidden = true;
   loadOlderButton.disabled = true;
 }
@@ -165,8 +174,15 @@ function clearSession() {
   state.currentUsername = "";
   state.users = [];
   state.threadsByPeer = new Map();
+  state.threadEventSeqs = new Map();
+  state.threadSummaryBaseSeqs = new Map();
   state.threadListRequest = null;
   state.threadListDirty = false;
+  if (state.threadSummaryTimer !== null) {
+    clearTimeout(state.threadSummaryTimer);
+    state.threadSummaryTimer = null;
+  }
+  state.socketSummaryStale = false;
   resetConversation();
   authView.hidden = false;
   chatView.hidden = true;
@@ -281,9 +297,118 @@ function applyCurrentThreadSummary(thread) {
   }
 }
 
+function updateThreadFromMessage(message) {
+  const seq = Number(message.seq);
+  if (!Number.isSafeInteger(seq) || seq <= 0) {
+    return;
+  }
+  const thread = [...state.threadsByPeer.values()].find((item) => item.id === message.thread_id);
+  const baseline = state.threadSummaryBaseSeqs.get(message.thread_id) ?? Number(thread?.last_seq || 0);
+  if (seq <= baseline) {
+    return;
+  }
+  let events = state.threadEventSeqs.get(message.thread_id);
+  if (!events) {
+    events = new Map();
+    state.threadEventSeqs.set(message.thread_id, events);
+  }
+  if (events.has(seq)) {
+    return;
+  }
+  events.set(seq, message);
+  if (!thread) {
+    // A thread opened in another tab may not be in our initial list yet.
+    if (state.threadListRequest) {
+      state.threadListDirty = true;
+    }
+    void loadThreads();
+    return;
+  }
+  thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
+  if (message.sender_id !== state.currentUserID && message.kind !== "system" &&
+      seq > Number(thread.last_read_seq || 0)) {
+    thread.unread_count = Number(thread.unread_count || 0) + 1;
+  }
+  renderPeerList();
+}
+
+function reconcileThreadSummary(thread) {
+  const old = state.threadsByPeer.get(thread.peer.id);
+  const baseSeq = Number(thread.last_seq || 0);
+  const events = state.threadEventSeqs.get(thread.id);
+  const oldReadSeq = Number(old?.last_read_seq || 0);
+  const freshReadSeq = Number(thread.last_read_seq || 0);
+  if (oldReadSeq > freshReadSeq && thread.id === state.threadID) {
+    let newlyRead = 0;
+    for (let seq = freshReadSeq + 1; seq <= oldReadSeq; seq += 1) {
+      const message = state.messages.get(seq);
+      if (message && message.sender_id !== state.currentUserID && message.kind !== "system") {
+        newlyRead += 1;
+      }
+    }
+    thread.last_read_seq = oldReadSeq;
+    thread.unread_count = Math.max(0, Number(thread.unread_count || 0) - newlyRead);
+  }
+  state.threadSummaryBaseSeqs.set(thread.id, baseSeq);
+  if (events) {
+    for (const [seq, message] of events) {
+      if (seq <= baseSeq) {
+        events.delete(seq);
+      } else {
+        thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
+        if (message.sender_id !== state.currentUserID && message.kind !== "system" &&
+            seq > Number(thread.last_read_seq || 0)) {
+          thread.unread_count = Number(thread.unread_count || 0) + 1;
+        }
+      }
+    }
+  }
+  return thread;
+}
+
+function applyLocalReadMarker(threadID, previous, current) {
+  const thread = [...state.threadsByPeer.values()].find((item) => item.id === threadID);
+  if (!thread || current <= previous) {
+    return;
+  }
+  thread.last_read_seq = Math.max(Number(thread.last_read_seq || 0), current);
+  let newlyRead = 0;
+  for (let seq = previous + 1; seq <= current; seq += 1) {
+    const message = state.messages.get(seq);
+    if (message && message.sender_id !== state.currentUserID && message.kind !== "system") {
+      newlyRead += 1;
+    }
+  }
+  thread.unread_count = Math.max(0, Number(thread.unread_count || 0) - newlyRead);
+  renderPeerList();
+}
+
+function scheduleThreadSummaryRefresh() {
+  if (state.threadSummaryTimer !== null) {
+    clearTimeout(state.threadSummaryTimer);
+  }
+  const sessionVersion = state.sessionVersion;
+  const token = state.token;
+  state.threadSummaryTimer = setTimeout(() => {
+    state.threadSummaryTimer = null;
+    if (!currentSessionMatches(sessionVersion, token)) {
+      return;
+    }
+    if (state.threadListRequest) {
+      state.threadListDirty = true;
+    } else {
+      void loadThreads();
+    }
+  }, threadSummaryDebounceMs);
+}
+
 async function loadThreads() {
   if (!state.token) {
     return;
+  }
+  if (state.threadSummaryTimer !== null) {
+    clearTimeout(state.threadSummaryTimer);
+    state.threadSummaryTimer = null;
   }
   const sessionVersion = state.sessionVersion;
   const token = state.token;
@@ -292,7 +417,6 @@ async function loadThreads() {
     state.threadListRequest.sessionVersion === sessionVersion &&
     state.threadListRequest.token === token
   ) {
-    state.threadListDirty = true;
     return;
   }
 
@@ -304,8 +428,12 @@ async function loadThreads() {
       return;
     }
 
-    state.threadsByPeer = new Map(threads.map((thread) => [thread.peer.id, thread]));
-    applyCurrentThreadSummary(threads.find((thread) => thread.id === state.threadID));
+    const refreshed = new Map();
+    for (const thread of threads) {
+      refreshed.set(thread.peer.id, reconcileThreadSummary(thread));
+    }
+    state.threadsByPeer = refreshed;
+    applyCurrentThreadSummary(refreshed.get(state.peerID));
     renderPeerList();
   } catch (error) {
     if (currentSessionMatches(sessionVersion, token)) {
@@ -502,8 +630,11 @@ async function syncCurrentConversation() {
   }
 }
 
-function stopWebSocket() {
+function stopWebSocket(resetBackoff = true) {
   state.socketGeneration += 1;
+  state.socketTicketAbort?.abort();
+  state.socketTicketAbort = null;
+  clearSocketHealthTimer();
   if (state.reconnectTimer !== null) {
     clearTimeout(state.reconnectTimer);
     state.reconnectTimer = null;
@@ -511,9 +642,74 @@ function stopWebSocket() {
   const socket = state.socket;
   state.socket = null;
   state.socketConnecting = false;
-  state.reconnectDelay = 1000;
+  state.socketLastActivityAt = 0;
+  if (resetBackoff) {
+    state.reconnectDelay = 1000;
+    state.socketSummaryStale = false;
+  }
   if (socket) {
     socket.close(1000, "session ended");
+  }
+}
+
+function clearSocketHealthTimer() {
+  if (state.socketHealthTimer !== null) {
+    clearTimeout(state.socketHealthTimer);
+    state.socketHealthTimer = null;
+  }
+}
+
+function armSocketTimeout(generation, sessionVersion, token, delay) {
+  clearSocketHealthTimer();
+  const timer = setTimeout(() => {
+    if (state.socketHealthTimer !== timer) {
+      return;
+    }
+    state.socketHealthTimer = null;
+    if (generation === state.socketGeneration && currentSessionMatches(sessionVersion, token) &&
+        !(document.visibilityState === "hidden" && state.socket?.readyState === WebSocket.OPEN)) {
+      restartWebSocket();
+    }
+  }, delay);
+  state.socketHealthTimer = timer;
+}
+
+function restartWebSocket(immediate = false) {
+  if (!state.token) {
+    return;
+  }
+  stopWebSocket(false);
+  state.socketSummaryStale = true;
+  if (immediate) {
+    void connectWebSocket();
+  } else {
+    scheduleReconnect(state.socketGeneration, state.sessionVersion, state.token);
+  }
+}
+
+function ensureWebSocket() {
+  if (!state.token || (state.socketConnecting && !state.socket)) {
+    return;
+  }
+  if (!state.socket) {
+    if (state.reconnectTimer !== null) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+    void connectWebSocket();
+    return;
+  }
+  if (state.socket.readyState === 0 && state.socketConnecting) {
+    return;
+  }
+  if (state.socket.readyState === WebSocket.OPEN) {
+    // Background tabs can delay both timers and onmessage callbacks. Give a queued
+    // heartbeat a chance to arrive before declaring an apparently open socket dead.
+    const stale = Date.now() - state.socketLastActivityAt >= websocketHeartbeatTimeoutMs;
+    armSocketTimeout(state.socketGeneration, state.sessionVersion, state.token,
+      stale ? websocketResumeGraceMs : websocketHeartbeatTimeoutMs);
+  } else {
+    restartWebSocket();
   }
 }
 
@@ -524,10 +720,16 @@ function scheduleReconnect(generation, sessionVersion, token) {
   }
   const delay = state.reconnectDelay;
   state.reconnectDelay = Math.min(delay * 2, 30000);
-  state.reconnectTimer = setTimeout(() => {
+  const timer = setTimeout(() => {
+    if (state.reconnectTimer !== timer) {
+      return;
+    }
     state.reconnectTimer = null;
-    void connectWebSocket();
+    if (generation === state.socketGeneration && currentSessionMatches(sessionVersion, token)) {
+      void connectWebSocket();
+    }
   }, delay);
+  state.reconnectTimer = timer;
 }
 
 function handleSocketMessage(data) {
@@ -543,6 +745,7 @@ function handleSocketMessage(data) {
       !Number.isSafeInteger(seq) || seq <= 0) {
     return;
   }
+  updateThreadFromMessage(event);
   if (event.thread_id === state.threadID) {
     const changed = mergeMessages([event]);
     if (state.messagesLoaded) {
@@ -558,8 +761,6 @@ function handleSocketMessage(data) {
       }
     }
   }
-  // Summary/unread count is updated by an event-triggered request, never a timer.
-  void loadThreads();
 }
 
 async function connectWebSocket() {
@@ -569,9 +770,15 @@ async function connectWebSocket() {
   const sessionVersion = state.sessionVersion;
   const token = state.token;
   const generation = state.socketGeneration;
+  const ticketAbort = new AbortController();
+  state.socketTicketAbort = ticketAbort;
   state.socketConnecting = true;
+  armSocketTimeout(generation, sessionVersion, token, websocketConnectTimeoutMs);
   try {
-    const response = await apiRequest("/auth/ws-ticket", { method: "POST" });
+    const response = await apiRequest("/auth/ws-ticket", { method: "POST", signal: ticketAbort.signal });
+    if (state.socketTicketAbort === ticketAbort) {
+      state.socketTicketAbort = null;
+    }
     if (generation !== state.socketGeneration || !currentSessionMatches(sessionVersion, token)) {
       return;
     }
@@ -588,13 +795,28 @@ async function connectWebSocket() {
         return;
       }
       state.socketConnecting = false;
-      state.reconnectDelay = 1000;
+      state.socketLastActivityAt = Date.now();
+      if (document.visibilityState === "visible") {
+        armSocketTimeout(generation, sessionVersion, token, websocketHeartbeatTimeoutMs);
+      } else {
+        clearSocketHealthTimer();
+      }
       showError("");
-      void loadThreads();
+      if (state.socketSummaryStale) {
+        state.socketSummaryStale = false;
+        void loadThreads();
+      }
       void syncCurrentConversation();
     };
     socket.onmessage = (message) => {
       if (generation === state.socketGeneration && state.socket === socket) {
+        state.socketLastActivityAt = Date.now();
+        if (document.visibilityState === "visible") {
+          armSocketTimeout(generation, sessionVersion, token, websocketHeartbeatTimeoutMs);
+        } else {
+          clearSocketHealthTimer();
+        }
+        state.reconnectDelay = 1000;
         handleSocketMessage(message.data);
       }
     };
@@ -603,13 +825,20 @@ async function connectWebSocket() {
       if (generation !== state.socketGeneration || state.socket !== socket) {
         return;
       }
+      clearSocketHealthTimer();
       state.socket = null;
       state.socketConnecting = false;
+      state.socketSummaryStale = true;
       scheduleReconnect(generation, sessionVersion, token);
     };
   } catch (error) {
+    if (state.socketTicketAbort === ticketAbort) {
+      state.socketTicketAbort = null;
+    }
     if (generation === state.socketGeneration && currentSessionMatches(sessionVersion, token)) {
+      clearSocketHealthTimer();
       state.socketConnecting = false;
+      state.socketSummaryStale = true;
       showError(error.message);
       scheduleReconnect(generation, sessionVersion, token);
     }
@@ -728,14 +957,19 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
       return;
     }
 
+    const previousReadSeq = state.lastReadSeq;
     state.lastReadSeq = Math.max(state.lastReadSeq, Number(response.last_read_seq || 0));
+    applyLocalReadMarker(snapshot.threadID, previousReadSeq, state.lastReadSeq);
+    if (state.lastReadSeq > target) {
+      // Another tab advanced the marker; local messages may not cover that range.
+      void loadThreads();
+    }
     completed = true;
     for (const seq of state.seenReceivedSeqs) {
       if (seq <= state.lastReadSeq) {
         state.seenReceivedSeqs.delete(seq);
       }
     }
-    await loadThreads();
   } catch (error) {
     if (currentConversationMatches(snapshot)) {
       showError(error.message);
@@ -778,7 +1012,6 @@ async function openConversation(peerID) {
   historyElement.innerHTML = '<p class="empty">Đang tải lịch sử...</p>';
   contentInput.disabled = true;
   sendButton.disabled = true;
-  refreshButton.disabled = true;
   loadOlderButton.hidden = true;
   showError("");
 
@@ -797,13 +1030,13 @@ async function openConversation(peerID) {
     }
 
     state.threadID = thread.id;
-    state.lastReadSeq = Number(thread.last_read_seq || 0);
-    state.peerLastReadSeq = Number(thread.peer_last_read_seq || 0);
-    state.threadsByPeer.set(peerID, thread);
+    const summary = reconcileThreadSummary(thread);
+    state.lastReadSeq = Number(summary.last_read_seq || 0);
+    state.peerLastReadSeq = Number(summary.peer_last_read_seq || 0);
+    state.threadsByPeer.set(peerID, summary);
     renderPeerList();
     contentInput.disabled = false;
     sendButton.disabled = false;
-    refreshButton.disabled = false;
     await loadInitialHistory();
     if (version === state.conversationVersion && thread.id === state.threadID) {
       contentInput.focus();
@@ -862,6 +1095,8 @@ loginForm.addEventListener("submit", async (event) => {
     state.currentUsername = username.trim().toLowerCase();
     state.users = [];
     state.threadsByPeer = new Map();
+    state.threadEventSeqs = new Map();
+    state.threadSummaryBaseSeqs = new Map();
     sessionStorage.setItem(sessionTokenKey, state.token);
     sessionStorage.setItem(sessionUsernameKey, state.currentUsername);
     loginForm.reset();
@@ -892,6 +1127,7 @@ messageForm.addEventListener("submit", async (event) => {
     }
     contentInput.value = "";
     mergeMessages([message]);
+    updateThreadFromMessage(message);
     if (Number(message.seq) > state.syncedSeq + 1) {
       void catchUpConversation(snapshot);
     } else {
@@ -900,7 +1136,7 @@ messageForm.addEventListener("submit", async (event) => {
       }
     }
     renderMessages("bottom", false);
-    await loadThreads();
+    scheduleThreadSummaryRefresh();
   } catch (error) {
     if (currentConversationMatches(snapshot)) {
       showError(error.message);
@@ -918,10 +1154,6 @@ logoutButton.addEventListener("click", () => {
   showError("");
 });
 
-refreshButton.addEventListener("click", async () => {
-  await Promise.all([loadThreads(), syncCurrentConversation()]);
-});
-
 loadOlderButton.addEventListener("click", loadOlderMessages);
 
 let visibilityFrame = null;
@@ -937,22 +1169,25 @@ historyElement.addEventListener("scroll", () => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "visible" || !state.token) {
+  if (document.visibilityState !== "visible") {
+    if (state.socket?.readyState === WebSocket.OPEN) {
+      clearSocketHealthTimer();
+    }
+    return;
+  }
+  if (!state.token) {
     return;
   }
   const snapshot = conversationSnapshot();
   recordVisibleMessages(snapshot);
+  ensureWebSocket();
 });
 
 window.addEventListener("online", () => {
-  if (!state.token || state.socket || state.socketConnecting) {
+  if (!state.token) {
     return;
   }
-  if (state.reconnectTimer !== null) {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
-  }
-  void connectWebSocket();
+  ensureWebSocket();
 });
 
 state.token = sessionStorage.getItem(sessionTokenKey) || "";

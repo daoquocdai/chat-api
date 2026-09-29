@@ -77,7 +77,7 @@ function makeApp() {
   }
   const sandbox = {
     document, window, sessionStorage, fetch, WebSocket: FakeWebSocket,
-    MiniHermesRealtime: realtime, Headers, URL, URLSearchParams, atob,
+    MiniHermesRealtime: realtime, Headers, URL, URLSearchParams, AbortController, atob,
     crypto: { randomUUID: () => "new-message-id" },
     requestAnimationFrame: () => 1, cancelAnimationFrame: () => {},
     setTimeout(callback) {
@@ -100,6 +100,14 @@ function makeApp() {
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 15));
+
+test("every app.js DOM selector exists in index.html", () => {
+  const script = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  for (const [, id] of script.matchAll(/document\.querySelector\("#([\w-]+)"\)/g)) {
+    assert.ok(html.includes(`id="${id}"`), `missing #${id} in index.html`);
+  }
+});
 
 test("Alice event reaches Bob immediately; offline Bob reconnects and backfills every page", async () => {
   const app = makeApp();

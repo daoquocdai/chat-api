@@ -42,6 +42,7 @@ func New(
 
 	router.HandleMethodNotAllowed = true
 	router.NoMethod(noMethodHandler)
+	router.Use(webAssetCachePolicy)
 
 	router.GET("/health", healthHandler)
 	router.GET("/", indexHandler)
@@ -62,6 +63,14 @@ func New(
 	authenticated.GET("/threads/:id/messages", messageHandler.List)
 
 	return router
+}
+
+func webAssetCachePolicy(c *gin.Context) {
+	switch c.Request.URL.Path {
+	case "/", "/app.js", "/realtime-core.js", "/style.css":
+		c.Header("Cache-Control", "no-store")
+	}
+	c.Next()
 }
 
 func indexHandler(c *gin.Context) {

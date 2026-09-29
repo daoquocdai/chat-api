@@ -13,10 +13,14 @@ import (
 const queueSize = 64
 const writeTimeout = 5 * time.Second
 const pingInterval = 30 * time.Second
+const defaultHeartbeatInterval = 5 * time.Second
+
+var heartbeatFrame = []byte(`{"type":"heartbeat"}`)
 
 type Hub struct {
-	mu      sync.RWMutex
-	clients map[string]map[*client]struct{}
+	mu                sync.RWMutex
+	clients           map[string]map[*client]struct{}
+	heartbeatInterval time.Duration
 }
 
 type client struct {
@@ -28,7 +32,10 @@ type client struct {
 }
 
 func NewHub() *Hub {
-	return &Hub{clients: make(map[string]map[*client]struct{})}
+	return &Hub{
+		clients:           make(map[string]map[*client]struct{}),
+		heartbeatInterval: defaultHeartbeatInterval,
+	}
 }
 
 func (h *Hub) add(userID string, conn *websocket.Conn) *client {
@@ -57,21 +64,29 @@ func (h *Hub) remove(c *client) {
 }
 
 func (h *Hub) writeLoop(c *client) {
-	ticker := time.NewTicker(pingInterval)
-	defer ticker.Stop()
+	pingTicker := time.NewTicker(pingInterval)
+	heartbeatTicker := time.NewTicker(h.heartbeatInterval)
+	defer pingTicker.Stop()
+	defer heartbeatTicker.Stop()
 	defer h.remove(c)
+	write := func(data []byte) error {
+		ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+		defer cancel()
+		return c.conn.Write(ctx, websocket.MessageText, data)
+	}
 	for {
 		select {
 		case <-c.done:
 			return
 		case data := <-c.send:
-			ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
-			err := c.conn.Write(ctx, websocket.MessageText, data)
-			cancel()
-			if err != nil {
+			if err := write(data); err != nil {
 				return
 			}
-		case <-ticker.C:
+		case <-heartbeatTicker.C:
+			if err := write(heartbeatFrame); err != nil {
+				return
+			}
+		case <-pingTicker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 			err := c.conn.Ping(ctx)
 			cancel()

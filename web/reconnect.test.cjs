@@ -217,7 +217,7 @@ test("two stationary tabs: idle, three messages, gateway outage and one catch-up
   assert.equal(countThreadSummaries(alice), aliceThreadsBefore);
   assert.equal(countThreadSummaries(bob), bobThreadsBefore);
   assert.equal(countRequests(bob, "GET", `/threads/${bob.threadID}/messages?`), bobHistoryBefore);
-  assert.equal(bob.state.messages.size, 13);
+  assert.equal(bob.state.currentCache.messages.size, 13);
   assert.equal(bob.state.threadsByPeer.get(alice.aliceID).unread_count, 3);
   assert.equal(alice.timerDelays.get(alice.state.threadSummaryTimer), 750);
   const summaryRefresh = alice.timers.get(alice.state.threadSummaryTimer);
@@ -230,7 +230,7 @@ test("two stationary tabs: idle, three messages, gateway outage and one catch-up
   contentInput.value = "tin trong luc gateway tat";
   await messageForm.listeners.submit({ preventDefault() {} });
   await settle();
-  assert.equal(bob.state.messages.size, 13);
+  assert.equal(bob.state.currentCache.messages.size, 13);
   assert.equal(countRequests(bob, "GET", `/threads/${bob.threadID}/messages?`), bobHistoryBefore);
   const outageSummary = alice.timers.get(alice.state.threadSummaryTimer);
   outageSummary();
@@ -238,13 +238,13 @@ test("two stationary tabs: idle, three messages, gateway outage and one catch-up
   assert.equal(countThreadSummaries(alice), aliceThreadsBefore + 2);
   await runReconnectTimer(alice);
   await runReconnectTimer(bob);
-  assert.equal(bob.state.messages.size, 13);
+  assert.equal(bob.state.currentCache.messages.size, 13);
   assert.equal(countRequests(bob, "GET", `/threads/${bob.threadID}/messages?`), bobHistoryBefore);
   assert.equal(countThreadSummaries(bob), bobThreadsBefore);
   alice.sockets[1].open();
   bob.sockets[1].open();
   await settle();
-  assert.equal(bob.state.messages.size, 14);
+  assert.equal(bob.state.currentCache.messages.size, 14);
   assert.equal(countRequests(bob, "GET", `/threads/${bob.threadID}/messages?`), bobHistoryBefore + 1);
   assert.equal(bob.ticketCount, 2);
   assert.equal(bob.state.threadsByPeer.get(alice.aliceID).unread_count, 4);
@@ -267,7 +267,7 @@ test("online with a healthy socket does nothing; a stale socket only fetches aft
   app.state.socketLastActivityAt = Date.now() - 31000;
   app.document.listeners.visibilitychange();
   await settle();
-  assert.equal(app.state.messages.size, 10);
+  assert.equal(app.state.currentCache.messages.size, 10);
   assert.equal(app.cursors.length, priorHistoryRequests);
   assert.equal(app.sockets[0].closed, false);
   assert.equal(app.timerDelays.get(app.state.socketHealthTimer), 5000);
@@ -280,16 +280,16 @@ test("online with a healthy socket does nothing; a stale socket only fetches aft
   assert.equal(app.maxActiveHistory, 1);
   app.sockets[1].open();
   await settle();
-  assert.equal(app.state.messages.size, 80);
-  assert.equal(app.state.syncedSeq, 80);
-  assert.equal(app.state.messageIDs.size, 80);
+  assert.equal(app.state.currentCache.messages.size, 80);
+  assert.equal(app.state.currentCache.syncedSeq, 80);
+  assert.equal(app.state.currentCache.messageIDs.size, 80);
   assert.deepEqual(app.cursors.slice(-3), [null, 51, 21]);
   for (const seq of [80, 79]) {
     const message = app.history[seq - 1];
     app.sockets[1].message({ ...message, type: "message.created", message_id: message.id, recipient_id: app.bobID });
   }
-  assert.equal(app.state.messages.size, 80);
-  assert.deepEqual([...app.state.messages.keys()].sort((a, b) => a - b), Array.from({ length: 80 }, (_, i) => i + 1));
+  assert.equal(app.state.currentCache.messages.size, 80);
+  assert.deepEqual([...app.state.currentCache.messages.keys()].sort((a, b) => a - b), Array.from({ length: 80 }, (_, i) => i + 1));
 });
 
 test("missing heartbeat replaces a half-open socket and backfills on new open", async () => {
@@ -313,9 +313,9 @@ test("missing heartbeat replaces a half-open socket and backfills on new open", 
   assert.equal(app.cursors.length, priorHistoryRequests);
   app.sockets[1].open();
   await settle();
-  assert.equal(app.state.messages.size, 80);
-  assert.equal(app.state.syncedSeq, 80);
-  assert.equal(app.state.messageIDs.size, 80);
+  assert.equal(app.state.currentCache.messages.size, 80);
+  assert.equal(app.state.currentCache.syncedSeq, 80);
+  assert.equal(app.state.currentCache.messageIDs.size, 80);
   assert.equal(app.maxActiveHistory, 1);
 });
 
@@ -345,8 +345,8 @@ test("failed reconnects keep requesting fresh tickets until the gateway returns"
   assert.equal(app.cursors.length, priorHistoryRequests);
   app.sockets[2].open();
   await settle();
-  assert.equal(app.state.messages.size, 80);
-  assert.equal(app.state.syncedSeq, 80);
+  assert.equal(app.state.currentCache.messages.size, 80);
+  assert.equal(app.state.currentCache.syncedSeq, 80);
   assert.equal(app.maxActiveHistory, 1);
 });
 
@@ -500,7 +500,7 @@ test("showing a hidden tab with a healthy socket does not fetch history", async 
   app.document.visibilityState = "visible";
   app.document.listeners.visibilitychange();
   await settle();
-  assert.equal(app.state.messages.size, 10);
+  assert.equal(app.state.currentCache.messages.size, 10);
   assert.equal(app.cursors.length, priorHistoryRequests);
   assert.equal(app.ticketCount, 1);
   assert.equal(app.sockets.length, 1);
@@ -518,7 +518,7 @@ test("showing a hidden tab replaces a stale socket and catches up after open", a
   app.document.visibilityState = "visible";
   app.document.listeners.visibilitychange();
   await settle();
-  assert.equal(app.state.messages.size, 10);
+  assert.equal(app.state.currentCache.messages.size, 10);
   assert.equal(app.timerDelays.get(app.state.socketHealthTimer), 5000);
   app.timers.get(app.state.socketHealthTimer)();
   await settle();
@@ -527,7 +527,7 @@ test("showing a hidden tab replaces a stale socket and catches up after open", a
   assert.equal(app.ticketCount, 2);
   app.sockets[1].open();
   await settle();
-  assert.equal(app.state.messages.size, 80);
+  assert.equal(app.state.currentCache.messages.size, 80);
 });
 
 test("logout and account switch invalidate an old watchdog callback", async () => {
@@ -551,7 +551,7 @@ test("logout and account switch invalidate an old watchdog callback", async () =
 test("read marker waits for visible received messages without crossing a seq gap", async () => {
   const app = makeApp();
   await vm.runInContext(`openConversation("${app.aliceID}")`, app.context);
-  app.state.messages.delete(2);
+  app.state.currentCache.messages.delete(2);
   const visible = new Set([3]);
   const historyElement = vm.runInContext("historyElement", app.context);
   historyElement.querySelectorAll = () => [...visible].map((seq) => ({
@@ -565,7 +565,7 @@ test("read marker waits for visible received messages without crossing a seq gap
   vm.runInContext("recordVisibleMessages()", app.context);
   await settle();
   assert.deepEqual(app.readMarkers, [1]);
-  app.state.messages.set(2, { ...app.history[1] });
+  app.state.currentCache.messages.set(2, { ...app.history[1] });
   visible.add(2);
   vm.runInContext("recordVisibleMessages()", app.context);
   await settle();
@@ -602,5 +602,5 @@ test("a burst of sends refreshes peer read status once", async () => {
   app.timers.get(app.state.threadSummaryTimer)();
   await settle();
   assert.equal(countThreadSummaries(app), 1);
-  assert.equal(app.state.peerLastReadSeq, 12);
+  assert.equal(app.state.currentCache.peerLastReadSeq, 12);
 });

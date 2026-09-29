@@ -29,29 +29,18 @@ const state = {
   currentUsername: "",
   users: [],
   threadsByPeer: new Map(),
+  threadCaches: new Map(),
+  directRequestsByPeer: new Map(),
   threadEventSeqs: new Map(),
   threadSummaryBaseSeqs: new Map(),
   peerID: "",
   threadID: "",
+  currentCache: null,
   conversationVersion: 0,
-  messages: new Map(),
-  messageIDs: new Map(),
-  messagesLoaded: false,
-  syncedSeq: 0,
-  nextCursor: null,
-  lastReadSeq: 0,
-  peerLastReadSeq: 0,
-  seenReceivedSeqs: new Set(),
-  initialHistoryRequest: null,
-  syncAfterInitial: false,
-  catchupRequest: null,
-  catchupAgain: false,
-  olderRequest: null,
   threadListRequest: null,
   threadListDirty: false,
+  threadListCatchup: false,
   threadSummaryTimer: null,
-  readRequest: null,
-  pendingReadSeq: 0,
   socket: null,
   socketConnecting: false,
   socketGeneration: 0,
@@ -127,7 +116,7 @@ async function sendMessageWithRetry(snapshot, messageID, content) {
       return await apiRequest(`/threads/${snapshot.threadID}/messages`, request);
     } catch (error) {
       const retryable = error.status === undefined || error.status >= 500;
-      if (attempt === 1 || !retryable || !currentConversationMatches(snapshot)) {
+      if (attempt === 1 || !retryable || !cacheSnapshotMatches(snapshot)) {
         throw error;
       }
     }
@@ -139,22 +128,8 @@ async function sendMessageWithRetry(snapshot, messageID, content) {
 function resetConversation() {
   state.peerID = "";
   state.threadID = "";
+  state.currentCache = null;
   state.conversationVersion += 1;
-  state.messages = new Map();
-  state.messageIDs = new Map();
-  state.messagesLoaded = false;
-  state.syncedSeq = 0;
-  state.nextCursor = null;
-  state.lastReadSeq = 0;
-  state.peerLastReadSeq = 0;
-  state.seenReceivedSeqs = new Set();
-  state.initialHistoryRequest = null;
-  state.syncAfterInitial = false;
-  state.catchupRequest = null;
-  state.catchupAgain = false;
-  state.olderRequest = null;
-  state.readRequest = null;
-  state.pendingReadSeq = 0;
   peerName.textContent = "Chọn một tài khoản";
   historyElement.innerHTML = '<p class="empty">Chọn một tài khoản để bắt đầu chat.</p>';
   contentInput.value = "";
@@ -174,10 +149,13 @@ function clearSession() {
   state.currentUsername = "";
   state.users = [];
   state.threadsByPeer = new Map();
+  state.threadCaches = new Map();
+  state.directRequestsByPeer = new Map();
   state.threadEventSeqs = new Map();
   state.threadSummaryBaseSeqs = new Map();
   state.threadListRequest = null;
   state.threadListDirty = false;
+  state.threadListCatchup = false;
   if (state.threadSummaryTimer !== null) {
     clearTimeout(state.threadSummaryTimer);
     state.threadSummaryTimer = null;
@@ -207,7 +185,38 @@ function conversationSnapshot() {
     token: state.token,
     version: state.conversationVersion,
     threadID: state.threadID,
+    cache: state.currentCache,
   };
+}
+
+function newThreadCache(threadID) {
+  return {
+    threadID,
+    messages: new Map(), messageIDs: new Map(), messagesLoaded: false,
+    syncedSeq: 0, nextCursor: null, lastReadSeq: 0, peerLastReadSeq: 0,
+    seenReceivedSeqs: new Set(), initialHistoryRequest: null,
+    syncAfterInitial: false, catchupRequest: null, catchupTargetSeq: 0,
+    olderRequest: null, readRequest: null, pendingReadSeq: 0,
+  };
+}
+
+function cacheForThread(threadID) {
+  let cache = state.threadCaches.get(threadID);
+  if (!cache) {
+    cache = newThreadCache(threadID);
+    state.threadCaches.set(threadID, cache);
+  }
+  return cache;
+}
+
+function cacheSnapshot(cache) {
+  return { sessionVersion: state.sessionVersion, token: state.token,
+    threadID: cache.threadID, cache };
+}
+
+function cacheSnapshotMatches(snapshot) {
+  return currentSessionMatches(snapshot.sessionVersion, snapshot.token) &&
+    state.threadCaches.get(snapshot.threadID) === snapshot.cache;
 }
 
 function currentConversationMatches(snapshot) {
@@ -215,6 +224,7 @@ function currentConversationMatches(snapshot) {
     currentSessionMatches(snapshot.sessionVersion, snapshot.token) &&
     snapshot.version === state.conversationVersion &&
     snapshot.threadID === state.threadID &&
+    snapshot.cache === state.currentCache &&
     Boolean(snapshot.threadID)
   );
 }
@@ -285,14 +295,15 @@ async function loadUsers() {
 }
 
 function applyCurrentThreadSummary(thread) {
-  if (!thread || thread.id !== state.threadID) {
+  if (!thread) {
     return;
   }
-
-  const previousPeerMarker = state.peerLastReadSeq;
-  state.lastReadSeq = Math.max(state.lastReadSeq, Number(thread.last_read_seq || 0));
-  state.peerLastReadSeq = Math.max(state.peerLastReadSeq, Number(thread.peer_last_read_seq || 0));
-  if (state.messagesLoaded && previousPeerMarker !== state.peerLastReadSeq) {
+  const cache = state.threadCaches.get(thread.id);
+  if (!cache) return;
+  const previousPeerMarker = cache.peerLastReadSeq;
+  cache.lastReadSeq = Math.max(cache.lastReadSeq, Number(thread.last_read_seq || 0));
+  cache.peerLastReadSeq = Math.max(cache.peerLastReadSeq, Number(thread.peer_last_read_seq || 0));
+  if (state.currentCache === cache && cache.messagesLoaded && previousPeerMarker !== cache.peerLastReadSeq) {
     renderMessages("preserve", false);
   }
 }
@@ -332,16 +343,32 @@ function updateThreadFromMessage(message) {
   renderPeerList();
 }
 
+function acceptMessage(message) {
+  const cache = cacheForThread(message.thread_id);
+  const changed = MiniHermesRealtime.merge(cache.messages, cache.messageIDs, [message]);
+  if (cache.messagesLoaded) {
+    if (Number(message.seq) > cache.syncedSeq + 1) {
+      void catchUpConversation(cache, Number(message.seq));
+    } else {
+      while (cache.messages.has(cache.syncedSeq + 1)) {
+        cache.syncedSeq += 1;
+      }
+    }
+  }
+  return { cache, changed };
+}
+
 function reconcileThreadSummary(thread) {
   const old = state.threadsByPeer.get(thread.peer.id);
   const baseSeq = Number(thread.last_seq || 0);
   const events = state.threadEventSeqs.get(thread.id);
   const oldReadSeq = Number(old?.last_read_seq || 0);
   const freshReadSeq = Number(thread.last_read_seq || 0);
-  if (oldReadSeq > freshReadSeq && thread.id === state.threadID) {
+  const cache = state.threadCaches.get(thread.id);
+  if (oldReadSeq > freshReadSeq && cache) {
     let newlyRead = 0;
     for (let seq = freshReadSeq + 1; seq <= oldReadSeq; seq += 1) {
-      const message = state.messages.get(seq);
+      const message = cache.messages.get(seq);
       if (message && message.sender_id !== state.currentUserID && message.kind !== "system") {
         newlyRead += 1;
       }
@@ -368,13 +395,14 @@ function reconcileThreadSummary(thread) {
 
 function applyLocalReadMarker(threadID, previous, current) {
   const thread = [...state.threadsByPeer.values()].find((item) => item.id === threadID);
-  if (!thread || current <= previous) {
+  const cache = state.threadCaches.get(threadID);
+  if (!thread || !cache || current <= previous) {
     return;
   }
   thread.last_read_seq = Math.max(Number(thread.last_read_seq || 0), current);
   let newlyRead = 0;
   for (let seq = previous + 1; seq <= current; seq += 1) {
-    const message = state.messages.get(seq);
+    const message = cache.messages.get(seq);
     if (message && message.sender_id !== state.currentUserID && message.kind !== "system") {
       newlyRead += 1;
     }
@@ -402,7 +430,7 @@ function scheduleThreadSummaryRefresh() {
   }, threadSummaryDebounceMs);
 }
 
-async function loadThreads() {
+async function loadThreads(catchUpCached = false) {
   if (!state.token) {
     return;
   }
@@ -417,6 +445,10 @@ async function loadThreads() {
     state.threadListRequest.sessionVersion === sessionVersion &&
     state.threadListRequest.token === token
   ) {
+    if (catchUpCached) {
+      state.threadListDirty = true;
+      state.threadListCatchup = true;
+    }
     return;
   }
 
@@ -430,10 +462,25 @@ async function loadThreads() {
 
     const refreshed = new Map();
     for (const thread of threads) {
+      const serverLastSeq = Number(thread.last_seq || 0);
       refreshed.set(thread.peer.id, reconcileThreadSummary(thread));
+      const cache = state.threadCaches.get(thread.id);
+      if (catchUpCached && cache?.messagesLoaded && serverLastSeq > cache.syncedSeq) {
+        void catchUpConversation(cache, serverLastSeq);
+      }
+    }
+    // A direct-thread POST may have completed after this list request began.
+    for (const [peerID, thread] of state.threadsByPeer) {
+      if (!refreshed.has(peerID)) {
+        refreshed.set(peerID, thread);
+        const cache = state.threadCaches.get(thread.id);
+        if (catchUpCached && cache?.messagesLoaded) {
+          void catchUpConversation(cache);
+        }
+      }
     }
     state.threadsByPeer = refreshed;
-    applyCurrentThreadSummary(refreshed.get(state.peerID));
+    for (const thread of refreshed.values()) applyCurrentThreadSummary(thread);
     renderPeerList();
   } catch (error) {
     if (currentSessionMatches(sessionVersion, token)) {
@@ -444,7 +491,9 @@ async function loadThreads() {
       state.threadListRequest = null;
       if (state.threadListDirty && currentSessionMatches(sessionVersion, token)) {
         state.threadListDirty = false;
-        void loadThreads();
+        const retryCatchup = state.threadListCatchup;
+        state.threadListCatchup = false;
+        void loadThreads(retryCatchup);
       }
     }
   }
@@ -457,27 +506,29 @@ function displayName(userID) {
   return peerByID(userID)?.username || "unknown";
 }
 
-function mergeMessages(messages) {
-  return MiniHermesRealtime.merge(state.messages, state.messageIDs, messages);
+function mergeMessages(cache, messages) {
+  return MiniHermesRealtime.merge(cache.messages, cache.messageIDs, messages);
 }
 
-function sortedMessages() {
-  return [...state.messages.values()].sort((left, right) => left.seq - right.seq);
+function sortedMessages(cache) {
+  return [...cache.messages.values()].sort((left, right) => left.seq - right.seq);
 }
 
-function highestMessageSeq() {
+function highestMessageSeq(cache) {
   let highest = 0;
-  for (const seq of state.messages.keys()) {
+  for (const seq of cache.messages.keys()) {
     highest = Math.max(highest, seq);
   }
   return highest;
 }
 
 function renderMessages(scrollMode = "preserve", recordVisibility = true) {
+  const cache = state.currentCache;
+  if (!cache) return;
   const previousHeight = historyElement.scrollHeight;
   const previousTop = historyElement.scrollTop;
   const wasNearBottom = previousHeight - previousTop - historyElement.clientHeight < 48;
-  const messages = sortedMessages();
+  const messages = sortedMessages(cache);
 
   historyElement.replaceChildren();
   if (messages.length === 0) {
@@ -503,7 +554,7 @@ function renderMessages(scrollMode = "preserve", recordVisibility = true) {
         day: "2-digit",
         month: "2-digit",
       });
-      const readStatus = sent && message.seq <= state.peerLastReadSeq ? " · Đã đọc" : "";
+      const readStatus = sent && message.seq <= cache.peerLastReadSeq ? " · Đã đọc" : "";
       meta.textContent = `${displayName(message.sender_id)} · ${time}${readStatus}`;
       item.append(content, meta);
       historyElement.append(item);
@@ -518,8 +569,8 @@ function renderMessages(scrollMode = "preserve", recordVisibility = true) {
     historyElement.scrollTop = previousTop;
   }
 
-  loadOlderButton.hidden = state.nextCursor === null;
-  loadOlderButton.disabled = state.nextCursor === null || Boolean(state.olderRequest);
+  loadOlderButton.hidden = cache.nextCursor === null;
+  loadOlderButton.disabled = cache.nextCursor === null || Boolean(cache.olderRequest);
   if (recordVisibility) {
     const snapshot = conversationSnapshot();
     requestAnimationFrame(() => recordVisibleMessages(snapshot));
@@ -534,99 +585,107 @@ function pageURL(threadID, beforeSeq = null) {
   return `/threads/${threadID}/messages?${params}`;
 }
 
-async function loadInitialHistory() {
-  if (!state.threadID || !state.token) {
+async function loadInitialHistory(cache = state.currentCache) {
+  if (!cache || !state.token || cache.messagesLoaded) {
     return;
   }
-  const snapshot = conversationSnapshot();
-  if (state.initialHistoryRequest) {
-    state.syncAfterInitial = true;
+  const snapshot = cacheSnapshot(cache);
+  if (cache.initialHistoryRequest) {
+    cache.syncAfterInitial = true;
     return;
   }
   const request = { ...snapshot };
-  state.initialHistoryRequest = request;
+  cache.initialHistoryRequest = request;
   try {
     const page = await apiRequest(pageURL(snapshot.threadID));
-    if (!currentConversationMatches(snapshot)) {
+    if (!cacheSnapshotMatches(snapshot)) {
       return;
     }
     const messages = Array.isArray(page.messages) ? page.messages : [];
-    mergeMessages(messages);
-    state.nextCursor = page.next_cursor ?? null;
-    state.syncedSeq = Math.max(0, ...messages.map((message) => Number(message.seq) || 0));
-    state.messagesLoaded = true;
-    renderMessages("initial");
-    showError("");
+    mergeMessages(cache, messages);
+    cache.nextCursor = page.next_cursor ?? null;
+    cache.syncedSeq = Math.max(0, ...messages.map((message) => Number(message.seq) || 0));
+    cache.messagesLoaded = true;
+    if (state.currentCache === cache) {
+      renderMessages("initial");
+      showError("");
+    }
     // An event could have arrived while the first REST page was in flight.
-    if (state.syncAfterInitial || highestMessageSeq() > state.syncedSeq) {
-      state.syncAfterInitial = false;
-      await catchUpConversation(snapshot);
+    if (cache.syncAfterInitial || highestMessageSeq(cache) > cache.syncedSeq) {
+      cache.syncAfterInitial = false;
+      await catchUpConversation(cache);
     }
   } catch (error) {
-    if (currentConversationMatches(snapshot)) {
+    if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
       showError(error.message);
     }
   } finally {
-    if (state.initialHistoryRequest === request) {
-      state.initialHistoryRequest = null;
+    if (cache.initialHistoryRequest === request) {
+      cache.initialHistoryRequest = null;
     }
   }
 }
 
-async function catchUpConversation(snapshot = conversationSnapshot()) {
-  if (!currentConversationMatches(snapshot) || !state.messagesLoaded) {
+async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
+  if (!cache || state.threadCaches.get(cache.threadID) !== cache || !cache.messagesLoaded || !state.token) {
     return;
   }
-  if (state.catchupRequest) {
-    state.catchupAgain = true;
+  if (cache.catchupRequest) {
+    cache.catchupTargetSeq = Math.max(cache.catchupTargetSeq, targetSeq);
     return;
   }
+  const snapshot = cacheSnapshot(cache);
   const request = { ...snapshot };
-  state.catchupRequest = request;
-  const baseline = state.syncedSeq;
-  const stale = new Error("conversation changed");
+  cache.catchupRequest = request;
+  const baseline = cache.syncedSeq;
+  const stale = new Error("session changed");
+  let completed = false;
   try {
     const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
       async (beforeSeq) => {
         const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
-        if (!currentConversationMatches(snapshot)) {
+        if (!cacheSnapshotMatches(snapshot)) {
           throw stale;
         }
         return page;
       },
       baseline,
-      (messages) => mergeMessages(messages),
+      (messages) => mergeMessages(cache, messages),
     );
-    if (!currentConversationMatches(snapshot)) {
+    if (!cacheSnapshotMatches(snapshot)) {
       return;
     }
-    state.syncedSeq = Math.max(state.syncedSeq, maxSeq);
-    renderMessages("new");
-    showError("");
+    cache.syncedSeq = Math.max(cache.syncedSeq, maxSeq);
+    completed = true;
+    if (state.currentCache === cache) {
+      renderMessages("new");
+      showError("");
+    }
   } catch (error) {
-    if (error !== stale && currentConversationMatches(snapshot)) {
+    if (error !== stale && cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
       showError(error.message);
     }
   } finally {
-    if (state.catchupRequest === request) {
-      state.catchupRequest = null;
-      const again = state.catchupAgain;
-      state.catchupAgain = false;
-      if (again && currentConversationMatches(snapshot)) {
-        void catchUpConversation(snapshot);
+    if (cache.catchupRequest === request) {
+      cache.catchupRequest = null;
+      const nextTarget = cache.catchupTargetSeq;
+      cache.catchupTargetSeq = 0;
+      if (completed && nextTarget > cache.syncedSeq && cacheSnapshotMatches(snapshot)) {
+        void catchUpConversation(cache);
       }
     }
   }
 }
 
 async function syncCurrentConversation() {
-  if (!state.threadID) {
+  const cache = state.currentCache;
+  if (!cache) {
     return;
   }
-  if (!state.messagesLoaded) {
-    await loadInitialHistory();
+  if (!cache.messagesLoaded) {
+    await loadInitialHistory(cache);
   } else {
-    await catchUpConversation();
+    await catchUpConversation(cache);
   }
 }
 
@@ -693,8 +752,7 @@ function ensureWebSocket() {
   }
   if (!state.socket) {
     if (state.reconnectTimer !== null) {
-      clearTimeout(state.reconnectTimer);
-      state.reconnectTimer = null;
+      return;
     }
     void connectWebSocket();
     return;
@@ -746,20 +804,9 @@ function handleSocketMessage(data) {
     return;
   }
   updateThreadFromMessage(event);
-  if (event.thread_id === state.threadID) {
-    const changed = mergeMessages([event]);
-    if (state.messagesLoaded) {
-      if (seq > state.syncedSeq + 1) {
-        void catchUpConversation();
-      } else {
-        while (state.messages.has(state.syncedSeq + 1)) {
-          state.syncedSeq += 1;
-        }
-      }
-      if (changed) {
-        renderMessages("new");
-      }
-    }
+  const { cache, changed } = acceptMessage(event);
+  if (state.currentCache === cache && cache.messagesLoaded && changed) {
+    renderMessages("new");
   }
 }
 
@@ -804,9 +851,14 @@ async function connectWebSocket() {
       showError("");
       if (state.socketSummaryStale) {
         state.socketSummaryStale = false;
-        void loadThreads();
+        void loadThreads(true);
+        if (state.currentCache && !state.currentCache.messagesLoaded) {
+          void loadInitialHistory(state.currentCache);
+        }
+      } else {
+        // The first socket may open after the initial REST page was fetched.
+        void syncCurrentConversation();
       }
-      void syncCurrentConversation();
     };
     socket.onmessage = (message) => {
       if (generation === state.socketGeneration && state.socket === socket) {
@@ -846,32 +898,37 @@ async function connectWebSocket() {
 }
 
 async function loadOlderMessages() {
-  if (state.nextCursor === null || !state.threadID || state.olderRequest) {
+  const cache = state.currentCache;
+  if (!cache || cache.nextCursor === null || cache.olderRequest) {
     return;
   }
-  const snapshot = conversationSnapshot();
-  const request = { ...snapshot, beforeSeq: state.nextCursor };
-  state.olderRequest = request;
+  const snapshot = cacheSnapshot(cache);
+  const request = { ...snapshot, beforeSeq: cache.nextCursor };
+  cache.olderRequest = request;
   loadOlderButton.disabled = true;
 
   try {
     const page = await apiRequest(pageURL(snapshot.threadID, request.beforeSeq));
-    if (!currentConversationMatches(snapshot)) {
+    if (!cacheSnapshotMatches(snapshot)) {
       return;
     }
-    mergeMessages(Array.isArray(page.messages) ? page.messages : []);
-    state.nextCursor = page.next_cursor ?? null;
-    renderMessages("older");
-    showError("");
+    mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
+    cache.nextCursor = page.next_cursor ?? null;
+    if (state.currentCache === cache) {
+      renderMessages("older");
+      showError("");
+    }
   } catch (error) {
-    if (currentConversationMatches(snapshot)) {
+    if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
       showError(error.message);
     }
   } finally {
-    if (state.olderRequest === request) {
-      state.olderRequest = null;
-      loadOlderButton.hidden = state.nextCursor === null;
-      loadOlderButton.disabled = state.nextCursor === null;
+    if (cache.olderRequest === request) {
+      cache.olderRequest = null;
+      if (state.currentCache === cache) {
+        loadOlderButton.hidden = cache.nextCursor === null;
+        loadOlderButton.disabled = cache.nextCursor === null;
+      }
     }
   }
 }
@@ -883,11 +940,12 @@ function isElementVisibleInHistory(element) {
 }
 
 function recordVisibleMessages(snapshot = conversationSnapshot()) {
+  const cache = snapshot.cache;
   if (
     !currentConversationMatches(snapshot) ||
     document.visibilityState !== "visible" ||
     chatView.hidden ||
-    !state.messagesLoaded
+    !cache.messagesLoaded
   ) {
     return;
   }
@@ -897,21 +955,21 @@ function recordVisibleMessages(snapshot = conversationSnapshot()) {
       continue;
     }
     const seq = Number(element.dataset.seq);
-    if (Number.isSafeInteger(seq) && seq > state.lastReadSeq) {
-      state.seenReceivedSeqs.add(seq);
+    if (Number.isSafeInteger(seq) && seq > cache.lastReadSeq) {
+      cache.seenReceivedSeqs.add(seq);
     }
   }
 
-  let candidate = state.lastReadSeq;
+  let candidate = cache.lastReadSeq;
   let sawReceived = false;
   while (true) {
     const nextSeq = candidate + 1;
-    const message = state.messages.get(nextSeq);
+    const message = cache.messages.get(nextSeq);
     if (!message) {
       break;
     }
     if (message.sender_id !== state.currentUserID && message.kind !== "system") {
-      if (!state.seenReceivedSeqs.has(nextSeq)) {
+      if (!cache.seenReceivedSeqs.has(nextSeq)) {
         break;
       }
       sawReceived = true;
@@ -919,7 +977,7 @@ function recordVisibleMessages(snapshot = conversationSnapshot()) {
     candidate = nextSeq;
   }
 
-  if (sawReceived && candidate > state.lastReadSeq) {
+  if (sawReceived && candidate > cache.lastReadSeq) {
     queueReadMarker(candidate, snapshot);
   }
 }
@@ -928,46 +986,47 @@ function queueReadMarker(lastReadSeq, snapshot) {
   if (!currentConversationMatches(snapshot) || document.visibilityState !== "visible") {
     return;
   }
-  state.pendingReadSeq = Math.max(state.pendingReadSeq, lastReadSeq);
+  snapshot.cache.pendingReadSeq = Math.max(snapshot.cache.pendingReadSeq, lastReadSeq);
   flushReadMarker(snapshot);
 }
 
 async function flushReadMarker(snapshot = conversationSnapshot()) {
+  const cache = snapshot.cache;
   if (
-    state.readRequest ||
-    state.pendingReadSeq <= state.lastReadSeq ||
+    !cache || cache.readRequest ||
+    cache.pendingReadSeq <= cache.lastReadSeq ||
     !currentConversationMatches(snapshot) ||
     document.visibilityState !== "visible"
   ) {
     return;
   }
 
-  const target = state.pendingReadSeq;
-  state.pendingReadSeq = 0;
+  const target = cache.pendingReadSeq;
+  cache.pendingReadSeq = 0;
   const request = { ...snapshot, target };
   let completed = false;
-  state.readRequest = request;
+  cache.readRequest = request;
   try {
     const response = await apiRequest(`/threads/${snapshot.threadID}/read`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ last_read_seq: target }),
     });
-    if (!currentConversationMatches(snapshot)) {
+    if (!cacheSnapshotMatches(snapshot)) {
       return;
     }
 
-    const previousReadSeq = state.lastReadSeq;
-    state.lastReadSeq = Math.max(state.lastReadSeq, Number(response.last_read_seq || 0));
-    applyLocalReadMarker(snapshot.threadID, previousReadSeq, state.lastReadSeq);
-    if (state.lastReadSeq > target) {
+    const previousReadSeq = cache.lastReadSeq;
+    cache.lastReadSeq = Math.max(cache.lastReadSeq, Number(response.last_read_seq || 0));
+    applyLocalReadMarker(snapshot.threadID, previousReadSeq, cache.lastReadSeq);
+    if (cache.lastReadSeq > target) {
       // Another tab advanced the marker; local messages may not cover that range.
       void loadThreads();
     }
     completed = true;
-    for (const seq of state.seenReceivedSeqs) {
-      if (seq <= state.lastReadSeq) {
-        state.seenReceivedSeqs.delete(seq);
+    for (const seq of cache.seenReceivedSeqs) {
+      if (seq <= cache.lastReadSeq) {
+        cache.seenReceivedSeqs.delete(seq);
       }
     }
   } catch (error) {
@@ -975,11 +1034,13 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
       showError(error.message);
     }
   } finally {
-    if (state.readRequest === request) {
-      state.readRequest = null;
+    if (cache.readRequest === request) {
+      cache.readRequest = null;
     }
     if (completed && currentConversationMatches(snapshot)) {
       recordVisibleMessages(snapshot);
+    } else if (completed && state.currentCache === cache) {
+      recordVisibleMessages();
     }
   }
 }
@@ -990,21 +1051,7 @@ async function openConversation(peerID) {
   const token = state.token;
   state.peerID = peerID;
   state.threadID = "";
-  state.messages = new Map();
-  state.messageIDs = new Map();
-  state.messagesLoaded = false;
-  state.syncedSeq = 0;
-  state.nextCursor = null;
-  state.lastReadSeq = 0;
-  state.peerLastReadSeq = 0;
-  state.seenReceivedSeqs = new Set();
-  state.initialHistoryRequest = null;
-  state.syncAfterInitial = false;
-  state.catchupRequest = null;
-  state.catchupAgain = false;
-  state.olderRequest = null;
-  state.readRequest = null;
-  state.pendingReadSeq = 0;
+  state.currentCache = null;
   renderPeerList();
 
   const peer = peerByID(peerID);
@@ -1016,11 +1063,28 @@ async function openConversation(peerID) {
   showError("");
 
   try {
-    const thread = await apiRequest("/threads/direct", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ peer_id: peerID }),
-    });
+    let thread = state.threadsByPeer.get(peerID);
+    if (!thread) {
+      let request = state.directRequestsByPeer.get(peerID);
+      if (!request) {
+        request = apiRequest("/threads/direct", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ peer_id: peerID }),
+        });
+        state.directRequestsByPeer.set(peerID, request);
+        void request.finally(() => {
+          if (state.directRequestsByPeer.get(peerID) === request) {
+            state.directRequestsByPeer.delete(peerID);
+          }
+        }).catch(() => {});
+      }
+      thread = await request;
+      if (!currentSessionMatches(sessionVersion, token)) return;
+      thread = reconcileThreadSummary(thread);
+      state.threadsByPeer.set(peerID, thread);
+      renderPeerList();
+    }
     if (
       version !== state.conversationVersion ||
       peerID !== state.peerID ||
@@ -1030,15 +1094,19 @@ async function openConversation(peerID) {
     }
 
     state.threadID = thread.id;
-    const summary = reconcileThreadSummary(thread);
-    state.lastReadSeq = Number(summary.last_read_seq || 0);
-    state.peerLastReadSeq = Number(summary.peer_last_read_seq || 0);
-    state.threadsByPeer.set(peerID, summary);
+    const cache = cacheForThread(thread.id);
+    state.currentCache = cache;
+    applyCurrentThreadSummary(thread);
     renderPeerList();
     contentInput.disabled = false;
     sendButton.disabled = false;
-    await loadInitialHistory();
-    if (version === state.conversationVersion && thread.id === state.threadID) {
+    if (cache.messagesLoaded) {
+      renderMessages("initial");
+    } else {
+      await loadInitialHistory(cache);
+    }
+    if (version === state.conversationVersion && thread.id === state.threadID &&
+        currentSessionMatches(sessionVersion, token)) {
       contentInput.focus();
     }
   } catch (error) {
@@ -1095,8 +1163,13 @@ loginForm.addEventListener("submit", async (event) => {
     state.currentUsername = username.trim().toLowerCase();
     state.users = [];
     state.threadsByPeer = new Map();
+    state.threadCaches = new Map();
+    state.directRequestsByPeer = new Map();
     state.threadEventSeqs = new Map();
     state.threadSummaryBaseSeqs = new Map();
+    state.threadListRequest = null;
+    state.threadListDirty = false;
+    state.threadListCatchup = false;
     sessionStorage.setItem(sessionTokenKey, state.token);
     sessionStorage.setItem(sessionUsernameKey, state.currentUsername);
     loginForm.reset();
@@ -1122,20 +1195,17 @@ messageForm.addEventListener("submit", async (event) => {
   showError("");
   try {
     const message = await sendMessageWithRetry(snapshot, messageID, content);
-    if (!currentConversationMatches(snapshot)) {
+    if (!cacheSnapshotMatches(snapshot)) {
       return;
     }
-    contentInput.value = "";
-    mergeMessages([message]);
     updateThreadFromMessage(message);
-    if (Number(message.seq) > state.syncedSeq + 1) {
-      void catchUpConversation(snapshot);
-    } else {
-      while (state.messages.has(state.syncedSeq + 1)) {
-        state.syncedSeq += 1;
-      }
+    const { cache } = acceptMessage(message);
+    if (currentConversationMatches(snapshot)) {
+      contentInput.value = "";
+      renderMessages("bottom", false);
+    } else if (state.currentCache === cache) {
+      renderMessages("new", false);
     }
-    renderMessages("bottom", false);
     scheduleThreadSummaryRefresh();
   } catch (error) {
     if (currentConversationMatches(snapshot)) {

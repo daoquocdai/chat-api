@@ -63,7 +63,7 @@ function makeApp() {
       return response({ id: threadID, peer: { id: aliceID, username: "alice" }, last_read_seq: 0, peer_last_read_seq: 0 });
     }
     if (url === "/threads") {
-      return response([{ id: threadID, peer: { id: aliceID, username: "alice" }, last_read_seq: 0, peer_last_read_seq: 0, unread_count: 0 }]);
+      return response([{ id: threadID, peer: { id: aliceID, username: "alice" }, last_seq: history.length, last_read_seq: 0, peer_last_read_seq: 0, unread_count: 0 }]);
     }
     if (url.startsWith(`/threads/${threadID}/messages?`)) {
       const query = new URL(url, "http://localhost").searchParams;
@@ -112,7 +112,7 @@ test("every app.js DOM selector exists in index.html", () => {
 test("Alice event reaches Bob immediately; offline Bob reconnects and backfills every page", async () => {
   const app = makeApp();
   await vm.runInContext(`openConversation("${app.aliceID}")`, app.context);
-  assert.equal(app.state.messages.size, 10);
+  assert.equal(app.state.currentCache.messages.size, 10);
   await vm.runInContext("connectWebSocket()", app.context);
   assert.equal(app.sockets.length, 1);
   app.sockets[0].open();
@@ -123,9 +123,9 @@ test("Alice event reaches Bob immediately; offline Bob reconnects and backfills 
     created_at: "2026-09-28T00:00:00Z" };
   app.history.push(aliceMessage); // REST POST has committed before the gateway event.
   app.sockets[0].message({ ...aliceMessage, type: "message.created", message_id: aliceMessage.id, recipient_id: app.bobID });
-  assert.equal(app.state.messages.get(11).content, "Alice vừa gửi");
+  assert.equal(app.state.currentCache.messages.get(11).content, "Alice vừa gửi");
   app.sockets[0].message({ ...aliceMessage, type: "message.created", message_id: aliceMessage.id, recipient_id: app.bobID });
-  assert.equal(app.state.messages.size, 11);
+  assert.equal(app.state.currentCache.messages.size, 11);
 
   app.sockets[0].close();
   for (let seq = 12; seq <= 80; seq++) app.history.push({ ...aliceMessage, id: `message-${seq}`, seq });
@@ -136,9 +136,9 @@ test("Alice event reaches Bob immediately; offline Bob reconnects and backfills 
   assert.equal(app.sockets.length, 2);
   app.sockets[1].open();
   await settle();
-  assert.equal(app.state.messages.size, 80);
-  assert.equal(app.state.messageIDs.size, 80);
-  assert.equal(app.state.syncedSeq, 80);
+  assert.equal(app.state.currentCache.messages.size, 80);
+  assert.equal(app.state.currentCache.messageIDs.size, 80);
+  assert.equal(app.state.currentCache.syncedSeq, 80);
   assert.deepEqual(app.cursors.slice(-3), [null, 51, 21]);
 
   vm.runInContext("clearSession()", app.context);
@@ -161,8 +161,8 @@ test("an online seq gap triggers REST catch-up without a periodic request", asyn
   };
   vm.runInContext("handleSocketMessage", app.context)(JSON.stringify(gapEvent));
   await settle();
-  assert.equal(app.state.syncedSeq, 45);
-  assert.equal(app.state.messages.size, 45);
+  assert.equal(app.state.currentCache.syncedSeq, 45);
+  assert.equal(app.state.currentCache.messages.size, 45);
   assert.deepEqual(app.cursors.slice(-2), [null, 16]);
 });
 

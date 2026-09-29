@@ -5,6 +5,7 @@ const threadSummaryDebounceMs = 750;
 const websocketConnectTimeoutMs = 10000;
 const websocketHeartbeatTimeoutMs = 15000;
 const websocketResumeGraceMs = 5000;
+const pendingSendMismatchMessage = "Tin trước chưa được xác nhận. Hãy lưu nội dung mới ở nơi khác và khôi phục đúng nội dung tin cũ để bấm Gửi lại; chỉ gửi tin mới sau khi tin cũ thành công.";
 
 const authView = document.querySelector("#auth-view");
 const chatView = document.querySelector("#chat-view");
@@ -60,6 +61,12 @@ function showNotice(message) {
 function showError(message) {
   errorElement.textContent = message;
   errorElement.hidden = !message;
+}
+
+function updateSendButton() {
+  const pending = state.currentCache?.pendingSend;
+  sendButton.textContent = pending ? "Gửi lại" : "Gửi";
+  sendButton.disabled = !state.threadID || Boolean(pending?.inFlight);
 }
 
 function decodeSubject(token) {
@@ -134,7 +141,7 @@ function resetConversation() {
   historyElement.innerHTML = '<p class="empty">Chọn một tài khoản để bắt đầu chat.</p>';
   contentInput.value = "";
   contentInput.disabled = true;
-  sendButton.disabled = true;
+  updateSendButton();
   loadOlderButton.hidden = true;
   loadOlderButton.disabled = true;
 }
@@ -197,6 +204,7 @@ function newThreadCache(threadID) {
     seenReceivedSeqs: new Set(), initialHistoryRequest: null,
     syncAfterInitial: false, catchupRequest: null, catchupTargetSeq: 0,
     olderRequest: null, readRequest: null, pendingReadSeq: 0,
+    pendingSend: null, draftContent: "",
   };
 }
 
@@ -859,6 +867,7 @@ async function connectWebSocket() {
         // The first socket may open after the initial REST page was fetched.
         void syncCurrentConversation();
       }
+      void flushReadMarker();
     };
     socket.onmessage = (message) => {
       if (generation === state.socketGeneration && state.socket === socket) {
@@ -1030,6 +1039,10 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
       }
     }
   } catch (error) {
+    if (cacheSnapshotMatches(snapshot)) {
+      // PUT may have committed despite a lost response; retrying a monotonic marker is safe.
+      cache.pendingReadSeq = Math.max(cache.pendingReadSeq, target);
+    }
     if (currentConversationMatches(snapshot)) {
       showError(error.message);
     }
@@ -1046,6 +1059,9 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
 }
 
 async function openConversation(peerID) {
+  if (state.currentCache) {
+    state.currentCache.draftContent = contentInput.value;
+  }
   const version = ++state.conversationVersion;
   const sessionVersion = state.sessionVersion;
   const token = state.token;
@@ -1096,14 +1112,18 @@ async function openConversation(peerID) {
     state.threadID = thread.id;
     const cache = cacheForThread(thread.id);
     state.currentCache = cache;
+    contentInput.value = cache.draftContent;
     applyCurrentThreadSummary(thread);
     renderPeerList();
     contentInput.disabled = false;
-    sendButton.disabled = false;
+    updateSendButton();
     if (cache.messagesLoaded) {
       renderMessages("initial");
     } else {
       await loadInitialHistory(cache);
+    }
+    if (state.currentCache === cache) {
+      void flushReadMarker();
     }
     if (version === state.conversationVersion && thread.id === state.threadID &&
         currentSessionMatches(sessionVersion, token)) {
@@ -1189,32 +1209,69 @@ messageForm.addEventListener("submit", async (event) => {
     return;
   }
   const snapshot = conversationSnapshot();
-  const messageID = crypto.randomUUID();
+  const cache = snapshot.cache;
+  if (cache.pendingSend?.inFlight) {
+    return;
+  }
   const content = contentInput.value;
-  sendButton.disabled = true;
+  let pending = cache.pendingSend;
+  if (pending && content !== pending.content) {
+    showError(pendingSendMismatchMessage);
+    return;
+  }
+  if (!pending) {
+    pending = { messageID: crypto.randomUUID(), content, inFlight: false };
+    cache.pendingSend = pending;
+  }
+  cache.draftContent = content;
+  pending.inFlight = true;
+  updateSendButton();
   showError("");
   try {
-    const message = await sendMessageWithRetry(snapshot, messageID, content);
+    const message = await sendMessageWithRetry(snapshot, pending.messageID, pending.content);
     if (!cacheSnapshotMatches(snapshot)) {
       return;
     }
+    if (cache.pendingSend === pending) {
+      cache.pendingSend = null;
+    }
+    if (cache.draftContent === pending.content) {
+      cache.draftContent = "";
+    }
     updateThreadFromMessage(message);
-    const { cache } = acceptMessage(message);
-    if (currentConversationMatches(snapshot)) {
-      contentInput.value = "";
-      renderMessages("bottom", false);
-    } else if (state.currentCache === cache) {
-      renderMessages("new", false);
+    acceptMessage(message);
+    if (state.currentCache === cache) {
+      if (contentInput.value === pending.content) {
+        contentInput.value = "";
+      } else {
+        cache.draftContent = contentInput.value;
+        showNotice("Tin trước đã gửi; nội dung đã sửa vẫn ở ô nhập. Bấm Gửi để gửi thành tin mới.");
+      }
+      renderMessages(currentConversationMatches(snapshot) ? "bottom" : "new", false);
     }
     scheduleThreadSummaryRefresh();
   } catch (error) {
-    if (currentConversationMatches(snapshot)) {
-      showError(error.message);
+    if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
+      showError(contentInput.value === pending.content
+        ? `${error.message} Tin chưa được xác nhận; bấm Gửi lại với nội dung cũ.`
+        : pendingSendMismatchMessage);
     }
   } finally {
-    if (currentConversationMatches(snapshot)) {
-      sendButton.disabled = false;
+    pending.inFlight = false;
+    if (state.currentCache === cache) {
+      updateSendButton();
     }
+  }
+});
+
+contentInput.addEventListener("input", () => {
+  const cache = state.currentCache;
+  if (!cache) return;
+  cache.draftContent = contentInput.value;
+  if (cache.pendingSend && contentInput.value !== cache.pendingSend.content) {
+    showError(pendingSendMismatchMessage);
+  } else if (errorElement.textContent === pendingSendMismatchMessage) {
+    showError("");
   }
 });
 
@@ -1250,6 +1307,7 @@ document.addEventListener("visibilitychange", () => {
   }
   const snapshot = conversationSnapshot();
   recordVisibleMessages(snapshot);
+  void flushReadMarker(snapshot);
   ensureWebSocket();
 });
 

@@ -147,27 +147,11 @@ Mở `http://localhost:8080`:
 4. Tải lại trang hoặc khởi động lại server; đăng nhập và chọn lại peer để xem lịch sử còn trong PostgreSQL.
 5. Đăng nhập tài khoản thứ ba để xác nhận tài khoản đó không thể truy cập thread Alice–Bob bằng API.
 
-Web lưu JWT trong `sessionStorage` của từng tab, dùng Bearer token cho REST và đổi vé ngắn hạn để mở WebSocket. Mỗi lần người dùng submit tạo một `message_id` mới, kể cả nội dung giống hệt; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload của lần gửi đó. Tin mới đi qua WebSocket; khi mở thread, kết nối lại hoặc thấy gap `seq`, web lấy bù bằng REST và đi ngược `next_cursor` cho đến mốc đã biết. Tin từ REST/event được gộp theo `message_id`, render theo `seq`; nút **Tin cũ hơn** vẫn tải lịch sử cũ theo cursor. Web chỉ gửi read marker khi cuộc chat đang mở, tab đang hiển thị và các tin nhận liên tiếp đã thực sự xuất hiện trong viewport. Đăng xuất/đổi tài khoản đóng socket và hủy lịch reconnect cũ.
+Web lưu JWT trong `sessionStorage` của từng tab, dùng Bearer token cho REST và đổi vé ngắn hạn để mở WebSocket. Mỗi tin mới được chủ động gửi có một `message_id` mới, kể cả nội dung giống hệt; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload. Nếu hai lần thử vẫn lỗi, web giữ tin chưa xác nhận trong cache của thread; nút **Gửi lại** tiếp tục dùng UUID và nội dung cũ cho đến khi thành công. Nếu người dùng sửa nội dung trong lúc đó, web chặn gửi và yêu cầu khôi phục nội dung cũ trước khi thử lại. Cache này chỉ tồn tại trong phiên trang, nên sau khi tải lại cần kiểm tra lịch sử trước khi gửi lại một tin chưa rõ kết quả. Tin mới đi qua WebSocket; khi mở thread, kết nối lại hoặc thấy gap `seq`, web lấy bù bằng REST và đi ngược `next_cursor` cho đến mốc đã biết. Tin từ REST/event được gộp theo `message_id`, render theo `seq`; nút **Tin cũ hơn** vẫn tải lịch sử cũ theo cursor. Web chỉ gửi read marker khi cuộc chat đang mở, tab đang hiển thị và các tin nhận liên tiếp đã thực sự xuất hiện trong viewport; PUT lỗi giữ lại mốc đã thấy để thử lại khi tab hiện hoặc kết nối phục hồi. Đăng xuất/đổi tài khoản đóng socket và hủy lịch reconnect cũ.
 
 Collection [docs/week2-chat.http](docs/week2-chat.http) minh họa đầy đủ hai người chat, request thiếu JWT và cả thao tác đọc/gửi bị từ chối với tài khoản thứ ba. Đổi biến `@run`, rồi chạy request từ trên xuống dưới.
 
-Test tích hợp PostgreSQL tạo một schema ngẫu nhiên có tiền tố `mini_hermes_test_` rồi chỉ xóa schema đó khi kết thúc. Test bị skip nếu chưa đặt `TEST_DATABASE_URL`; chỉ trỏ biến này vào PostgreSQL local/test có thể ghi dữ liệu:
-
-```powershell
-$env:TEST_DATABASE_URL = 'postgres://chat:chat@localhost:5432/chat_api_test?sslmode=disable'
-go test ./internal/integration -v
-```
-
-Test tích hợp Redis dùng một stream tạm riêng và bị skip nếu chưa đặt `TEST_REDIS_ADDR`:
-
-```powershell
-$env:TEST_REDIS_ADDR = 'localhost:6379'
-go test ./internal/module/message/publisher -run Integration -v
-go test ./internal/gateway -run Integration -v
-go test ./internal/wsticket -run Integration -v
-```
-
-Kiểm tra logic browser không cần backend: `node --test web/*.test.cjs` và `node --check web/app.js`.
+Repo chỉ giữ test service cho user, thread, message và vé WebSocket. Chạy `go test ./...`, `go vet ./...`, `go build ./...` và `node --check web/app.js`. Gateway/web không còn test tự động thường trực; cần thử thủ công trên trình duyệt và với PostgreSQL/Redis khi thay đổi luồng tích hợp.
 
 Xem [docs/request-flow.md](docs/request-flow.md) để biết ranh giới handler/service/repository và transaction.
 

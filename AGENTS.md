@@ -12,7 +12,7 @@ Mini-Hermes là dự án học tập xây hệ thống chat bằng Go.
 
 ## Workflow
 - Dùng các lệnh trong Makefile khi phù hợp.
-- Thêm test cho hành vi mới và chạy `make test`, `make build` trước khi báo hoàn thành.
-- Nếu test cần PostgreSQL hoặc Redis nhưng môi trường chưa sẵn sàng, nói rõ test nào chưa chạy; không ghi là đã đạt.
+- Chỉ duy trì test service tại `internal/module/user/service/service_test.go`, `internal/module/thread/service/service_test.go`, `internal/module/message/service/service_test.go` và `internal/wsticket/service_test.go`; không thêm test thường trực ngoài bốn file này.
+- Với web/gateway, kiểm chứng thủ công hoặc bằng script tạm rồi xóa script tạm. Chạy `make test`, `make build` khi phù hợp; nếu không chạy được thì dùng lệnh Go tương đương và nêu rõ giới hạn kiểm chứng.
 - Không reset/TRUNCATE database hoặc merge branch nếu chưa được yêu cầu.
 - Cuối mỗi lượt, tóm tắt thay đổi, kết quả kiểm tra và giới hạn còn lại.

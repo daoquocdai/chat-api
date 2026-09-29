@@ -21,8 +21,10 @@ flowchart LR
     P --> Q[sqlc]
     Q --> DB[(PostgreSQL)]
     S -->|sau commit| X[Redis Streams XADD]
-    X --> G[ws-gateway XREADGROUP]
-    G -->|message.created| W[WebSocket browser]
+    X --> G[ws-gateway XREADGROUP: pending trước entry mới]
+    G --> H[Hub định tuyến recipient_id]
+    H -->|message.created| W[WebSocket browser]
+    G -.->|XACK sau xử lý, không phải đã đọc| X
     C -->|POST /auth/ws-ticket| T[Redis ticket SETNX]
     W -->|GET /ws?ticket=...| U[GETDEL trước upgrade]
     U --> T
@@ -65,6 +67,8 @@ Publisher chạy với timeout cấu hình. Lỗi transaction/quyền/UUID confl
 
 Thread tồn tại nhưng actor không phải participant trả `403`; thread không tồn tại trả `404`.
 
+Gateway dùng một consumer name cố định cho một instance. Nó đọc lại pending bằng `XREADGROUP ... 0` trước khi đọc entry mới bằng `XREADGROUP ... >`, dùng `recipient_id` trong event để xếp tin vào mọi kết nối hiện có của người nhận mà không truy vấn PostgreSQL. Sau khi xử lý entry, gateway `XACK` cả khi người nhận offline. ACK chỉ xác nhận gateway đã xử lý stream entry, không xác nhận WebSocket đã giao tin hoặc người nhận đã đọc; lịch sử vẫn lấy từ PostgreSQL.
+
 ## Đọc lịch sử
 
 `GET /threads/:id/messages` tra actor từ JWT và chỉ query khi actor là participant đang hoạt động. `limit` mặc định 30, nằm trong `1..100`; `before_seq` nếu có phải dương. Repository query `seq DESC`, lấy `limit + 1`, giữ điều kiện `seq >= joined_seq` và không dùng `OFFSET`, timestamp hay message ID toàn cục.
@@ -94,12 +98,12 @@ Router phục vụ `web/index.html`, `web/app.js`, `web/realtime-core.js` và `w
 1. Đăng ký rồi đăng nhập.
 2. Lưu JWT vào `sessionStorage` của tab và lấy user hiện tại từ claim `sub`.
 3. Gọi `GET /users` bằng Bearer token và chỉ hiển thị các tài khoản khác.
-4. Khi chọn peer, gọi `POST /threads/direct`, sau đó tải lịch sử.
+4. Khi chọn peer chưa biết thread ID, gọi `POST /threads/direct`; nếu đã có ID từ summary thì dùng lại. Trang lịch sử đầu chỉ tải một lần cho mỗi thread trong phiên trang.
 5. Gọi `POST /auth/ws-ticket` bằng Bearer JWT để lấy vé Redis TTL ngắn; gateway tiêu thụ vé bằng `GETDEL` trước WebSocket upgrade. Không đưa JWT vào URL. CLI vẫn dùng Bearer trực tiếp.
-6. Tải trang lịch sử mới nhất khi mở thread; nút **Tin cũ hơn** đi theo `next_cursor`. Tin mới nhận bằng WebSocket, gộp theo external `message_id`, render theo `seq`.
-7. Sau reconnect hoặc phát hiện gap `seq`, web gọi REST nhiều trang cho đến mốc `seq` đã biết (hoặc hết lịch sử), không có timer dò tin. Sự kiện cho thread khác kích hoạt tải lại summary/unread; offline vẫn lấy bù từ PostgreSQL.
-8. Chỉ gọi `PUT read` cho chuỗi tin nhận đã xuất hiện trong viewport khi cuộc chat hiện tại và tab đều đang hiển thị. GET nền và thao tác gửi không tự cập nhật marker.
-9. Mọi response bất đồng bộ đều đối chiếu session version, conversation version và thread ID trước khi cập nhật DOM; đăng xuất/đổi tài khoản đóng socket và hủy reconnect cũ.
+6. Thread đã tải được hiển thị từ cache; nút **Tin cũ hơn** đi theo `next_cursor`. Tin mới nhận bằng WebSocket, gộp theo external `message_id`, render theo `seq`.
+7. Sau reconnect, web đối chiếu summary rồi lấy bù mọi thread đã cache có `last_seq` mới hơn mốc đồng bộ. Gap `seq` từ event hoặc response gửi tin cũng kích hoạt lấy bù đúng thread; không có timer dò tin.
+8. Chỉ gọi `PUT read` cho chuỗi tin nhận đã xuất hiện trong viewport khi cuộc chat hiện tại và tab đều đang hiển thị. PUT lỗi giữ lại mốc đã thấy để retry khi tab hiện hoặc kết nối phục hồi; GET nền và thao tác gửi không tự cập nhật marker.
+9. Response bất đồng bộ chỉ ghi vào cache đúng thread/phiên; DOM chỉ cập nhật cho thread đang mở. Đăng xuất/đổi tài khoản xóa cache, đóng socket và hủy reconnect cũ.
 10. Khi API trả `401`, xóa session local và đưa người dùng về màn hình đăng nhập.
 
 Không còn route `/messages` sender/receiver hoặc `POST /users`; client không có đường API để tự khai danh tính người gửi.

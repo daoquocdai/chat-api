@@ -379,3 +379,160 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 		t.Fatalf("publisher calls = %d, want 2", publisher.calls)
 	}
 }
+
+type fakeMembershipRepository struct {
+	load  func(context.Context, string, int64) ([]string, error)
+	calls int
+}
+
+func (r *fakeMembershipRepository) ListMemberIDsAtSequence(ctx context.Context, thread string, seq int64) ([]string, error) {
+	r.calls++
+	return r.load(ctx, thread, seq)
+}
+
+type fakeMembershipCache struct {
+	snapshots          map[int64][]string
+	readErr, writeErr  error
+	getCalls, putCalls int
+}
+
+func (c *fakeMembershipCache) Get(ctx context.Context, _ string, version int64) ([]string, error) {
+	c.getCalls++
+	if _, ok := ctx.Deadline(); !ok {
+		panic("cache read has no deadline")
+	}
+	return c.snapshots[version], c.readErr
+}
+
+func (c *fakeMembershipCache) Put(ctx context.Context, _ string, version int64, ids []string) error {
+	c.putCalls++
+	if _, ok := ctx.Deadline(); !ok {
+		panic("cache write has no deadline")
+	}
+	if c.writeErr == nil {
+		c.snapshots[version] = append([]string(nil), ids...)
+	}
+	return c.writeErr
+}
+
+func TestCachedPublisherFallback(t *testing.T) {
+	peer := "22222222-2222-4222-8222-222222222222"
+	dbErr := errors.New("snapshot query failed")
+	cacheErr := errors.New("cache unavailable")
+	cases := []struct {
+		name                         string
+		cached, loaded               []string
+		readErr, writeErr, dbErr     error
+		kind                         string
+		version                      int64
+		wantDB, wantPut, wantPublish int
+		wantRecipients               []string
+		wantError                    bool
+	}{
+		{name: "miss loads and fills", loaded: []string{actorExternalID, peer}, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{peer}},
+		{name: "hit avoids database", cached: []string{actorExternalID, peer}, kind: "text", version: 1, wantPublish: 1, wantRecipients: []string{peer}},
+		{name: "read error ignores cached data", cached: []string{actorExternalID}, loaded: []string{actorExternalID, peer}, readErr: cacheErr, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{peer}},
+		{name: "write error still publishes database snapshot", loaded: []string{actorExternalID, peer}, writeErr: cacheErr, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{peer}},
+		{name: "database error does not publish", dbErr: dbErr, kind: "text", version: 1, wantDB: 1, wantError: true},
+		{name: "empty database snapshot does not publish", loaded: []string{}, kind: "text", version: 1, wantDB: 1, wantError: true},
+		{name: "invalid version does not publish", kind: "text", version: 0, wantError: true},
+		{name: "future version does not publish", kind: "text", version: 4, wantError: true},
+		{name: "system includes actor", cached: []string{actorExternalID, peer}, kind: "system", version: 1, wantPublish: 1, wantRecipients: []string{actorExternalID, peer}},
+		{name: "solo group uses empty recipient array", cached: []string{actorExternalID}, kind: "text", version: 1, wantPublish: 1, wantRecipients: []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := &fakeMembershipCache{snapshots: map[int64][]string{1: tc.cached}, readErr: tc.readErr, writeErr: tc.writeErr}
+			repo := &fakeMembershipRepository{load: func(_ context.Context, thread string, seq int64) ([]string, error) {
+				if thread != threadExternalID || seq != 3 {
+					t.Fatal("fallback must use original message seq")
+				}
+				return tc.loaded, tc.dbErr
+			}}
+			out := &fakePublisher{}
+			publisher := service.NewCachedPublisher(repo, cache, out)
+			err := publisher.Publish(context.Background(), messageevent.MessageCreated{ThreadID: threadExternalID, ThreadKind: "group", MembershipVersion: tc.version, SenderID: actorExternalID, Seq: 3, Kind: tc.kind})
+			if (err != nil) != tc.wantError || repo.calls != tc.wantDB || cache.putCalls != tc.wantPut || out.calls != tc.wantPublish {
+				t.Fatalf("err=%v database/cache/publish=%d/%d/%d", err, repo.calls, cache.putCalls, out.calls)
+			}
+			if tc.wantPublish == 1 && !reflect.DeepEqual(out.events[0].RecipientIDs, tc.wantRecipients) {
+				t.Fatalf("recipients=%v want=%v", out.events[0].RecipientIDs, tc.wantRecipients)
+			}
+			if tc.readErr == nil && tc.cached != nil && !reflect.DeepEqual(cache.snapshots[1], tc.cached) {
+				t.Fatal("sender filtering mutated shared cache snapshot")
+			}
+		})
+	}
+}
+
+func TestCachedPublisherMembershipChangeAndOldRetry(t *testing.T) {
+	bob := "22222222-2222-4222-8222-222222222222"
+	charlie := "33333333-3333-4333-8333-333333333333"
+	cache := &fakeMembershipCache{snapshots: map[int64][]string{}}
+	repo := &fakeMembershipRepository{load: func(_ context.Context, _ string, seq int64) ([]string, error) {
+		if seq <= 5 {
+			return []string{actorExternalID, bob}, nil
+		}
+		return []string{actorExternalID, charlie}, nil
+	}}
+	out := &fakePublisher{}
+	pub := service.NewCachedPublisher(repo, cache, out)
+	steps := []struct {
+		seq, version int64
+		sender, kind string
+		want         []string
+	}{
+		{2, 1, actorExternalID, "text", []string{bob}},
+		{3, 1, bob, "text", []string{actorExternalID}},
+		{5, 1, actorExternalID, "system", []string{actorExternalID, bob}}, // Removal boundary is inclusive.
+		{7, 6, actorExternalID, "text", []string{charlie}},
+		{2, 1, actorExternalID, "text", []string{bob}}, // Retry after membership changed.
+	}
+	for _, step := range steps {
+		if err := pub.Publish(context.Background(), messageevent.MessageCreated{ThreadID: threadExternalID, ThreadKind: "group", Seq: step.seq, MembershipVersion: step.version, SenderID: step.sender, Kind: step.kind}); err != nil {
+			t.Fatal(err)
+		}
+		if got := out.events[len(out.events)-1].RecipientIDs; !reflect.DeepEqual(got, step.want) {
+			t.Fatalf("seq=%d recipients=%v want=%v", step.seq, got, step.want)
+		}
+	}
+	if repo.calls != 2 {
+		t.Fatalf("database calls=%d want one per membership version", repo.calls)
+	}
+	delete(cache.snapshots, 1) // Eviction/TTL must also use the old seq on a retry.
+	if err := pub.Publish(context.Background(), messageevent.MessageCreated{ThreadID: threadExternalID, ThreadKind: "group", Seq: 2, MembershipVersion: 1, SenderID: actorExternalID, Kind: "text"}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(out.events[len(out.events)-1].RecipientIDs, []string{bob}) || repo.calls != 3 {
+		t.Fatal("evicted old snapshot used current membership")
+	}
+}
+
+func TestCachedPublisherDirectBypassesMembershipCache(t *testing.T) {
+	out := &fakePublisher{}
+	pub := service.NewCachedPublisher(nil, nil, out)
+	event := messageevent.MessageCreated{ThreadKind: "direct", RecipientIDs: []string{"peer"}}
+	if err := pub.Publish(context.Background(), event); err != nil || !reflect.DeepEqual(out.events[0], event) {
+		t.Fatalf("direct event changed: %v", err)
+	}
+}
+
+func TestPublishMessageAfterRequestCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	pub := &fakePublisher{publish: func(ctx context.Context, _ messageevent.MessageCreated) error {
+		if ctx.Err() != nil {
+			t.Fatal("committed message publish inherited request cancellation")
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("publish must be bounded")
+		}
+		return errors.New("XADD timed out")
+	}}
+	message := model.Message{ExternalID: messageExternalID, ThreadExternalID: threadExternalID, Seq: 4}
+	err := service.PublishMessage(ctx, pub, time.Second, message)
+	var saved *model.EventPublishError
+	if !errors.As(err, &saved) || saved.MessageID != messageExternalID || saved.Seq != 4 {
+		t.Fatalf("lost saved message identity: %v", err)
+	}
+}

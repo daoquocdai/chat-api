@@ -5,8 +5,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
+	messageservice "github.com/daoquocdai/chat-api/internal/module/message/service"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 )
 
@@ -50,7 +50,7 @@ func (s *Service) CreateGroup(ctx context.Context, actorExternalID, name string,
 	if err != nil {
 		return model.Thread{}, err
 	}
-	if err := s.publishSystem(ctx, message); err != nil {
+	if err := messageservice.PublishMessage(ctx, s.publisher, s.publishTimeout, message); err != nil {
 		return thread, err
 	}
 	return thread, nil
@@ -99,7 +99,7 @@ func (s *Service) changeMember(ctx context.Context, actorExternalID, threadExter
 	if err != nil {
 		return messagemodel.Message{}, err
 	}
-	if err := s.publishSystem(ctx, message); err != nil {
+	if err := messageservice.PublishMessage(ctx, s.publisher, s.publishTimeout, message); err != nil {
 		return message, err
 	}
 	return message, nil
@@ -122,13 +122,4 @@ func (s *Service) Members(ctx context.Context, actorExternalID, threadExternalID
 		members = []model.Member{}
 	}
 	return members, nil
-}
-
-func (s *Service) publishSystem(ctx context.Context, message messagemodel.Message) error {
-	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.publishTimeout)
-	defer cancel()
-	if err := s.publisher.Publish(publishCtx, messageevent.FromMessage(message)); err != nil {
-		return &messagemodel.EventPublishError{MessageID: message.ExternalID, ThreadID: message.ThreadExternalID, SenderID: message.SenderExternalID, Seq: message.Seq, Cause: err}
-	}
-	return nil
 }

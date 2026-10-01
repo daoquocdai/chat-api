@@ -22,15 +22,15 @@ JOIN participants AS p
 WHERE t.external_id = sqlc.arg(thread_external_id)
 FOR UPDATE OF t;
 
--- name: ListMessageRecipients :many
-SELECT DISTINCT recipient.external_id
+-- name: ListMemberIDsAtSequence :many
+SELECT DISTINCT member.external_id
 FROM participants AS participant
-JOIN users AS recipient ON recipient.id = participant.user_id
-WHERE participant.thread_id = sqlc.arg(thread_id)
-  AND participant.joined_seq <= sqlc.arg(seq)
-  AND (participant.left_seq IS NULL OR participant.left_seq >= sqlc.arg(seq))
-  AND (sqlc.arg(include_sender)::BOOLEAN OR participant.user_id <> sqlc.arg(sender_id))
-ORDER BY recipient.external_id;
+JOIN threads AS thread ON thread.id = participant.thread_id
+JOIN users AS member ON member.id = participant.user_id
+WHERE thread.external_id = sqlc.arg(thread_external_id)
+  AND participant.joined_seq <= sqlc.arg(seq)::BIGINT
+  AND (participant.left_seq IS NULL OR participant.left_seq >= sqlc.arg(seq)::BIGINT)
+ORDER BY member.external_id;
 
 -- name: GetMessageByExternalID :one
 SELECT

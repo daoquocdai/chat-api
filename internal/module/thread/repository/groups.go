@@ -196,13 +196,10 @@ func systemMessageAt(ctx context.Context, q *sqlc.Queries, threadID, seq int64) 
 
 func systemMessageFromRow(ctx context.Context, q *sqlc.Queries, threadID int64, row sqlc.GetThreadMessageAtSequenceRow) (messagemodel.Message, error) {
 	message := messagemodel.Message{ID: row.ID, ExternalID: row.ExternalID.String(), ThreadExternalID: row.ThreadExternalID.String(), ThreadKind: row.ThreadKind, SenderExternalID: row.SenderExternalID.String(), Seq: row.Seq, Kind: row.Kind, ContentFormat: row.ContentFormat, Content: row.Content, CreatedAt: row.CreatedAt.Time}
-	ids, err := q.ListMessageRecipients(ctx, sqlc.ListMessageRecipientsParams{ThreadID: threadID, Seq: row.Seq, SenderID: 0, IncludeSender: true})
+	version, err := q.GetMembershipVersion(ctx, sqlc.GetMembershipVersionParams{ThreadID: threadID, Seq: row.Seq})
 	if err != nil {
 		return messagemodel.Message{}, err
 	}
-	message.RecipientIDs = make([]string, len(ids))
-	for i, id := range ids {
-		message.RecipientIDs[i] = id.String()
-	}
+	message.MembershipVersion = version
 	return message, nil
 }

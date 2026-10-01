@@ -3,13 +3,13 @@ package service_test
 import (
 	"context"
 	"errors"
-	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
-	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
+	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
 	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
 	"github.com/daoquocdai/chat-api/internal/module/thread/service"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
@@ -253,7 +253,7 @@ func TestCreateGroup(t *testing.T) {
 				return usermodel.User{}, usermodel.ErrUserNotFound
 			}}
 			saved := threadmodel.Thread{ID: 7, ExternalID: threadExternalID, Kind: "group", Name: strings.TrimSpace(tc.groupName), Role: "admin"}
-			system := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, SenderExternalID: actorExternalID, Kind: "system", Seq: 1, RecipientIDs: []string{actorExternalID, peerExternalID}}
+			system := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, ThreadKind: "group", MembershipVersion: 1, SenderExternalID: actorExternalID, Kind: "system", Seq: 1, RecipientIDs: []string{actorExternalID, peerExternalID}}
 			order := []string{}
 			repo := &fakeThreadRepository{createGroup: func(_ context.Context, actor int64, name string, ids []int64, content string) (threadmodel.Thread, messagemodel.Message, error) {
 				order = append(order, "repository")
@@ -271,7 +271,7 @@ func TestCreateGroup(t *testing.T) {
 				if _, ok := ctx.Deadline(); !ok {
 					t.Fatal("publish timeout missing")
 				}
-				if !reflect.DeepEqual(event.RecipientIDs, system.RecipientIDs) || event.MessageID != system.ExternalID {
+				if !reflect.DeepEqual(event.RecipientIDs, system.RecipientIDs) || event.MessageID != system.ExternalID || event.ThreadKind != "group" || event.MembershipVersion != 1 {
 					t.Fatalf("event = %+v", event)
 				}
 			}
@@ -315,7 +315,7 @@ func TestGroupMembership(t *testing.T) {
 				}
 				return usermodel.User{ID: 22, Username: "Bob"}, nil
 			}}
-			saved := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, Kind: "system", Seq: 9}
+			saved := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, ThreadKind: "group", MembershipVersion: 6, Kind: "system", Seq: 9}
 			repo := &fakeThreadRepository{changeMember: func(_ context.Context, thread string, actor, target int64, action threadmodel.MembershipAction, content string) (messagemodel.Message, error) {
 				wantTarget := int64(22)
 				if action == threadmodel.LeaveGroup {
@@ -350,6 +350,9 @@ func TestGroupMembership(t *testing.T) {
 			}
 			if len(pub.events) != wantPublish {
 				t.Fatal("published before successful repository return")
+			}
+			if wantPublish == 1 && (pub.events[0].ThreadKind != "group" || pub.events[0].MembershipVersion != 6) {
+				t.Fatal("membership operation lost the publishing snapshot version")
 			}
 		})
 	}

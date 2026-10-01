@@ -86,16 +86,8 @@ func (s *Service) Send(
 		return model.Message{}, false, err
 	}
 
-	publishContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.publishTimeout)
-	defer cancel()
-	if err := s.publisher.Publish(publishContext, messageevent.FromMessage(message)); err != nil {
-		return message, created, &model.EventPublishError{
-			MessageID: message.ExternalID,
-			ThreadID:  message.ThreadExternalID,
-			SenderID:  message.SenderExternalID,
-			Seq:       message.Seq,
-			Cause:     err,
-		}
+	if err := PublishMessage(ctx, s.publisher, s.publishTimeout, message); err != nil {
+		return message, created, err
 	}
 
 	return message, created, nil

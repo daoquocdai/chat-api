@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
+	messageservice "github.com/daoquocdai/chat-api/internal/module/message/service"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 )
@@ -20,10 +20,6 @@ type Repository interface {
 	ListMembers(ctx context.Context, threadExternalID string, actorID int64) ([]model.Member, error)
 }
 
-type Publisher interface {
-	Publish(context.Context, messageevent.MessageCreated) error
-}
-
 type UserFinder interface {
 	GetByExternalID(ctx context.Context, externalID string) (usermodel.User, error)
 }
@@ -31,11 +27,11 @@ type UserFinder interface {
 type Service struct {
 	repository     Repository
 	users          UserFinder
-	publisher      Publisher
+	publisher      messageservice.Publisher
 	publishTimeout time.Duration
 }
 
-func New(repository Repository, users UserFinder, publisher Publisher, publishTimeout time.Duration) *Service {
+func New(repository Repository, users UserFinder, publisher messageservice.Publisher, publishTimeout time.Duration) *Service {
 	return &Service{repository: repository, users: users, publisher: publisher, publishTimeout: publishTimeout}
 }
 

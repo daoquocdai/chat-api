@@ -13,6 +13,7 @@ import (
 	messagerepository "github.com/daoquocdai/chat-api/internal/module/message/repository"
 	messageservice "github.com/daoquocdai/chat-api/internal/module/message/service"
 	threadhandler "github.com/daoquocdai/chat-api/internal/module/thread/handler"
+	"github.com/daoquocdai/chat-api/internal/module/thread/membership"
 	threadrepository "github.com/daoquocdai/chat-api/internal/module/thread/repository"
 	threadservice "github.com/daoquocdai/chat-api/internal/module/thread/service"
 	userhandler "github.com/daoquocdai/chat-api/internal/module/user/handler"
@@ -50,12 +51,13 @@ func run() error {
 	}
 
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:         cfg.Redis.Address,
-		Password:     cfg.Redis.Password,
-		DB:           cfg.Redis.Database,
-		DialTimeout:  cfg.Redis.PublishTimeout,
-		ReadTimeout:  cfg.Redis.PublishTimeout,
-		WriteTimeout: cfg.Redis.PublishTimeout,
+		Addr:                  cfg.Redis.Address,
+		Password:              cfg.Redis.Password,
+		DB:                    cfg.Redis.Database,
+		DialTimeout:           cfg.Redis.PublishTimeout,
+		ReadTimeout:           cfg.Redis.PublishTimeout,
+		WriteTimeout:          cfg.Redis.PublishTimeout,
+		ContextTimeoutEnabled: true,
 	})
 	defer redisClient.Close()
 
@@ -77,11 +79,15 @@ func run() error {
 	userHandler := userhandler.New(userService)
 
 	threadRepository := threadrepository.New(pool)
-	messagePublisher := messagepublisher.NewRedis(redisClient, cfg.Redis.Stream)
+	messageRepository := messagerepository.New(pool)
+	messagePublisher := messageservice.NewCachedPublisher(
+		messageRepository,
+		membership.NewRedis(redisClient, cfg.Redis.Stream),
+		messagepublisher.NewRedis(redisClient, cfg.Redis.Stream),
+	)
 	threadService := threadservice.New(threadRepository, userService, messagePublisher, cfg.Redis.PublishTimeout)
 	threadHandler := threadhandler.New(threadService)
 
-	messageRepository := messagerepository.New(pool)
 	messageService := messageservice.New(
 		messageRepository,
 		userService,

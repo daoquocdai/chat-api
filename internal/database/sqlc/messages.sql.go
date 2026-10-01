@@ -186,31 +186,24 @@ func (q *Queries) IncrementThreadSequence(ctx context.Context, id int64) (int64,
 	return last_seq, err
 }
 
-const listMessageRecipients = `-- name: ListMessageRecipients :many
-SELECT DISTINCT recipient.external_id
+const listMemberIDsAtSequence = `-- name: ListMemberIDsAtSequence :many
+SELECT DISTINCT member.external_id
 FROM participants AS participant
-JOIN users AS recipient ON recipient.id = participant.user_id
-WHERE participant.thread_id = $1
-  AND participant.joined_seq <= $2
-  AND (participant.left_seq IS NULL OR participant.left_seq >= $2)
-  AND ($3::BOOLEAN OR participant.user_id <> $4)
-ORDER BY recipient.external_id
+JOIN threads AS thread ON thread.id = participant.thread_id
+JOIN users AS member ON member.id = participant.user_id
+WHERE thread.external_id = $1
+  AND participant.joined_seq <= $2::BIGINT
+  AND (participant.left_seq IS NULL OR participant.left_seq >= $2::BIGINT)
+ORDER BY member.external_id
 `
 
-type ListMessageRecipientsParams struct {
-	ThreadID      int64
-	Seq           int64
-	IncludeSender bool
-	SenderID      int64
+type ListMemberIDsAtSequenceParams struct {
+	ThreadExternalID pgtype.UUID
+	Seq              int64
 }
 
-func (q *Queries) ListMessageRecipients(ctx context.Context, arg ListMessageRecipientsParams) ([]pgtype.UUID, error) {
-	rows, err := q.db.Query(ctx, listMessageRecipients,
-		arg.ThreadID,
-		arg.Seq,
-		arg.IncludeSender,
-		arg.SenderID,
-	)
+func (q *Queries) ListMemberIDsAtSequence(ctx context.Context, arg ListMemberIDsAtSequenceParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listMemberIDsAtSequence, arg.ThreadExternalID, arg.Seq)
 	if err != nil {
 		return nil, err
 	}

@@ -72,7 +72,7 @@ func (r *PostgresRepository) Send(
 				existing.SenderExternalID, existing.Seq, existing.ThreadKind, existing.Kind,
 				existing.ContentFormat, existing.Content, existing.CreatedAt,
 			)
-			return setRecipients(ctx, queries, threadInternalID, senderID, &result)
+			return setAudience(ctx, queries, threadInternalID, &result)
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -99,7 +99,7 @@ func (r *PostgresRepository) Send(
 			message.SenderExternalID, message.Seq, message.ThreadKind, message.Kind,
 			message.ContentFormat, message.Content, message.CreatedAt,
 		)
-		return setRecipients(ctx, queries, threadInternalID, senderID, &result)
+		return setAudience(ctx, queries, threadInternalID, &result)
 	})
 	if err != nil {
 		if isExternalIDUniqueViolation(err) {
@@ -216,16 +216,45 @@ func isExternalIDUniqueViolation(err error) bool {
 		postgresError.ConstraintName == "messages_external_id_key"
 }
 
-func setRecipients(ctx context.Context, queries *sqlc.Queries, threadID, senderID int64, message *model.Message) error {
-	recipients, err := queries.ListMessageRecipients(ctx, sqlc.ListMessageRecipientsParams{
-		ThreadID: threadID, Seq: message.Seq, SenderID: senderID, IncludeSender: message.Kind == "system",
+func setAudience(ctx context.Context, queries *sqlc.Queries, threadID int64, message *model.Message) error {
+	if message.ThreadKind == "group" {
+		version, err := queries.GetMembershipVersion(ctx, sqlc.GetMembershipVersionParams{ThreadID: threadID, Seq: message.Seq})
+		message.MembershipVersion = version
+		return err
+	}
+	id, err := parseUUID(message.ThreadExternalID, model.ErrInvalidThreadID)
+	if err != nil {
+		return err
+	}
+	members, err := queries.ListMemberIDsAtSequence(ctx, sqlc.ListMemberIDsAtSequenceParams{
+		ThreadExternalID: id, Seq: message.Seq,
 	})
 	if err != nil {
 		return err
 	}
-	message.RecipientIDs = make([]string, len(recipients))
-	for i, id := range recipients {
-		message.RecipientIDs[i] = id.String()
+	message.RecipientIDs = make([]string, 0, len(members))
+	for _, id := range members {
+		if externalID := id.String(); externalID != message.SenderExternalID {
+			message.RecipientIDs = append(message.RecipientIDs, externalID)
+		}
 	}
 	return nil
+}
+
+// ListMemberIDsAtSequence is only used by the publishing service after commit.
+// Historical intervals make this safe even if membership changes before this query.
+func (r *PostgresRepository) ListMemberIDsAtSequence(ctx context.Context, threadExternalID string, seq int64) ([]string, error) {
+	id, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := sqlc.New(r.pool).ListMemberIDsAtSequence(ctx, sqlc.ListMemberIDsAtSequenceParams{ThreadExternalID: id, Seq: seq})
+	if err != nil {
+		return nil, err
+	}
+	members := make([]string, len(ids))
+	for i, id := range ids {
+		members[i] = id.String()
+	}
+	return members, nil
 }

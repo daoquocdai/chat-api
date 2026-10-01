@@ -39,7 +39,7 @@ Gửi tin nhận `message_id` UUID và `content`. `message_id` chính là `messa
 
 `PUT /threads/:id/read` chỉ nhận `last_read_seq`; danh tính luôn đến từ JWT. Marker chỉ tăng, phải nằm trong phạm vi participant được xem và không vượt `threads.last_seq`.
 
-## Group chat: bước 1 tuần 4
+## Group chat backend tuần 4
 
 `POST /threads/group` nhận `{ "name": "Nhóm học", "member_ids": ["<Bob UUID>", "<Charlie UUID>"] }`. Creator tự được thêm với role `admin`; không đưa creator vào `member_ids`. Tên được trim, dài 1–100 ký tự Unicode; nhóm tối đa 100 thành viên kể cả creator. Danh sách UUID không được trùng. Tạo nhóm ghi thread, participants và system message `seq=1` trong một transaction. Cùng tên có thể tạo nhiều nhóm.
 
@@ -49,7 +49,26 @@ Thay đổi membership và gửi tin cùng khóa dòng thread, nên không thể
 
 Unread dùng `last_read_seq` của khoảng membership hiện tại, đếm tin người khác gửi và bỏ qua system message. Thêm/xóa/rời đã ở trạng thái đích không tạo thêm `seq`: API trả và thử publish lại system message của lần chuyển trạng thái hiện tại. Đây không phải idempotency cho tạo nhóm. Nếu tạo nhóm trả `503` do XADD, nhóm **đã lưu**; dùng `thread_id` trong lỗi hoặc `GET /threads` để tìm nhóm, không gửi lại POST tạo nhóm một cách mù quáng.
 
-Bước này dùng các bảng hiện có, không cần migration mới. Web demo vẫn chỉ hiển thị direct chat; group UI và cache membership riêng trong Redis là bước tiếp theo. API nhóm chạy thử bằng [docs/week4-groups.http](docs/week4-groups.http). Chưa có E2EE. Web nhận tin mới qua `ws-gateway`, không dò REST theo chu kỳ.
+Bước này dùng các bảng hiện có, không cần migration mới. Backend có cache membership Redis được dùng khi publish; web demo vẫn chỉ hiển thị direct chat. API nhóm chạy thử bằng [docs/week4-groups.http](docs/week4-groups.http). Chưa có E2EE. Web nhận tin mới qua `ws-gateway`, không dò REST theo chu kỳ.
+
+### Cache membership Redis
+
+Cache nằm ở **API**, tại `internal/module/thread/membership/redis.go`. Nó lưu snapshot gồm `thread_id`, `version`, `member_ids` (external UUID của mọi thành viên được xem, gồm sender), dưới key `<redis.stream>:membership:<thread UUID>:<version>`, TTL 15 phút. `CachedPublisher` trong message service dùng cùng cache cho text và system message. Cache hit bỏ được query JOIN participants/users và việc lấy toàn bộ UUID từ PostgreSQL; kiểm tra quyền, khóa thread và query lấy version vẫn chạy trong PostgreSQL. API danh sách thành viên và đọc lịch sử không dùng cache này.
+
+Version là mốc thay đổi danh sách người được xem, lấy từ các khoảng membership trong transaction: thêm có hiệu lực ở `joined_seq`, xóa/rời có hiệu lực ở `left_seq + 1`. Chọn mốc lớn nhất không vượt `message.seq`; không thêm cột version hoặc migration. Version gắn với snapshot lịch sử, không phải một key danh sách active bị ghi đè.
+
+Ví dụ nhóm ban đầu có Alice/Bob ở seq 1, Bob bị xóa ở seq 5 và được thêm lại ở seq 9:
+
+| Message | Version | Snapshot được dùng |
+| --- | --- | --- |
+| Text seq 2 hoặc retry seq 2 | 1 | Alice, Bob |
+| System xóa Bob seq 5 | 1 | Alice, Bob; Bob được xem thông báo xóa |
+| Text seq 6–8 | 6 | Alice |
+| System thêm lại seq 9 và text sau đó | 9 | Alice, Bob |
+
+Thêm/xóa/rời khiến các message sau chuyển sang version mới, nên không thể đọc nhầm key cũ. Snapshot cũ được giữ đến hết TTL để phục vụ retry, không cần DEL hoặc "current membership" pointer. Nếu cache miss, lỗi, sai kiểu hoặc JSON không hợp lệ, service đọc PostgreSQL theo **seq của message**, rồi thử ghi lại snapshot. Mỗi thao tác cache có timeout 100 ms trong tổng publish timeout; lỗi ghi cache không chặn publish bằng danh sách vừa lấy từ DB. Nếu query fallback hoặc XADD thất bại sau commit, API trả 503 với định danh message đã lưu; không phát event với danh sách người nhận chưa xác định.
+
+Service loại sender khỏi snapshot đối với text; system giữ tất cả. Event trong stream vẫn chứa `recipient_ids` đầy đủ. Gateway không đọc cache, không query PostgreSQL và không thay người nhận theo membership hiện tại. Vì vậy entry cũ/pending vẫn dùng snapshot đã đóng gói; eviction cache không ảnh hưởng chúng.
 
 ## Redis Stream `message.created`
 
@@ -68,9 +87,9 @@ Sau khi transaction PostgreSQL của `POST /threads/:id/messages` commit thành 
 | `content` | Nội dung đã lưu |
 | `created_at` | UTC RFC3339 với độ chính xác nano giây |
 
-Publisher không nhận recipient từ request. Repository lấy danh sách từ các khoảng `participants` bao phủ `seq` trong transaction. Text bỏ sender khỏi danh sách; system message gửi tới mọi người trong khoảng đó, gồm actor/người vừa rời. Retry message cũ dùng membership tại `seq` cũ, không dùng danh sách thành viên hiện tại. Gateway đọc `recipient_ids` và fan-out; khi gặp entry cũ đã nằm trong stream, nó chuyển field `recipient_id` cũ sang danh sách một phần tử. Publisher mới chỉ ghi contract mới.
+Publisher không nhận recipient từ request. Với direct, repository lấy danh sách trong transaction; với group, repository trả version tại `seq` rồi service lấy snapshot từ cache/DB sau commit. Cả hai dùng cùng query khoảng `participants` bao phủ `seq`. Text bỏ sender khỏi danh sách; system message gửi tới mọi người trong khoảng đó, gồm actor/người vừa rời. Retry message cũ dùng membership tại `seq` cũ, không dùng danh sách thành viên hiện tại. `MembershipVersion` chỉ là metadata nội bộ trước publish, không phải field bắt buộc của stream. Gateway đọc `recipient_ids` và fan-out; entry cũ có `recipient_id` được đọc như danh sách một phần tử, thiếu `thread_kind` được hiểu là direct. Không phải xóa stream khi nâng cấp.
 
-Nếu commit thất bại, request không có quyền hoặc UUID conflict thì không publish. Nếu commit đã thành công nhưng `XADD` lỗi/timeout, API trả `503 Service Unavailable` với hướng dẫn retry đúng `message_id` và payload cũ. Retry hợp lệ đọc lại cùng message/`seq` rồi thử `XADD` lần nữa. Vì kết quả XADD có thể đã tới Redis trước khi client nhận lỗi, stream có thể có nhiều entry cho cùng `message_id`. Gateway chuyển tiếp từng entry, kể cả entry trùng; client phải khử trùng theo `message_id` và dùng `seq` từ PostgreSQL để sắp thứ tự trong thread. Thiết kế này không bảo đảm exactly-once và không bảo đảm realtime nếu client không retry.
+Nếu commit thất bại, request không có quyền hoặc UUID conflict thì không publish. Nếu commit đã thành công nhưng query snapshot fallback hoặc `XADD` lỗi/timeout, API trả `503 Service Unavailable` với hướng dẫn retry đúng `message_id` và payload cũ. Retry hợp lệ đọc lại cùng message/`seq` rồi thử publish lần nữa; gửi/retry vẫn yêu cầu sender đang là thành viên active. Vì kết quả XADD có thể đã tới Redis trước khi client nhận lỗi, stream có thể có nhiều entry cho cùng `message_id`. Gateway chuyển tiếp từng entry, kể cả entry trùng; client phải khử trùng theo `message_id` và dùng `seq` từ PostgreSQL để sắp thứ tự trong thread. Thiết kế này không bảo đảm exactly-once và không bảo đảm realtime nếu client không retry; chưa có outbox.
 
 ## WebSocket gateway và vé một lần
 
@@ -171,9 +190,13 @@ Collection [docs/week2-chat.http](docs/week2-chat.http) minh họa đầy đủ 
 
 Repo chỉ giữ test service cho user, thread, message và vé WebSocket. Chạy `go test ./...`, `go vet ./...`, `go build ./...` và `node --check web/app.js`. Gateway/web không còn test tự động thường trực; cần thử thủ công trên trình duyệt và với PostgreSQL/Redis khi thay đổi luồng tích hợp.
 
+Với nhóm, cần kiểm tra thêm cache hit/miss và TTL, thêm/xóa/rời/thêm lại, gửi đồng thời với xóa thành viên, retry message cũ khi cache đã mất, pending cũ sau thay đổi membership, nhiều kết nối cùng user, lịch sử và unread trong từng khoảng. Dùng stream/cache riêng và tài khoản tạm cho kịch bản tích hợp; chỉ xóa dữ liệu/cổng/tiến trình của kịch bản, giữ nguyên dịch vụ có sẵn. Kiểm thử HTTP/WebSocket tự động bằng kịch bản tạm không thay thế demo giao diện nhóm trên trình duyệt.
+
 Xem [docs/request-flow.md](docs/request-flow.md) để biết ranh giới handler/service/repository và transaction.
 
 ## Chưa có trong scope
 
-- Giao diện nhóm trên web và cache membership trong Redis.
+- Giao diện nhóm trên web và demo nhóm đầy đủ.
 - Nhiều gateway instance, E2EE, API prekey và chính sách retention/trim stream.
+
+Để bổ sung group UI: hiển thị summary group (`name`, `role`, `member_count`, `peer: null`), thêm form tạo nhóm và màn hình thành viên, nối thao tác thêm/xóa/rời theo role. Sau đó cho client nhận event group, gộp text/system theo `message_id` và `seq`, lấy bù history bằng cursor và dùng read/unread hiện có. Cần xử lý 503 tạo nhóm bằng cách đối chiếu `thread_id`, đồng thời demo nhiều tab với thêm/xóa/thêm lại và reconnect.

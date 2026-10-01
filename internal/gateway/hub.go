@@ -101,6 +101,7 @@ type wireMessage struct {
 	Type          string    `json:"type"`
 	MessageID     string    `json:"message_id"`
 	ThreadID      string    `json:"thread_id"`
+	ThreadKind    string    `json:"thread_kind"`
 	SenderID      string    `json:"sender_id"`
 	RecipientID   string    `json:"recipient_id"`
 	Seq           int64     `json:"seq"`
@@ -114,9 +115,18 @@ type wireMessage struct {
 // deliberately non-blocking; a slow connection is closed and must catch up via REST.
 // This is not a delivery acknowledgement and does not deduplicate stream entries.
 func (h *Hub) Dispatch(event messageevent.MessageCreated) error {
+	for _, recipientID := range event.RecipientIDs {
+		if err := h.dispatchTo(event, recipientID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Hub) dispatchTo(event messageevent.MessageCreated, recipientID string) error {
 	data, err := json.Marshal(wireMessage{
 		Type: messageevent.MessageCreatedType, MessageID: event.MessageID,
-		ThreadID: event.ThreadID, SenderID: event.SenderID, RecipientID: event.RecipientID,
+		ThreadID: event.ThreadID, ThreadKind: event.ThreadKind, SenderID: event.SenderID, RecipientID: recipientID,
 		Seq: event.Seq, Kind: event.Kind, ContentFormat: event.ContentFormat,
 		Content: event.Content, CreatedAt: event.CreatedAt,
 	})
@@ -125,7 +135,7 @@ func (h *Hub) Dispatch(event messageevent.MessageCreated) error {
 	}
 	h.mu.RLock()
 	var slow []*client
-	for c := range h.clients[event.RecipientID] {
+	for c := range h.clients[recipientID] {
 		select {
 		case <-c.done:
 		case c.send <- data:

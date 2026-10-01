@@ -88,24 +88,13 @@ func (s *Service) Send(
 
 	publishContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.publishTimeout)
 	defer cancel()
-	if err := s.publisher.Publish(publishContext, messageevent.MessageCreated{
-		MessageID:     message.ExternalID,
-		ThreadID:      message.ThreadExternalID,
-		SenderID:      message.SenderExternalID,
-		RecipientID:   message.RecipientExternalID,
-		Seq:           message.Seq,
-		Kind:          message.Kind,
-		ContentFormat: message.ContentFormat,
-		Content:       message.Content,
-		CreatedAt:     message.CreatedAt,
-	}); err != nil {
+	if err := s.publisher.Publish(publishContext, messageevent.FromMessage(message)); err != nil {
 		return message, created, &model.EventPublishError{
-			MessageID:   message.ExternalID,
-			ThreadID:    message.ThreadExternalID,
-			SenderID:    message.SenderExternalID,
-			RecipientID: message.RecipientExternalID,
-			Seq:         message.Seq,
-			Cause:       err,
+			MessageID: message.ExternalID,
+			ThreadID:  message.ThreadExternalID,
+			SenderID:  message.SenderExternalID,
+			Seq:       message.Seq,
+			Cause:     err,
 		}
 	}
 

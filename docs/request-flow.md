@@ -6,28 +6,21 @@
 - Handler bind request, lấy external user ID đã xác thực từ Gin context và ánh xạ lỗi HTTP.
 - Service chuẩn hóa username, kiểm tra input, băm/so mật khẩu và tra actor nội bộ; không phụ thuộc Gin.
 - Repository dùng sqlc/PostgreSQL, kiểm tra participant và giữ transaction.
-- Message service gọi publisher Redis Streams sau khi repository đã commit; publisher không nằm trong transaction PostgreSQL.
+- Message service và các thao tác nhóm trong thread service gọi cùng publisher Redis Streams sau khi repository đã commit; publisher không nằm trong transaction PostgreSQL.
 - JWT manager trong `internal/token` ký/xác minh token, không phụ thuộc Gin.
 - Bearer middleware chỉ xác minh token và đặt external user ID từ `sub` vào context; không truy vấn database.
 - Vé WebSocket đi qua handler → service → Redis repository: API dùng `SETNX` với TTL; gateway dùng `GETDEL` nguyên tử trước khi upgrade.
 
 ```mermaid
-flowchart LR
-    C[Web hoặc HTTP client] --> R[Gin router]
-    R --> M[Bearer middleware]
-    M --> H[Handler]
+flowchart TD
+    C[Client] --> H[Handler và JWT middleware]
     H --> S[Service]
-    S --> P[Repository]
-    P --> Q[sqlc]
-    Q --> DB[(PostgreSQL)]
-    S -->|sau commit| X[Redis Streams XADD]
-    X --> G[ws-gateway XREADGROUP: pending trước entry mới]
-    G --> H[Hub định tuyến recipient_id]
-    H -->|message.created| W[WebSocket browser]
-    G -.->|XACK sau xử lý, không phải đã đọc| X
-    C -->|POST /auth/ws-ticket| T[Redis ticket SETNX]
-    W -->|GET /ws?ticket=...| U[GETDEL trước upgrade]
-    U --> T
+    S --> R[Repository và sqlc]
+    R --> DB[(PostgreSQL)]
+    S -->|sau commit| X[(Redis Stream)]
+    X --> G[Gateway và Hub]
+    G -->|fan-out recipient_ids| C
+    G -->|XACK sau xếp hàng| X
 ```
 
 ## Auth
@@ -49,11 +42,26 @@ Một PostgreSQL user repository phục vụ cả đăng ký/đăng nhập, look
 
 Không còn cột cặp user hay unique index tương ứng trên `threads`. Vì vậy cơ chế chống trùng phụ thuộc mọi đường ghi direct thread đều dùng transaction/khóa trên; thao tác SQL trực tiếp hoặc implementation khác bỏ qua khóa có thể tạo trùng.
 
+## Nhóm và membership
+
+`POST /threads/group` đi qua thread handler/service/repository:
+
+1. Service kiểm tra tên, số lượng, UUID không trùng/không gồm creator, rồi tra các user nội bộ.
+2. Repository tạo thread, creator role admin và các member; mọi khoảng membership bắt đầu ở seq 1.
+3. Cùng transaction, tăng `last_seq`, ghi system message tạo nhóm và lấy recipient tại seq 1.
+4. Commit rồi service mới publish qua publisher dùng chung với gửi tin.
+
+Thêm/xóa/rời nhóm khóa dòng thread, đọc lại actor/role và membership đích sau khi có khóa. Admin được thêm/xóa người khác; actor tự rời. Thay đổi interval và system message dùng cùng `seq` trong một transaction. Khi admin cuối rời, thành viên còn lại có `(joined_seq, user_id)` nhỏ nhất thành admin. Group tối đa 100 người.
+
+Thêm người đang active hoặc xóa/rời người đã inactive trả system message ở `joined_seq`/`left_seq` hiện tại, không tăng seq; publish lại có thể tạo stream entry trùng. Tạo nhóm chưa có idempotency key: lỗi publish trả 503 kèm thread/message UUID đã lưu, client đối chiếu trước khi tạo lại. Các thao tác không có quyền hoặc transaction rollback không publish.
+
+Cache membership riêng ở Redis và group UI chưa nằm trong bước REST này. PostgreSQL vẫn quyết định quyền; gateway fan-out theo danh sách trong event và không query DB.
+
 ## Gửi tin
 
 `POST /threads/:id/messages` nhận `message_id` và `content`, không nhận sender. `message_id` là UUID client đã chọn cho `messages.external_id`; response vẫn trả external ID trong `id`.
 
-Trong một transaction, repository khóa thread đồng thời với việc xác nhận actor là participant đang hoạt động. Sau đó nó tra `external_id` toàn cục:
+Trong một transaction, repository khóa thread rồi đọc lại membership đang hoạt động sau khi lấy được khóa. Thao tác thêm/xóa/rời nhóm và cập nhật read marker dùng cùng khóa. Sau đó repository tra `external_id` toàn cục:
 
 1. UUID đã thuộc đúng sender, thread, kind/format và nội dung: trả message cũ, không tăng `last_seq`.
 2. UUID đã gắn với bất kỳ dữ liệu nào khác: trả `409 Conflict` chung, không trả message cũ nên không lộ nội dung/người gửi/thread của người khác.
@@ -61,17 +69,17 @@ Trong một transaction, repository khóa thread đồng thời với việc xá
 
 Unique constraint trên `messages.external_id` xử lý cả race giữa các thread/instance. Nếu insert thua race, toàn transaction (kể cả tăng sequence) rollback và API trả conflict. Hai request retry giống hệt trong cùng thread được serialize bởi khóa thread nên chỉ có một row.
 
-Sau khi repository trả thành công, service phát một entry `event=message.created` bằng `XADD`. Entry dùng external UUID `message_id`, `thread_id`, `sender_id`, `recipient_id` cùng `seq`, `kind`, `content_format`, `content`, `created_at`. `recipient_id` được repository lấy từ active participant còn lại trong PostgreSQL, không đến từ client.
+Sau khi repository trả thành công, service phát một entry `event=message.created` bằng `XADD`. Entry dùng external UUID `message_id`, `thread_id`, `thread_kind`, `sender_id`, `recipient_ids` cùng `seq`, `kind`, `content_format`, `content`, `created_at`. `recipient_ids` là mảng JSON, lấy từ membership bao phủ `seq` của message trong PostgreSQL, không đến từ client. Text loại sender; system message gồm toàn bộ thành viên ở mốc đó. Retry vẫn dùng mốc `seq` cũ.
 
 Publisher chạy với timeout cấu hình. Lỗi transaction/quyền/UUID conflict xảy ra trước publisher nên không có event. Nếu PostgreSQL đã commit nhưng XADD lỗi, API trả `503` để client retry đúng UUID và payload. Retry không tạo message hay tăng `seq`, nhưng vẫn XADD lại. Do timeout có thể xảy ra sau khi Redis đã nhận lệnh, stream có thể chứa entry trùng; gateway chuyển tiếp từng entry và client khử trùng theo `message_id`. Luồng này không phải exactly-once và không thể bảo đảm realtime nếu client không retry.
 
 Thread tồn tại nhưng actor không phải participant trả `403`; thread không tồn tại trả `404`.
 
-Gateway dùng một consumer name cố định cho một instance. Nó đọc lại pending bằng `XREADGROUP ... 0` trước khi đọc entry mới bằng `XREADGROUP ... >`, dùng `recipient_id` trong event để xếp tin vào mọi kết nối hiện có của người nhận mà không truy vấn PostgreSQL. Sau khi xử lý entry, gateway `XACK` cả khi người nhận offline. ACK chỉ xác nhận gateway đã xử lý stream entry, không xác nhận WebSocket đã giao tin hoặc người nhận đã đọc; lịch sử vẫn lấy từ PostgreSQL.
+Gateway dùng một consumer name cố định cho một instance. Nó đọc lại pending bằng `XREADGROUP ... 0` trước khi đọc entry mới bằng `XREADGROUP ... >`, duyệt `recipient_ids` trong event để xếp tin vào mọi kết nối hiện có của người nhận mà không truy vấn PostgreSQL. Sau khi xử lý entry, gateway `XACK` cả khi người nhận offline. ACK chỉ xác nhận gateway đã xử lý stream entry, không xác nhận WebSocket đã giao tin hoặc người nhận đã đọc; lịch sử vẫn lấy từ PostgreSQL.
 
 ## Đọc lịch sử
 
-`GET /threads/:id/messages` tra actor từ JWT và chỉ query khi actor là participant đang hoạt động. `limit` mặc định 30, nằm trong `1..100`; `before_seq` nếu có phải dương. Repository query `seq DESC`, lấy `limit + 1`, giữ điều kiện `seq >= joined_seq` và không dùng `OFFSET`, timestamp hay message ID toàn cục.
+`GET /threads/:id/messages` tra actor từ JWT và kiểm tra actor từng là participant. `limit` mặc định 30, nằm trong `1..100`; `before_seq` nếu có phải dương. Repository query `seq DESC`, lấy `limit + 1`, dùng `EXISTS` để giữ message trong ít nhất một khoảng `joined_seq <= seq <= left_seq` của user (left_seq null là vẫn tham gia). Thêm lại tạo khoảng mới; không trả tin trong khoảng vắng mặt và không dùng `OFFSET`, timestamp hay message ID toàn cục.
 
 ```json
 {
@@ -87,9 +95,9 @@ Trang tiếp theo gọi `?before_seq=4&limit=2` và chỉ nhận message có `se
 
 ## Read marker và unread
 
-`PUT /threads/:id/read` nhận `{ "last_read_seq": N }`; actor không bao giờ đến từ body. SQL chỉ update participant đang hoạt động khi `joined_seq - 1 <= N <= threads.last_seq`, đồng thời dùng `GREATEST(last_read_seq, N)`. Vì vậy request cũ đến muộn không thể làm marker giảm. Thread rỗng chấp nhận mốc `0`.
+`PUT /threads/:id/read` nhận `{ "last_read_seq": N }`; actor không bao giờ đến từ body. Repository khóa thread và kiểm tra membership; SQL chỉ update participant đang hoạt động khi `joined_seq - 1 <= N <= threads.last_seq`, đồng thời dùng `GREATEST(last_read_seq, N)`. Vì vậy request cũ đến muộn không thể làm marker giảm. Thread rỗng chấp nhận mốc `0`.
 
-Hai query summary thread cùng trả `last_read_seq`, `peer_last_read_seq` và `unread_count`. `unread_count` là `COUNT(*)` trên các message nằm trong phạm vi xem, có `seq > last_read_seq`, do người khác gửi và `kind <> 'system'`; không suy ra từ `last_seq - last_read_seq`. UI dùng `peer_last_read_seq` để hiện “Đã đọc” cho tin mình gửi có `seq` không lớn hơn marker đó.
+Hai query summary thread cùng trả `last_read_seq`, `peer_last_read_seq` và `unread_count`. `unread_count` là `COUNT(*)` trên các message nằm trong phạm vi xem, có `seq > last_read_seq`, do người khác gửi và `kind <> 'system'`; không suy ra từ `last_seq - last_read_seq`. Với group, summary có `name`, `role`, `member_count`, không có peer. UI direct dùng `peer_last_read_seq` để hiện “Đã đọc” cho tin mình gửi có `seq` không lớn hơn marker đó.
 
 ## Web demo
 

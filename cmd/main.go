@@ -77,11 +77,11 @@ func run() error {
 	userHandler := userhandler.New(userService)
 
 	threadRepository := threadrepository.New(pool)
-	threadService := threadservice.New(threadRepository, userService)
+	messagePublisher := messagepublisher.NewRedis(redisClient, cfg.Redis.Stream)
+	threadService := threadservice.New(threadRepository, userService, messagePublisher, cfg.Redis.PublishTimeout)
 	threadHandler := threadhandler.New(threadService)
 
 	messageRepository := messagerepository.New(pool)
-	messagePublisher := messagepublisher.NewRedis(redisClient, cfg.Redis.Stream)
 	messageService := messageservice.New(
 		messageRepository,
 		userService,

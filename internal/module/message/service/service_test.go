@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -114,16 +115,17 @@ func TestSend(t *testing.T) {
 				return usermodel.User{ID: 11, ExternalID: actorExternalID}, nil
 			}}
 			wantMessage := model.Message{
-				ID:                  9,
-				ExternalID:          messageExternalID,
-				ThreadExternalID:    threadExternalID,
-				SenderExternalID:    actorExternalID,
-				RecipientExternalID: "22222222-2222-4222-8222-222222222222",
-				Seq:                 1,
-				Kind:                "text",
-				ContentFormat:       "plaintext",
-				Content:             tt.wantContent,
-				CreatedAt:           time.Date(2026, time.September, 28, 9, 0, 0, 0, time.UTC),
+				ID:               9,
+				ExternalID:       messageExternalID,
+				ThreadExternalID: threadExternalID,
+				ThreadKind:       "direct",
+				SenderExternalID: actorExternalID,
+				RecipientIDs:     []string{"22222222-2222-4222-8222-222222222222"},
+				Seq:              1,
+				Kind:             "text",
+				ContentFormat:    "plaintext",
+				Content:          tt.wantContent,
+				CreatedAt:        time.Date(2026, time.September, 28, 9, 0, 0, 0, time.UTC),
 			}
 			repository := &fakeMessageRepository{send: func(
 				gotCtx context.Context,
@@ -154,7 +156,7 @@ func TestSend(t *testing.T) {
 			if publisher.calls != tt.wantPublishCalls {
 				t.Fatalf("publisher calls = %d, want %d", publisher.calls, tt.wantPublishCalls)
 			}
-			if tt.wantError == nil && (got != wantMessage || !created) {
+			if tt.wantError == nil && (!reflect.DeepEqual(got, wantMessage) || !created) {
 				t.Fatalf("result = (%+v, %v), want (%+v, true)", got, created, wantMessage)
 			}
 		})
@@ -223,16 +225,17 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 	redisError := errors.New("redis unavailable")
 	createdAt := time.Date(2026, time.September, 28, 10, 30, 0, 123, time.FixedZone("ICT", 7*60*60))
 	wantMessage := model.Message{
-		ID:                  9,
-		ExternalID:          messageExternalID,
-		ThreadExternalID:    threadExternalID,
-		SenderExternalID:    actorExternalID,
-		RecipientExternalID: "22222222-2222-4222-8222-222222222222",
-		Seq:                 7,
-		Kind:                "text",
-		ContentFormat:       "plaintext",
-		Content:             "hello",
-		CreatedAt:           createdAt,
+		ID:               9,
+		ExternalID:       messageExternalID,
+		ThreadExternalID: threadExternalID,
+		ThreadKind:       "group",
+		SenderExternalID: actorExternalID,
+		RecipientIDs:     []string{"22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"},
+		Seq:              7,
+		Kind:             "text",
+		ContentFormat:    "plaintext",
+		Content:          "hello",
+		CreatedAt:        createdAt,
 	}
 
 	tests := []struct {
@@ -278,15 +281,16 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 				wantEvent := messageevent.MessageCreated{
 					MessageID:     wantMessage.ExternalID,
 					ThreadID:      wantMessage.ThreadExternalID,
+					ThreadKind:    wantMessage.ThreadKind,
 					SenderID:      wantMessage.SenderExternalID,
-					RecipientID:   wantMessage.RecipientExternalID,
+					RecipientIDs:  wantMessage.RecipientIDs,
 					Seq:           wantMessage.Seq,
 					Kind:          wantMessage.Kind,
 					ContentFormat: wantMessage.ContentFormat,
 					Content:       wantMessage.Content,
 					CreatedAt:     wantMessage.CreatedAt,
 				}
-				if gotEvent != wantEvent {
+				if !reflect.DeepEqual(gotEvent, wantEvent) {
 					t.Fatalf("event = %+v, want %+v", gotEvent, wantEvent)
 				}
 				return tt.publisherError
@@ -308,7 +312,7 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 			if publisher.calls != tt.wantPublishCalls {
 				t.Fatalf("publisher calls = %d, want %d", publisher.calls, tt.wantPublishCalls)
 			}
-			if tt.repositoryError == nil && got != wantMessage {
+			if tt.repositoryError == nil && !reflect.DeepEqual(got, wantMessage) {
 				t.Fatalf("message = %+v, want persisted message %+v", got, wantMessage)
 			}
 			if tt.wantPublishCalls == 1 && strings.Join(order, ",") != "repository,publisher" {
@@ -322,15 +326,15 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 	ctx := context.Background()
 	redisError := errors.New("redis unavailable")
 	message := model.Message{
-		ExternalID:          messageExternalID,
-		ThreadExternalID:    threadExternalID,
-		SenderExternalID:    actorExternalID,
-		RecipientExternalID: "22222222-2222-4222-8222-222222222222",
-		Seq:                 4,
-		Kind:                "text",
-		ContentFormat:       "plaintext",
-		Content:             "retry me",
-		CreatedAt:           time.Now(),
+		ExternalID:       messageExternalID,
+		ThreadExternalID: threadExternalID,
+		SenderExternalID: actorExternalID,
+		RecipientIDs:     []string{"22222222-2222-4222-8222-222222222222"},
+		Seq:              4,
+		Kind:             "text",
+		ContentFormat:    "plaintext",
+		Content:          "retry me",
+		CreatedAt:        time.Now(),
 	}
 	repositoryCalls := 0
 	repository := &fakeMessageRepository{send: func(

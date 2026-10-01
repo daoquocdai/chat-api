@@ -94,52 +94,22 @@ func (q *Queries) GetDirectThreadByParticipants(ctx context.Context, arg GetDire
 	return i, err
 }
 
-const getThreadReadBounds = `-- name: GetThreadReadBounds :one
-SELECT participant.joined_seq, thread.last_seq
-FROM threads AS thread
-JOIN participants AS participant
-  ON participant.thread_id = thread.id
- AND participant.user_id = $1
- AND participant.left_seq IS NULL
-WHERE thread.external_id = $2
-`
-
-type GetThreadReadBoundsParams struct {
-	UserID           int64
-	ThreadExternalID pgtype.UUID
-}
-
-type GetThreadReadBoundsRow struct {
-	JoinedSeq int64
-	LastSeq   int64
-}
-
-func (q *Queries) GetThreadReadBounds(ctx context.Context, arg GetThreadReadBoundsParams) (GetThreadReadBoundsRow, error) {
-	row := q.db.QueryRow(ctx, getThreadReadBounds, arg.UserID, arg.ThreadExternalID)
-	var i GetThreadReadBoundsRow
-	err := row.Scan(&i.JoinedSeq, &i.LastSeq)
-	return i, err
-}
-
 const getThreadSummaryForUser = `-- name: GetThreadSummaryForUser :one
 SELECT
-    t.id,
-    t.external_id,
-    t.kind,
-    peer.external_id AS peer_external_id,
-    peer.username AS peer_username,
-    t.last_seq,
-    mine.last_read_seq,
-    other.last_read_seq AS peer_last_read_seq,
-    (
-        SELECT COUNT(*)
-        FROM messages AS unread_message
-        WHERE unread_message.thread_id = t.id
-          AND unread_message.seq >= mine.joined_seq
-          AND unread_message.seq > mine.last_read_seq
-          AND unread_message.sender_id <> mine.user_id
-          AND unread_message.kind <> 'system'
-    ) AS unread_count,
+    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
+    mine.role,
+    COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
+    COALESCE(peer.username, '') AS peer_username,
+    t.last_seq, mine.last_read_seq,
+    COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
+    (SELECT COUNT(*) FROM participants AS member
+     WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,
+    (SELECT COUNT(*) FROM messages AS unread_message
+     WHERE unread_message.thread_id = t.id
+       AND unread_message.seq >= mine.joined_seq
+       AND unread_message.seq > mine.last_read_seq
+       AND unread_message.sender_id <> mine.user_id
+       AND unread_message.kind <> 'system') AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
@@ -150,17 +120,16 @@ JOIN participants AS mine
   ON mine.thread_id = t.id
  AND mine.user_id = $1
  AND mine.left_seq IS NULL
-JOIN participants AS other
-  ON other.thread_id = t.id
+LEFT JOIN participants AS other
+  ON t.kind = 'direct'
+ AND other.thread_id = t.id
  AND other.user_id <> mine.user_id
  AND other.left_seq IS NULL
-JOIN users AS peer ON peer.id = other.user_id
+LEFT JOIN users AS peer ON peer.id = other.user_id
 LEFT JOIN messages AS last_message
-  ON last_message.thread_id = t.id
- AND last_message.seq = t.last_seq
+  ON last_message.thread_id = t.id AND last_message.seq = t.last_seq
 LEFT JOIN users AS last_sender ON last_sender.id = last_message.sender_id
 WHERE t.external_id = $2
-  AND t.kind = 'direct'
 `
 
 type GetThreadSummaryForUserParams struct {
@@ -172,11 +141,14 @@ type GetThreadSummaryForUserRow struct {
 	ID                          int64
 	ExternalID                  pgtype.UUID
 	Kind                        string
+	Name                        string
+	Role                        string
 	PeerExternalID              pgtype.UUID
 	PeerUsername                string
 	LastSeq                     int64
 	LastReadSeq                 int64
 	PeerLastReadSeq             int64
+	MemberCount                 int64
 	UnreadCount                 int64
 	LastMessageSeq              pgtype.Int8
 	LastMessageSenderExternalID pgtype.UUID
@@ -192,11 +164,14 @@ func (q *Queries) GetThreadSummaryForUser(ctx context.Context, arg GetThreadSumm
 		&i.ID,
 		&i.ExternalID,
 		&i.Kind,
+		&i.Name,
+		&i.Role,
 		&i.PeerExternalID,
 		&i.PeerUsername,
 		&i.LastSeq,
 		&i.LastReadSeq,
 		&i.PeerLastReadSeq,
+		&i.MemberCount,
 		&i.UnreadCount,
 		&i.LastMessageSeq,
 		&i.LastMessageSenderExternalID,
@@ -209,42 +184,39 @@ func (q *Queries) GetThreadSummaryForUser(ctx context.Context, arg GetThreadSumm
 
 const listThreadsForUser = `-- name: ListThreadsForUser :many
 SELECT
-    t.id,
-    t.external_id,
-    t.kind,
-    peer.external_id AS peer_external_id,
-    peer.username AS peer_username,
-    t.last_seq,
-    mine.last_read_seq,
-    other.last_read_seq AS peer_last_read_seq,
-    (
-        SELECT COUNT(*)
-        FROM messages AS unread_message
-        WHERE unread_message.thread_id = t.id
-          AND unread_message.seq >= mine.joined_seq
-          AND unread_message.seq > mine.last_read_seq
-          AND unread_message.sender_id <> mine.user_id
-          AND unread_message.kind <> 'system'
-    ) AS unread_count,
+    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
+    mine.role,
+    COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
+    COALESCE(peer.username, '') AS peer_username,
+    t.last_seq, mine.last_read_seq,
+    COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
+    (SELECT COUNT(*) FROM participants AS member
+     WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,
+    (SELECT COUNT(*) FROM messages AS unread_message
+     WHERE unread_message.thread_id = t.id
+       AND unread_message.seq >= mine.joined_seq
+       AND unread_message.seq > mine.last_read_seq
+       AND unread_message.sender_id <> mine.user_id
+       AND unread_message.kind <> 'system') AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
     last_message.created_at AS last_message_created_at,
     t.created_at
-FROM participants AS mine
-JOIN threads AS t ON t.id = mine.thread_id
-JOIN participants AS other
-  ON other.thread_id = t.id
+FROM threads AS t
+JOIN participants AS mine
+  ON mine.thread_id = t.id
+ AND mine.user_id = $1
+ AND mine.left_seq IS NULL
+LEFT JOIN participants AS other
+  ON t.kind = 'direct'
+ AND other.thread_id = t.id
  AND other.user_id <> mine.user_id
  AND other.left_seq IS NULL
-JOIN users AS peer ON peer.id = other.user_id
+LEFT JOIN users AS peer ON peer.id = other.user_id
 LEFT JOIN messages AS last_message
-  ON last_message.thread_id = t.id
- AND last_message.seq = t.last_seq
+  ON last_message.thread_id = t.id AND last_message.seq = t.last_seq
 LEFT JOIN users AS last_sender ON last_sender.id = last_message.sender_id
-WHERE mine.user_id = $1
-  AND mine.left_seq IS NULL
-  AND t.kind = 'direct'
 ORDER BY COALESCE(last_message.created_at, t.created_at) DESC, t.id DESC
 `
 
@@ -252,11 +224,14 @@ type ListThreadsForUserRow struct {
 	ID                          int64
 	ExternalID                  pgtype.UUID
 	Kind                        string
+	Name                        string
+	Role                        string
 	PeerExternalID              pgtype.UUID
 	PeerUsername                string
 	LastSeq                     int64
 	LastReadSeq                 int64
 	PeerLastReadSeq             int64
+	MemberCount                 int64
 	UnreadCount                 int64
 	LastMessageSeq              pgtype.Int8
 	LastMessageSenderExternalID pgtype.UUID
@@ -278,11 +253,14 @@ func (q *Queries) ListThreadsForUser(ctx context.Context, userID int64) ([]ListT
 			&i.ID,
 			&i.ExternalID,
 			&i.Kind,
+			&i.Name,
+			&i.Role,
 			&i.PeerExternalID,
 			&i.PeerUsername,
 			&i.LastSeq,
 			&i.LastReadSeq,
 			&i.PeerLastReadSeq,
+			&i.MemberCount,
 			&i.UnreadCount,
 			&i.LastMessageSeq,
 			&i.LastMessageSenderExternalID,

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -130,7 +131,7 @@ func decode(values map[string]interface{}) (messageevent.MessageCreated, error) 
 		dest *string
 	}{
 		{"message_id", &event.MessageID}, {"thread_id", &event.ThreadID},
-		{"sender_id", &event.SenderID}, {"recipient_id", &event.RecipientID},
+		{"sender_id", &event.SenderID},
 		{"kind", &event.Kind}, {"content_format", &event.ContentFormat}, {"content", &event.Content},
 	} {
 		// Empty content is allowed; all other fields are required.
@@ -146,6 +147,22 @@ func decode(values map[string]interface{}) (messageevent.MessageCreated, error) 
 				return messageevent.MessageCreated{}, err
 			}
 		}
+	}
+	if text, ok := values["recipient_ids"].(string); ok {
+		if err := json.Unmarshal([]byte(text), &event.RecipientIDs); err != nil || event.RecipientIDs == nil {
+			return messageevent.MessageCreated{}, fmt.Errorf("invalid recipient_ids")
+		}
+	} else {
+		// Read existing entries already stored before the recipient-list contract.
+		recipient, err := get("recipient_id")
+		if err != nil {
+			return messageevent.MessageCreated{}, err
+		}
+		event.RecipientIDs = []string{recipient}
+	}
+	event.ThreadKind, _ = values["thread_kind"].(string)
+	if event.ThreadKind == "" {
+		event.ThreadKind = "direct"
 	}
 	seqText, err := get("seq")
 	if err != nil {

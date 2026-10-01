@@ -470,6 +470,8 @@ async function loadThreads(catchUpCached = false) {
 
     const refreshed = new Map();
     for (const thread of threads) {
+      // This demo currently renders direct chats; group REST support is separate.
+      if (thread.kind !== "direct" || !thread.peer) continue;
       const serverLastSeq = Number(thread.last_seq || 0);
       refreshed.set(thread.peer.id, reconcileThreadSummary(thread));
       const cache = state.threadCaches.get(thread.id);
@@ -805,6 +807,7 @@ function handleSocketMessage(data) {
   } catch {
     return;
   }
+  if (event.thread_kind === "group") return;
   const seq = Number(event.seq);
   if (event.type !== "message.created" || event.recipient_id !== state.currentUserID ||
       typeof event.message_id !== "string" || typeof event.thread_id !== "string" ||

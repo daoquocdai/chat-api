@@ -18,12 +18,11 @@ var (
 )
 
 type EventPublishError struct {
-	MessageID   string
-	ThreadID    string
-	SenderID    string
-	RecipientID string
-	Seq         int64
-	Cause       error
+	MessageID string
+	ThreadID  string
+	SenderID  string
+	Seq       int64
+	Cause     error
 }
 
 func (e *EventPublishError) Error() string {
@@ -31,7 +30,6 @@ func (e *EventPublishError) Error() string {
 		" message_id=" + e.MessageID +
 		" thread_id=" + e.ThreadID +
 		" sender_id=" + e.SenderID +
-		" recipient_id=" + e.RecipientID +
 		" seq=" + fmt.Sprint(e.Seq) +
 		": " + e.Cause.Error()
 }

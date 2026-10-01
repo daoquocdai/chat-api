@@ -16,6 +16,11 @@ type ThreadHandler interface {
 	CreateOrGetDirect(c *gin.Context)
 	List(c *gin.Context)
 	MarkRead(c *gin.Context)
+	CreateGroup(c *gin.Context)
+	Members(c *gin.Context)
+	AddMember(c *gin.Context)
+	RemoveMember(c *gin.Context)
+	Leave(c *gin.Context)
 }
 
 type MessageHandler interface {
@@ -57,6 +62,11 @@ func New(
 	authenticated.GET("/users", userHandler.List)
 	authenticated.POST("/auth/ws-ticket", wsTicketHandler.Issue)
 	authenticated.POST("/threads/direct", threadHandler.CreateOrGetDirect)
+	authenticated.POST("/threads/group", threadHandler.CreateGroup)
+	authenticated.GET("/threads/:id/members", threadHandler.Members)
+	authenticated.POST("/threads/:id/members", threadHandler.AddMember)
+	authenticated.DELETE("/threads/:id/members/:user_id", threadHandler.RemoveMember)
+	authenticated.POST("/threads/:id/leave", threadHandler.Leave)
 	authenticated.GET("/threads", threadHandler.List)
 	authenticated.PUT("/threads/:id/read", threadHandler.MarkRead)
 	authenticated.POST("/threads/:id/messages", messageHandler.Send)

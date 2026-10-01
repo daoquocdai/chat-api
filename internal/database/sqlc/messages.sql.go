@@ -38,6 +38,7 @@ SELECT
     created.id,
     created.external_id,
     thread.external_id AS thread_external_id,
+    thread.kind AS thread_kind,
     sender.external_id AS sender_external_id,
     created.seq,
     created.kind,
@@ -61,6 +62,7 @@ type CreateThreadMessageRow struct {
 	ID               int64
 	ExternalID       pgtype.UUID
 	ThreadExternalID pgtype.UUID
+	ThreadKind       string
 	SenderExternalID pgtype.UUID
 	Seq              int64
 	Kind             string
@@ -82,6 +84,7 @@ func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessa
 		&i.ID,
 		&i.ExternalID,
 		&i.ThreadExternalID,
+		&i.ThreadKind,
 		&i.SenderExternalID,
 		&i.Seq,
 		&i.Kind,
@@ -92,52 +95,6 @@ func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessa
 	return i, err
 }
 
-const getActiveThreadAccess = `-- name: GetActiveThreadAccess :one
-SELECT t.id
-FROM threads AS t
-JOIN participants AS p
-  ON p.thread_id = t.id
- AND p.user_id = $1
- AND p.left_seq IS NULL
-WHERE t.external_id = $2
-`
-
-type GetActiveThreadAccessParams struct {
-	UserID           int64
-	ThreadExternalID pgtype.UUID
-}
-
-func (q *Queries) GetActiveThreadAccess(ctx context.Context, arg GetActiveThreadAccessParams) (int64, error) {
-	row := q.db.QueryRow(ctx, getActiveThreadAccess, arg.UserID, arg.ThreadExternalID)
-	var id int64
-	err := row.Scan(&id)
-	return id, err
-}
-
-const getDirectRecipientExternalID = `-- name: GetDirectRecipientExternalID :one
-SELECT recipient.external_id
-FROM participants AS participant
-JOIN users AS recipient ON recipient.id = participant.user_id
-JOIN threads AS thread
-  ON thread.id = participant.thread_id
- AND thread.kind = 'direct'
-WHERE participant.thread_id = $1
-  AND participant.user_id <> $2
-  AND participant.left_seq IS NULL
-`
-
-type GetDirectRecipientExternalIDParams struct {
-	ThreadID int64
-	SenderID int64
-}
-
-func (q *Queries) GetDirectRecipientExternalID(ctx context.Context, arg GetDirectRecipientExternalIDParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, getDirectRecipientExternalID, arg.ThreadID, arg.SenderID)
-	var external_id pgtype.UUID
-	err := row.Scan(&external_id)
-	return external_id, err
-}
-
 const getMessageByExternalID = `-- name: GetMessageByExternalID :one
 SELECT
     m.id,
@@ -145,6 +102,7 @@ SELECT
     m.thread_id,
     m.sender_id,
     t.external_id AS thread_external_id,
+    t.kind AS thread_kind,
     sender.external_id AS sender_external_id,
     m.seq,
     m.kind,
@@ -163,6 +121,7 @@ type GetMessageByExternalIDRow struct {
 	ThreadID         int64
 	SenderID         int64
 	ThreadExternalID pgtype.UUID
+	ThreadKind       string
 	SenderExternalID pgtype.UUID
 	Seq              int64
 	Kind             string
@@ -180,6 +139,7 @@ func (q *Queries) GetMessageByExternalID(ctx context.Context, messageExternalID 
 		&i.ThreadID,
 		&i.SenderID,
 		&i.ThreadExternalID,
+		&i.ThreadKind,
 		&i.SenderExternalID,
 		&i.Seq,
 		&i.Kind,
@@ -188,6 +148,28 @@ func (q *Queries) GetMessageByExternalID(ctx context.Context, messageExternalID 
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const getThreadHistoryAccess = `-- name: GetThreadHistoryAccess :one
+SELECT t.id
+FROM threads AS t
+JOIN participants AS p
+  ON p.thread_id = t.id
+ AND p.user_id = $1
+WHERE t.external_id = $2
+LIMIT 1
+`
+
+type GetThreadHistoryAccessParams struct {
+	UserID           int64
+	ThreadExternalID pgtype.UUID
+}
+
+func (q *Queries) GetThreadHistoryAccess(ctx context.Context, arg GetThreadHistoryAccessParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getThreadHistoryAccess, arg.UserID, arg.ThreadExternalID)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
 }
 
 const incrementThreadSequence = `-- name: IncrementThreadSequence :one
@@ -204,11 +186,55 @@ func (q *Queries) IncrementThreadSequence(ctx context.Context, id int64) (int64,
 	return last_seq, err
 }
 
+const listMessageRecipients = `-- name: ListMessageRecipients :many
+SELECT DISTINCT recipient.external_id
+FROM participants AS participant
+JOIN users AS recipient ON recipient.id = participant.user_id
+WHERE participant.thread_id = $1
+  AND participant.joined_seq <= $2
+  AND (participant.left_seq IS NULL OR participant.left_seq >= $2)
+  AND ($3::BOOLEAN OR participant.user_id <> $4)
+ORDER BY recipient.external_id
+`
+
+type ListMessageRecipientsParams struct {
+	ThreadID      int64
+	Seq           int64
+	IncludeSender bool
+	SenderID      int64
+}
+
+func (q *Queries) ListMessageRecipients(ctx context.Context, arg ListMessageRecipientsParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listMessageRecipients,
+		arg.ThreadID,
+		arg.Seq,
+		arg.IncludeSender,
+		arg.SenderID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var external_id pgtype.UUID
+		if err := rows.Scan(&external_id); err != nil {
+			return nil, err
+		}
+		items = append(items, external_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listThreadMessagesPage = `-- name: ListThreadMessagesPage :many
 SELECT
     m.id,
     m.external_id,
     t.external_id AS thread_external_id,
+    t.kind AS thread_kind,
     sender.external_id AS sender_external_id,
     m.seq,
     m.kind,
@@ -218,12 +244,14 @@ SELECT
 FROM messages AS m
 JOIN threads AS t ON t.id = m.thread_id
 JOIN users AS sender ON sender.id = m.sender_id
-JOIN participants AS participant
-  ON participant.thread_id = t.id
- AND participant.user_id = $1
- AND participant.left_seq IS NULL
-WHERE t.external_id = $2
-  AND m.seq >= participant.joined_seq
+WHERE t.external_id = $1
+  AND EXISTS (
+    SELECT 1 FROM participants AS participant
+    WHERE participant.thread_id = t.id
+      AND participant.user_id = $2
+      AND m.seq >= participant.joined_seq
+      AND (participant.left_seq IS NULL OR m.seq <= participant.left_seq)
+  )
   AND (
     $3::BIGINT IS NULL
     OR m.seq < $3
@@ -233,8 +261,8 @@ LIMIT $4::INTEGER + 1
 `
 
 type ListThreadMessagesPageParams struct {
-	UserID           int64
 	ThreadExternalID pgtype.UUID
+	UserID           int64
 	BeforeSeq        pgtype.Int8
 	PageSize         int32
 }
@@ -243,6 +271,7 @@ type ListThreadMessagesPageRow struct {
 	ID               int64
 	ExternalID       pgtype.UUID
 	ThreadExternalID pgtype.UUID
+	ThreadKind       string
 	SenderExternalID pgtype.UUID
 	Seq              int64
 	Kind             string
@@ -253,8 +282,8 @@ type ListThreadMessagesPageRow struct {
 
 func (q *Queries) ListThreadMessagesPage(ctx context.Context, arg ListThreadMessagesPageParams) ([]ListThreadMessagesPageRow, error) {
 	rows, err := q.db.Query(ctx, listThreadMessagesPage,
-		arg.UserID,
 		arg.ThreadExternalID,
+		arg.UserID,
 		arg.BeforeSeq,
 		arg.PageSize,
 	)
@@ -269,6 +298,7 @@ func (q *Queries) ListThreadMessagesPage(ctx context.Context, arg ListThreadMess
 			&i.ID,
 			&i.ExternalID,
 			&i.ThreadExternalID,
+			&i.ThreadKind,
 			&i.SenderExternalID,
 			&i.Seq,
 			&i.Kind,

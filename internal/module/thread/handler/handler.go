@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	authmiddleware "github.com/daoquocdai/chat-api/internal/middleware"
+	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
 	"github.com/daoquocdai/chat-api/internal/module/thread/dto"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
@@ -17,6 +18,11 @@ type ThreadService interface {
 	CreateOrGetDirect(ctx context.Context, actorExternalID, peerExternalID string) (model.Thread, bool, error)
 	List(ctx context.Context, actorExternalID string) ([]model.Thread, error)
 	MarkRead(ctx context.Context, actorExternalID, threadExternalID string, lastReadSeq int64) (int64, error)
+	CreateGroup(ctx context.Context, actorExternalID, name string, memberIDs []string) (model.Thread, error)
+	Members(ctx context.Context, actorExternalID, threadExternalID string) ([]model.Member, error)
+	AddMember(ctx context.Context, actorExternalID, threadExternalID, targetExternalID string) (messagemodel.Message, error)
+	RemoveMember(ctx context.Context, actorExternalID, threadExternalID, targetExternalID string) (messagemodel.Message, error)
+	Leave(ctx context.Context, actorExternalID, threadExternalID string) (messagemodel.Message, error)
 }
 
 type Handler struct {
@@ -113,11 +119,19 @@ func authenticatedUserID(c *gin.Context) (string, bool) {
 }
 
 func writeError(c *gin.Context, err error) {
+	var publishErr *messagemodel.EventPublishError
+	if errors.As(err, &publishErr) {
+		log.Printf("thread handler: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "operation committed but realtime publish was not confirmed", "thread_id": publishErr.ThreadID, "message_id": publishErr.MessageID, "seq": publishErr.Seq})
+		return
+	}
 	switch {
 	case errors.Is(err, model.ErrPeerIDRequired), errors.Is(err, model.ErrSameUser),
 		errors.Is(err, model.ErrThreadIDRequired), errors.Is(err, model.ErrInvalidThreadID),
 		errors.Is(err, model.ErrReadSequenceRequired), errors.Is(err, model.ErrInvalidReadSequence),
-		errors.Is(err, usermodel.ErrInvalidUserID):
+		errors.Is(err, usermodel.ErrInvalidUserID), errors.Is(err, model.ErrInvalidGroupName),
+		errors.Is(err, model.ErrInvalidMemberIDs), errors.Is(err, model.ErrGroupTooLarge),
+		errors.Is(err, model.ErrNotGroup), errors.Is(err, model.ErrUseLeave):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 
 	case errors.Is(err, usermodel.ErrUserNotFound), errors.Is(err, model.ErrThreadNotFound):
@@ -125,6 +139,10 @@ func writeError(c *gin.Context, err error) {
 
 	case errors.Is(err, model.ErrNotParticipant):
 		c.JSON(http.StatusForbidden, gin.H{"error": model.ErrNotParticipant.Error()})
+	case errors.Is(err, model.ErrAdminRequired):
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+	case errors.Is(err, model.ErrMemberNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 
 	default:
 		log.Printf("thread handler: %v", err)

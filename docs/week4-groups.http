@@ -1,0 +1,214 @@
+### Week 4: group REST. Run top to bottom with chat-api + Redis running.
+### VS Code REST Client. Change @run before rerunning; messages use fresh UUIDs.
+### Group UI is a later step; this collection verifies backend behavior.
+@baseUrl = http://localhost:8080
+@run = group01
+@password = Week4-local-demo-2026!
+
+### Register Alice: expect 201
+# @name registerAlice
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{ "username": "alice-{{run}}", "password": "{{password}}" }
+
+### Login Alice: expect 200
+# @name loginAlice
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "username": "alice-{{run}}", "password": "{{password}}" }
+
+### Register Bob: expect 201
+# @name registerBob
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{ "username": "bob-{{run}}", "password": "{{password}}" }
+
+### Login Bob: expect 200
+# @name loginBob
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "username": "bob-{{run}}", "password": "{{password}}" }
+
+### Register Charlie: expect 201
+# @name registerCharlie
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{ "username": "charlie-{{run}}", "password": "{{password}}" }
+
+### Login Charlie: expect 200
+# @name loginCharlie
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "username": "charlie-{{run}}", "password": "{{password}}" }
+
+### Register Outsider: expect 201
+# @name registerOutsider
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{ "username": "outsider-{{run}}", "password": "{{password}}" }
+
+### Login Outsider: expect 200
+# @name loginOutsider
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{ "username": "outsider-{{run}}", "password": "{{password}}" }
+
+### Alice creates a 3-person group: expect 201, kind=group, role=admin, last_seq=1
+# @name createGroup
+POST {{baseUrl}}/threads/group
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "name": "Nhóm tuần 4", "member_ids": ["{{registerBob.response.body.$.id}}", "{{registerCharlie.response.body.$.id}}"] }
+
+### Bob lists members: 3 members, Alice admin
+GET {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/members
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+
+### Alice sends: expect 201, seq=2
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "message_id": "{{$guid}}", "content": "Chào cả nhóm" }
+
+### Bob sends: expect 201, seq=3
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "message_id": "{{$guid}}", "content": "Chào Alice và Charlie" }
+
+### Charlie has 2 unread text messages; creation system message does not count
+GET {{baseUrl}}/threads
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### Charlie marks through seq=3 as read: expect 200
+PUT {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/read
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "last_read_seq": 3 }
+
+### Charlie unread_count is now 0
+GET {{baseUrl}}/threads
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### Bob is not admin: expect 403, no system message or seq increase
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/members
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "user_id": "{{registerOutsider.response.body.$.id}}" }
+
+### Outsider cannot read history: expect 403
+GET {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages
+Authorization: Bearer {{loginOutsider.response.body.$.access_token}}
+
+### Alice removes Charlie: expect 200, system seq=4
+DELETE {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/members/{{registerCharlie.response.body.$.id}}
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### Repeat removal: same message UUID/seq=4, no new DB row
+DELETE {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/members/{{registerCharlie.response.body.$.id}}
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### Alice sends while Charlie is absent: expect 201, seq=5
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "message_id": "{{$guid}}", "content": "Chỉ Alice và Bob được xem tin này" }
+
+### Removed Charlie cannot send: expect 403
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "message_id": "{{$guid}}", "content": "Tin này không được lưu" }
+
+### Removed Charlie only sees seq 4,3,2,1; cannot see seq=5
+GET {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages?limit=30
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### Removed Charlie cannot update read marker: expect 403
+PUT {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/read
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "last_read_seq": 5 }
+
+### Alice adds Charlie again: expect 200, system seq=6, new membership interval
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/members
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "user_id": "{{registerCharlie.response.body.$.id}}" }
+
+### Repeat add: same system UUID/seq=6, no new participant or seq
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/members
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "user_id": "{{registerCharlie.response.body.$.id}}" }
+
+### Bob sends: expect 201, seq=7
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "message_id": "{{$guid}}", "content": "Charlie lại thấy được tin mới" }
+
+### Charlie sees 7,6,4,3,2,1: seq=5 remains forbidden; unread_count=1
+GET {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages?limit=30
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### History cursor keeps membership bounds: first page 7,6, cursor=6
+GET {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages?limit=2
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### Next page is 4,3; still excludes seq=5
+GET {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/messages?limit=2&before_seq=6
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### Charlie leaves: expect system seq=8
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/leave
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### Repeat leave: same system UUID/seq=8
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/leave
+Authorization: Bearer {{loginCharlie.response.body.$.access_token}}
+
+### Last admin Alice leaves: expect system seq=9; Bob becomes admin atomically
+POST {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/leave
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### Bob is the sole member and admin
+GET {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/members
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+
+### Alice no longer lists this active group
+GET {{baseUrl}}/threads
+Authorization: Bearer {{loginAlice.response.body.$.access_token}}
+
+### Bob marks all known messages read; lower retry does not decrease marker
+PUT {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/read
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "last_read_seq": 9 }
+
+### Retry older marker: expect response last_read_seq=9
+PUT {{baseUrl}}/threads/{{createGroup.response.body.$.id}}/read
+Authorization: Bearer {{loginBob.response.body.$.access_token}}
+Content-Type: application/json
+
+{ "last_read_seq": 2 }

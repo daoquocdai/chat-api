@@ -5,7 +5,7 @@ const threadSummaryDebounceMs = 750;
 const websocketConnectTimeoutMs = 10000;
 const websocketHeartbeatTimeoutMs = 15000;
 const websocketResumeGraceMs = 5000;
-const pendingSendMismatchMessage = "Tin trước chưa được xác nhận. Hãy lưu nội dung mới ở nơi khác và khôi phục đúng nội dung tin cũ để bấm Gửi lại; chỉ gửi tin mới sau khi tin cũ thành công.";
+const pendingSendMismatchMessage = "Tin trước chưa được xác nhận. Khôi phục đúng nội dung cũ để bấm Gửi lại; chỉ gửi tin mới sau khi tin cũ thành công.";
 
 const authView = document.querySelector("#auth-view");
 const chatView = document.querySelector("#chat-view");
@@ -14,7 +14,11 @@ const loginForm = document.querySelector("#login-form");
 const logoutButton = document.querySelector("#logout-button");
 const currentUsername = document.querySelector("#current-username");
 const peerList = document.querySelector("#peer-list");
+const directThreadList = document.querySelector("#direct-thread-list");
+const groupThreadList = document.querySelector("#group-thread-list");
+const newDirectSection = document.querySelector("#new-direct-section");
 const peerName = document.querySelector("#peer-name");
+const threadStatus = document.querySelector("#thread-status");
 const historyElement = document.querySelector("#history");
 const messageForm = document.querySelector("#message-form");
 const contentInput = document.querySelector("#content");
@@ -22,132 +26,129 @@ const sendButton = document.querySelector("#send-button");
 const loadOlderButton = document.querySelector("#load-older-button");
 const noticeElement = document.querySelector("#notice");
 const errorElement = document.querySelector("#error");
+const groupForm = document.querySelector("#group-form");
+const groupUsers = document.querySelector("#group-users");
+const createGroupButton = document.querySelector("#create-group-button");
+const recoverGroupButton = document.querySelector("#recover-group-button");
+const membersButton = document.querySelector("#members-button");
+const membersPanel = document.querySelector("#members-panel");
+const memberList = document.querySelector("#member-list");
+const addMemberForm = document.querySelector("#add-member-form");
+const addMemberUser = document.querySelector("#add-member-user");
+const addMemberButton = document.querySelector("#add-member-button");
+const leaveButton = document.querySelector("#leave-button");
 
 const state = {
-  token: "",
-  sessionVersion: 0,
-  currentUserID: "",
-  currentUsername: "",
-  users: [],
-  threadsByPeer: new Map(),
-  threadCaches: new Map(),
-  directRequestsByPeer: new Map(),
-  threadEventSeqs: new Map(),
-  threadSummaryBaseSeqs: new Map(),
-  peerID: "",
-  threadID: "",
-  currentCache: null,
-  conversationVersion: 0,
-  threadListRequest: null,
-  threadListDirty: false,
-  threadListCatchup: false,
-  threadSummaryTimer: null,
-  socket: null,
-  socketConnecting: false,
-  socketGeneration: 0,
-  socketTicketAbort: null,
-  socketHealthTimer: null,
-  socketLastActivityAt: 0,
-  socketSummaryStale: false,
-  reconnectTimer: null,
-  reconnectDelay: 1000,
+  token: "", sessionVersion: 0, sessionAbort: new AbortController(),
+  currentUserID: "", currentUsername: "", users: [],
+  // One entry per thread: summary, permissions, messages, drafts and requests.
+  threads: new Map(), directRequestsByPeer: new Map(),
+  threadID: "", currentCache: null, conversationVersion: 0,
+  visibilityFrame: null, renderedScrollTop: null, renderVersion: 0,
+  membershipSerial: 0, threadListRequest: null, threadListDirty: false,
+  threadListCatchup: false, threadSummaryTimer: null, groupCreation: null,
+  socket: null, socketConnecting: false, socketGeneration: 0,
+  socketTicketAbort: null, socketHealthTimer: null, socketLastActivityAt: 0,
+  socketSummaryStale: false, reconnectTimer: null, reconnectDelay: 1000,
 };
 
 function showNotice(message) {
   noticeElement.textContent = message;
   noticeElement.hidden = !message;
 }
-
 function showError(message) {
   errorElement.textContent = message;
   errorElement.hidden = !message;
 }
-
-function updateSendButton() {
-  const pending = state.currentCache?.pendingSend;
-  sendButton.textContent = pending ? "Gửi lại" : "Gửi";
-  sendButton.disabled = !state.threadID || Boolean(pending?.inFlight);
+function canUseThread(cache) {
+  return Boolean(cache?.summary && cache.active && !cache.permissionsPending);
 }
-
+function updateSendButton() {
+  const cache = state.currentCache;
+  const pending = cache?.pendingSend;
+  sendButton.textContent = pending ? "Gửi lại" : "Gửi";
+  sendButton.disabled = !canUseThread(cache) || Boolean(pending?.inFlight);
+  contentInput.disabled = !canUseThread(cache);
+}
+function renderThreadHeading() {
+  const cache = state.currentCache;
+  const thread = cache?.summary;
+  peerName.textContent = thread ? threadTitle(thread) : "Chọn cuộc trò chuyện";
+  const group = thread?.kind === "group";
+  threadStatus.textContent = group
+    ? !cache.active ? "Bạn đã rời hoặc bị xóa khỏi nhóm; chỉ xem lịch sử đã được cấp quyền."
+      : cache.permissionsPending ? "Đang đối chiếu thành viên và quyền..."
+      : `${thread.member_count} thành viên · ${thread.role === "admin" ? "Quản trị viên" : "Thành viên"}`
+    : "";
+  membersButton.hidden = !group || !cache.active;
+  if (!group || !cache.active) membersPanel.hidden = true;
+  updateSendButton();
+  if (group && !membersPanel.hidden) renderMembers(cache);
+}
 function decodeSubject(token) {
   try {
-    const payload = token.split(".")[1];
-    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    return JSON.parse(atob(padded)).sub || "";
-  } catch {
-    return "";
-  }
+    const normalized = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="))).sub || "";
+  } catch { return ""; }
 }
-
 async function readResponse(response) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(body.error || "Yêu cầu không thành công.");
     error.status = response.status;
+    error.details = body; // Preserve committed thread/message IDs and seq on 503.
     throw error;
   }
   return body;
 }
-
 async function apiRequest(path, options = {}, authenticated = true) {
   const requestToken = state.token;
   const requestSessionVersion = state.sessionVersion;
   const headers = new Headers(options.headers || {});
-  if (authenticated) {
-    headers.set("Authorization", `Bearer ${requestToken}`);
-  }
-
-  const response = await fetch(path, { ...options, headers });
-  if (
-    authenticated &&
-    response.status === 401 &&
-    requestToken === state.token &&
-    requestSessionVersion === state.sessionVersion
-  ) {
+  if (authenticated) headers.set("Authorization", `Bearer ${requestToken}`);
+  const signal = options.signal
+    ? AbortSignal.any([state.sessionAbort.signal, options.signal]) : state.sessionAbort.signal;
+  const response = await fetch(path, { ...options, headers, signal });
+  if (authenticated && response.status === 401 &&
+      currentSessionMatches(requestSessionVersion, requestToken)) {
     clearSession();
+    showError("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
     throw new Error("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
   }
   return readResponse(response);
 }
-
 async function sendMessageWithRetry(snapshot, messageID, content) {
-  const request = {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message_id: messageID, content }),
-  };
-
+  const request = { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message_id: messageID, content }) };
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await apiRequest(`/threads/${snapshot.threadID}/messages`, request);
-    } catch (error) {
-      const retryable = error.status === undefined || error.status >= 500;
-      if (attempt === 1 || !retryable || !cacheSnapshotMatches(snapshot)) {
-        throw error;
-      }
+    try { return await apiRequest(`/threads/${snapshot.threadID}/messages`, request); }
+    catch (error) {
+      if (attempt === 1 || (error.status !== undefined && error.status < 500) ||
+          !cacheSnapshotMatches(snapshot) || !canUseThread(snapshot.cache)) throw error;
     }
   }
-
-  throw new Error("Không thể gửi tin nhắn.");
 }
-
 function resetConversation() {
-  state.peerID = "";
   state.threadID = "";
   state.currentCache = null;
   state.conversationVersion += 1;
-  peerName.textContent = "Chọn một tài khoản";
-  historyElement.innerHTML = '<p class="empty">Chọn một tài khoản để bắt đầu chat.</p>';
+  peerName.textContent = "Chọn cuộc trò chuyện";
+  threadStatus.textContent = "";
+  historyElement.replaceChildren();
+  const empty = document.createElement("p");
+  empty.className = "empty";
+  empty.textContent = "Chọn tài khoản hoặc nhóm để bắt đầu chat.";
+  historyElement.append(empty);
   contentInput.value = "";
-  contentInput.disabled = true;
+  membersPanel.hidden = true;
+  membersButton.hidden = true;
   updateSendButton();
   loadOlderButton.hidden = true;
-  loadOlderButton.disabled = true;
 }
-
 function clearSession() {
   stopWebSocket();
+  state.sessionAbort.abort();
+  state.sessionAbort = new AbortController();
   sessionStorage.removeItem(sessionTokenKey);
   sessionStorage.removeItem(sessionUsernameKey);
   state.sessionVersion += 1;
@@ -155,358 +156,288 @@ function clearSession() {
   state.currentUserID = "";
   state.currentUsername = "";
   state.users = [];
-  state.threadsByPeer = new Map();
-  state.threadCaches = new Map();
+  state.threads = new Map();
   state.directRequestsByPeer = new Map();
-  state.threadEventSeqs = new Map();
-  state.threadSummaryBaseSeqs = new Map();
   state.threadListRequest = null;
   state.threadListDirty = false;
   state.threadListCatchup = false;
-  if (state.threadSummaryTimer !== null) {
-    clearTimeout(state.threadSummaryTimer);
-    state.threadSummaryTimer = null;
-  }
-  state.socketSummaryStale = false;
+  state.membershipSerial = 0;
+  state.groupCreation = null;
+  if (state.visibilityFrame !== null) cancelAnimationFrame(state.visibilityFrame);
+  state.visibilityFrame = null;
+  state.renderedScrollTop = null;
+  createGroupButton.disabled = false;
+  recoverGroupButton.hidden = true;
+  groupForm.reset();
+  if (state.threadSummaryTimer !== null) clearTimeout(state.threadSummaryTimer);
+  state.threadSummaryTimer = null;
   resetConversation();
   authView.hidden = false;
   chatView.hidden = true;
   logoutButton.hidden = true;
   currentUsername.textContent = "";
+  peerList.replaceChildren();
+  directThreadList.replaceChildren();
+  groupThreadList.replaceChildren();
+  newDirectSection.hidden = true;
+  groupUsers.replaceChildren();
 }
-
 function showChatView() {
   authView.hidden = true;
   chatView.hidden = false;
   logoutButton.hidden = false;
   currentUsername.textContent = state.currentUsername;
 }
-
 function currentSessionMatches(sessionVersion, token) {
   return sessionVersion === state.sessionVersion && token === state.token && Boolean(token);
 }
-
 function conversationSnapshot() {
-  return {
-    sessionVersion: state.sessionVersion,
-    token: state.token,
-    version: state.conversationVersion,
-    threadID: state.threadID,
-    cache: state.currentCache,
-  };
+  return { ...cacheSnapshot(state.currentCache), version: state.conversationVersion };
 }
-
 function newThreadCache(threadID) {
-  return {
-    threadID,
+  return { threadID, summary: null, active: false, permissionsPending: false,
+    membershipEpoch: 0, members: null, membersDirty: true, membersRequest: null,
+    memberMutation: null, eventMessages: new Map(), summaryBaseSeq: 0,
     messages: new Map(), messageIDs: new Map(), messagesLoaded: false,
-    syncedSeq: 0, nextCursor: null, lastReadSeq: 0, peerLastReadSeq: 0,
+    confirmedRanges: [], syncedSeq: 0, nextCursor: null, lastReadSeq: 0, peerLastReadSeq: 0,
     seenReceivedSeqs: new Set(), initialHistoryRequest: null,
-    syncAfterInitial: false, catchupRequest: null, catchupTargetSeq: 0,
+    catchupRequest: null, catchupTargetSeq: 0, catchupRecordVisibility: false,
     olderRequest: null, readRequest: null, pendingReadSeq: 0,
-    pendingSend: null, draftContent: "",
-  };
+    pendingSend: null, draftContent: "" };
 }
-
 function cacheForThread(threadID) {
-  let cache = state.threadCaches.get(threadID);
-  if (!cache) {
-    cache = newThreadCache(threadID);
-    state.threadCaches.set(threadID, cache);
-  }
-  return cache;
+  if (!state.threads.has(threadID)) state.threads.set(threadID, newThreadCache(threadID));
+  return state.threads.get(threadID);
 }
-
 function cacheSnapshot(cache) {
   return { sessionVersion: state.sessionVersion, token: state.token,
-    threadID: cache.threadID, cache };
+    threadID: cache?.threadID || "", cache, membershipEpoch: cache?.membershipEpoch };
 }
-
 function cacheSnapshotMatches(snapshot) {
   return currentSessionMatches(snapshot.sessionVersion, snapshot.token) &&
-    state.threadCaches.get(snapshot.threadID) === snapshot.cache;
+    state.threads.get(snapshot.threadID) === snapshot.cache;
 }
-
 function currentConversationMatches(snapshot) {
-  return (
-    currentSessionMatches(snapshot.sessionVersion, snapshot.token) &&
-    snapshot.version === state.conversationVersion &&
-    snapshot.threadID === state.threadID &&
-    snapshot.cache === state.currentCache &&
-    Boolean(snapshot.threadID)
-  );
+  return cacheSnapshotMatches(snapshot) && snapshot.version === state.conversationVersion &&
+    snapshot.threadID === state.threadID && snapshot.cache === state.currentCache;
 }
-
-function peerByID(id) {
-  return state.users.find((user) => user.id === id);
+function membershipSnapshotMatches(snapshot) {
+  return cacheSnapshotMatches(snapshot) && snapshot.membershipEpoch === snapshot.cache.membershipEpoch;
 }
-
+function peerByID(id) { return state.users.find((user) => user.id === id); }
+function threadTitle(thread) { return thread.kind === "group" ? thread.name : thread.peer?.username || "Chat 1-1"; }
+function directThreadForPeer(peerID) {
+  return [...state.threads.values()].find((cache) => cache.summary?.kind === "direct" &&
+    cache.summary.peer?.id === peerID);
+}
 function renderPeerList() {
-  peerList.replaceChildren();
-  const peers = state.users.filter((user) => user.id !== state.currentUserID);
-
-  if (peers.length === 0) {
-    const empty = document.createElement("p");
-    empty.className = "empty";
-    empty.textContent = "Chưa có tài khoản khác.";
-    peerList.append(empty);
-    return;
-  }
-
-  for (const user of peers) {
-    const thread = state.threadsByPeer.get(user.id);
-    const unreadCount = Number(thread?.unread_count || 0);
+  directThreadList.replaceChildren();
+  groupThreadList.replaceChildren();
+  for (const cache of state.threads.values()) {
+    const thread = cache.summary;
+    if (!thread) continue;
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `peer${user.id === state.peerID ? " active" : ""}`;
-
+    button.className = `peer${thread.id === state.threadID ? " active" : ""}`;
     const name = document.createElement("span");
-    name.textContent = user.username;
+    name.textContent = `${threadTitle(thread)}${thread.kind === "group"
+      ? cache.active ? ` · ${thread.member_count} người` : " · Đã rời (lịch sử)" : ""}`;
     button.append(name);
-
-    if (unreadCount > 0) {
+    const unread = cache.active ? Number(thread.unread_count || 0) : 0;
+    if (unread > 0) {
       const badge = document.createElement("span");
       badge.className = "unread-badge";
-      badge.textContent = unreadCount > 99 ? "99+" : String(unreadCount);
-      badge.setAttribute("aria-label", `${unreadCount} tin chưa đọc`);
+      badge.textContent = unread > 99 ? "99+" : String(unread);
+      badge.setAttribute("aria-label", `${unread} tin chưa đọc`);
       button.append(badge);
     }
-
-    button.addEventListener("click", () => openConversation(user.id));
+    button.addEventListener("click", () => openThread(thread.id));
+    (thread.kind === "group" ? groupThreadList : directThreadList).append(button);
+  }
+  for (const [list, text] of [[directThreadList, "Chưa có cuộc trò chuyện 1-1."],
+    [groupThreadList, "Chưa tham gia nhóm nào."]]) {
+    if (list.children.length) continue;
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = text;
+    list.append(empty);
+  }
+  peerList.replaceChildren();
+  const newPeers = state.users.filter((user) => user.id !== state.currentUserID && !directThreadForPeer(user.id));
+  newDirectSection.hidden = newPeers.length === 0;
+  for (const user of newPeers) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "peer";
+    button.textContent = user.username;
+    button.addEventListener("click", () => openDirect(user.id));
     peerList.append(button);
   }
 }
-
 async function loadUsers() {
-  const sessionVersion = state.sessionVersion;
-  const token = state.token;
+  const sessionVersion = state.sessionVersion, token = state.token;
   const users = await apiRequest("/users");
-  if (!currentSessionMatches(sessionVersion, token)) {
-    return;
-  }
-
+  if (!currentSessionMatches(sessionVersion, token)) return;
   const me = users.find((user) => user.id === state.currentUserID);
-  if (!me) {
-    clearSession();
-    throw new Error("Tài khoản của phiên đăng nhập không còn tồn tại.");
-  }
-
+  if (!me) { clearSession(); throw new Error("Tài khoản không còn tồn tại."); }
   state.users = users;
   state.currentUsername = me.username;
   sessionStorage.setItem(sessionUsernameKey, me.username);
   currentUsername.textContent = me.username;
-
-  if (state.peerID && !peerByID(state.peerID)) {
-    resetConversation();
+  groupUsers.replaceChildren();
+  for (const user of users.filter((user) => user.id !== state.currentUserID)) {
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox"; checkbox.value = user.id;
+    const name = document.createElement("span"); name.textContent = user.username;
+    label.append(checkbox, name); groupUsers.append(label);
   }
   renderPeerList();
 }
-
-function applyCurrentThreadSummary(thread) {
-  if (!thread) {
-    return;
+function receivedText(message) {
+  return message.sender_id !== state.currentUserID && message.kind !== "system";
+}
+function countReceived(cache, low, high) {
+  return [...cache.messages.values()].filter((message) =>
+    message.seq > low && message.seq <= high && receivedText(message)).length;
+}
+function reconcileThreadSummary(thread) {
+  const cache = cacheForThread(thread.id);
+  const old = cache.summary;
+  const rejoined = old && thread.kind === "group" && Number(old.joined_seq) !== Number(thread.joined_seq);
+  if (rejoined) {
+    cache.membershipEpoch += 1;
+    cache.lastReadSeq = Number(thread.last_read_seq || 0);
+    cache.pendingReadSeq = 0;
+    cache.readRequest = null;
+    cache.seenReceivedSeqs.clear();
+    cache.members = null;
+    cache.membersDirty = true;
+  } else if (cache.lastReadSeq > Number(thread.last_read_seq || 0)) {
+    thread.unread_count = Math.max(0, Number(thread.unread_count || 0) -
+      countReceived(cache, Number(thread.last_read_seq || 0), cache.lastReadSeq));
   }
-  const cache = state.threadCaches.get(thread.id);
-  if (!cache) return;
-  const previousPeerMarker = cache.peerLastReadSeq;
   cache.lastReadSeq = Math.max(cache.lastReadSeq, Number(thread.last_read_seq || 0));
-  cache.peerLastReadSeq = Math.max(cache.peerLastReadSeq, Number(thread.peer_last_read_seq || 0));
-  if (state.currentCache === cache && cache.messagesLoaded && previousPeerMarker !== cache.peerLastReadSeq) {
-    renderMessages("preserve", false);
-  }
-}
-
-function updateThreadFromMessage(message) {
-  const seq = Number(message.seq);
-  if (!Number.isSafeInteger(seq) || seq <= 0) {
-    return;
-  }
-  const thread = [...state.threadsByPeer.values()].find((item) => item.id === message.thread_id);
-  const baseline = state.threadSummaryBaseSeqs.get(message.thread_id) ?? Number(thread?.last_seq || 0);
-  if (seq <= baseline) {
-    return;
-  }
-  let events = state.threadEventSeqs.get(message.thread_id);
-  if (!events) {
-    events = new Map();
-    state.threadEventSeqs.set(message.thread_id, events);
-  }
-  if (events.has(seq)) {
-    return;
-  }
-  events.set(seq, message);
-  if (!thread) {
-    // A thread opened in another tab may not be in our initial list yet.
-    if (state.threadListRequest) {
-      state.threadListDirty = true;
+  thread.last_read_seq = cache.lastReadSeq;
+  cache.peerLastReadSeq = thread.kind === "direct"
+    ? Math.max(cache.peerLastReadSeq, Number(thread.peer_last_read_seq || 0)) : 0;
+  cache.summaryBaseSeq = Number(thread.last_seq || 0);
+  for (const [seq, message] of cache.eventMessages) {
+    if (seq <= cache.summaryBaseSeq) cache.eventMessages.delete(seq);
+    else {
+      thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
+      if (receivedText(message) && seq > cache.lastReadSeq) thread.unread_count += 1;
     }
-    void loadThreads();
-    return;
   }
-  thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
-  if (message.sender_id !== state.currentUserID && message.kind !== "system" &&
-      seq > Number(thread.last_read_seq || 0)) {
-    thread.unread_count = Number(thread.unread_count || 0) + 1;
+  cache.summary = thread;
+  cache.active = true;
+  cache.permissionsPending = false;
+  return cache;
+}
+function deactivateGroup(cache) {
+  if (cache.active) cache.membershipEpoch += 1;
+  cache.active = false;
+  cache.permissionsPending = false;
+  cache.pendingReadSeq = 0;
+  cache.members = null;
+  if (cache.summary) cache.summary.unread_count = 0;
+}
+function updateThreadFromMessage(message) {
+  const cache = cacheForThread(message.thread_id);
+  const seq = Number(message.seq);
+  if (!Number.isSafeInteger(seq) || seq <= 0 || seq <= cache.summaryBaseSeq || cache.eventMessages.has(seq)) return;
+  cache.eventMessages.set(seq, message);
+  const thread = cache.summary;
+  if (!thread) scheduleThreadSummaryRefresh();
+  else {
+    thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
+    if (cache.active && receivedText(message) && seq > cache.lastReadSeq) thread.unread_count += 1;
+  }
+  if (message.kind === "system") {
+    state.membershipSerial += 1;
+    cache.permissionsPending = true;
+    cache.membersDirty = true;
+    if (state.threadListRequest) state.threadListDirty = true;
+    scheduleThreadSummaryRefresh();
+    if (state.currentCache === cache) renderThreadHeading();
   }
   renderPeerList();
 }
-
-function acceptMessage(message) {
+function acceptMessage(message, recordVisibility = true) {
   const cache = cacheForThread(message.thread_id);
-  const changed = MiniHermesRealtime.merge(cache.messages, cache.messageIDs, [message]);
-  if (cache.messagesLoaded) {
-    if (Number(message.seq) > cache.syncedSeq + 1) {
-      void catchUpConversation(cache, Number(message.seq));
-    } else {
-      while (cache.messages.has(cache.syncedSeq + 1)) {
-        cache.syncedSeq += 1;
-      }
-    }
+  const changed = mergeMessages(cache, [message]);
+  if (cache.messagesLoaded && changed) {
+    const seq = Number(message.seq);
+    MiniHermesRealtime.confirmRange(cache.confirmedRanges, seq, seq);
+    if (seq > cache.syncedSeq + 1) void catchUpConversation(cache, seq, recordVisibility);
+    else while (cache.messages.has(cache.syncedSeq + 1)) cache.syncedSeq += 1;
   }
   return { cache, changed };
 }
-
-function reconcileThreadSummary(thread) {
-  const old = state.threadsByPeer.get(thread.peer.id);
-  const baseSeq = Number(thread.last_seq || 0);
-  const events = state.threadEventSeqs.get(thread.id);
-  const oldReadSeq = Number(old?.last_read_seq || 0);
-  const freshReadSeq = Number(thread.last_read_seq || 0);
-  const cache = state.threadCaches.get(thread.id);
-  if (oldReadSeq > freshReadSeq && cache) {
-    let newlyRead = 0;
-    for (let seq = freshReadSeq + 1; seq <= oldReadSeq; seq += 1) {
-      const message = cache.messages.get(seq);
-      if (message && message.sender_id !== state.currentUserID && message.kind !== "system") {
-        newlyRead += 1;
-      }
-    }
-    thread.last_read_seq = oldReadSeq;
-    thread.unread_count = Math.max(0, Number(thread.unread_count || 0) - newlyRead);
-  }
-  state.threadSummaryBaseSeqs.set(thread.id, baseSeq);
-  if (events) {
-    for (const [seq, message] of events) {
-      if (seq <= baseSeq) {
-        events.delete(seq);
-      } else {
-        thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
-        if (message.sender_id !== state.currentUserID && message.kind !== "system" &&
-            seq > Number(thread.last_read_seq || 0)) {
-          thread.unread_count = Number(thread.unread_count || 0) + 1;
-        }
-      }
-    }
-  }
-  return thread;
-}
-
 function applyLocalReadMarker(threadID, previous, current) {
-  const thread = [...state.threadsByPeer.values()].find((item) => item.id === threadID);
-  const cache = state.threadCaches.get(threadID);
-  if (!thread || !cache || current <= previous) {
-    return;
-  }
-  thread.last_read_seq = Math.max(Number(thread.last_read_seq || 0), current);
-  let newlyRead = 0;
-  for (let seq = previous + 1; seq <= current; seq += 1) {
-    const message = cache.messages.get(seq);
-    if (message && message.sender_id !== state.currentUserID && message.kind !== "system") {
-      newlyRead += 1;
-    }
-  }
-  thread.unread_count = Math.max(0, Number(thread.unread_count || 0) - newlyRead);
+  const cache = state.threads.get(threadID);
+  if (!cache?.summary || !cache.active || current <= previous) return;
+  cache.summary.last_read_seq = current;
+  cache.summary.unread_count = Math.max(0, Number(cache.summary.unread_count || 0) - countReceived(cache, previous, current));
   renderPeerList();
 }
-
 function scheduleThreadSummaryRefresh() {
-  if (state.threadSummaryTimer !== null) {
-    clearTimeout(state.threadSummaryTimer);
-  }
-  const sessionVersion = state.sessionVersion;
-  const token = state.token;
+  if (state.threadSummaryTimer !== null) return;
+  const sessionVersion = state.sessionVersion, token = state.token;
   state.threadSummaryTimer = setTimeout(() => {
     state.threadSummaryTimer = null;
-    if (!currentSessionMatches(sessionVersion, token)) {
-      return;
-    }
-    if (state.threadListRequest) {
-      state.threadListDirty = true;
-    } else {
-      void loadThreads();
-    }
+    if (currentSessionMatches(sessionVersion, token)) void loadThreads();
   }, threadSummaryDebounceMs);
 }
-
 async function loadThreads(catchUpCached = false) {
-  if (!state.token) {
-    return;
-  }
-  if (state.threadSummaryTimer !== null) {
-    clearTimeout(state.threadSummaryTimer);
-    state.threadSummaryTimer = null;
-  }
-  const sessionVersion = state.sessionVersion;
-  const token = state.token;
-  if (
-    state.threadListRequest &&
-    state.threadListRequest.sessionVersion === sessionVersion &&
-    state.threadListRequest.token === token
-  ) {
-    if (catchUpCached) {
-      state.threadListDirty = true;
-      state.threadListCatchup = true;
-    }
-    return;
-  }
-
-  const request = { sessionVersion, token };
+  if (!state.token) return;
+  state.threadListCatchup ||= catchUpCached;
+  if (state.threadSummaryTimer !== null) clearTimeout(state.threadSummaryTimer);
+  state.threadSummaryTimer = null;
+  if (state.threadListRequest) return state.threadListRequest.promise;
+  const sessionVersion = state.sessionVersion, token = state.token;
+  const request = {};
   state.threadListRequest = request;
-  try {
-    const threads = await apiRequest("/threads");
-    if (!currentSessionMatches(sessionVersion, token)) {
-      return;
-    }
-
-    const refreshed = new Map();
-    for (const thread of threads) {
-      // This demo currently renders direct chats; group REST support is separate.
-      if (thread.kind !== "direct" || !thread.peer) continue;
-      const serverLastSeq = Number(thread.last_seq || 0);
-      refreshed.set(thread.peer.id, reconcileThreadSummary(thread));
-      const cache = state.threadCaches.get(thread.id);
-      if (catchUpCached && cache?.messagesLoaded && serverLastSeq > cache.syncedSeq) {
-        void catchUpConversation(cache, serverLastSeq);
-      }
-    }
-    // A direct-thread POST may have completed after this list request began.
-    for (const [peerID, thread] of state.threadsByPeer) {
-      if (!refreshed.has(peerID)) {
-        refreshed.set(peerID, thread);
-        const cache = state.threadCaches.get(thread.id);
-        if (catchUpCached && cache?.messagesLoaded) {
-          void catchUpConversation(cache);
-        }
-      }
-    }
-    state.threadsByPeer = refreshed;
-    for (const thread of refreshed.values()) applyCurrentThreadSummary(thread);
-    renderPeerList();
-  } catch (error) {
-    if (currentSessionMatches(sessionVersion, token)) {
-      showError(error.message);
-    }
-  } finally {
-    if (state.threadListRequest === request) {
-      state.threadListRequest = null;
-      if (state.threadListDirty && currentSessionMatches(sessionVersion, token)) {
+  request.promise = (async () => {
+    try {
+      do {
         state.threadListDirty = false;
-        const retryCatchup = state.threadListCatchup;
+        const serial = state.membershipSerial;
+        const threads = await apiRequest("/threads");
+        if (!currentSessionMatches(sessionVersion, token)) return;
+        // A membership event or local mutation after GET began invalidates its permissions.
+        if (serial !== state.membershipSerial) { state.threadListDirty = true; continue; }
+        const activeIDs = new Set(threads.map((thread) => thread.id));
+        for (const thread of threads) {
+          const cache = reconcileThreadSummary(thread);
+          if (cache.messagesLoaded && (state.threadListCatchup || cache.syncedSeq < Number(thread.last_seq))) {
+            void catchUpConversation(cache, Number(thread.last_seq));
+          }
+        }
+        for (const cache of state.threads.values()) {
+          if (cache.summary?.kind === "group" && !activeIDs.has(cache.threadID)) {
+            const wasActive = cache.active;
+            deactivateGroup(cache);
+            // Also recover the removal/leave notice if it happened while offline.
+            if (wasActive && cache.messagesLoaded) void catchUpConversation(cache);
+          }
+        }
+        renderPeerList();
+        renderThreadHeading();
+        const cache = state.currentCache;
+        if (cache?.messagesLoaded) renderMessages("preserve", false);
+        if (cache?.summary?.kind === "group" && cache.active && !membersPanel.hidden && cache.membersDirty) {
+          void loadMembers(cache);
+        }
         state.threadListCatchup = false;
-        void loadThreads(retryCatchup);
-      }
+      } while (state.threadListDirty && currentSessionMatches(sessionVersion, token));
+    } catch (error) {
+      if (currentSessionMatches(sessionVersion, token)) showError(error.message);
+    } finally {
+      if (state.threadListRequest === request) state.threadListRequest = null;
     }
-  }
+  })();
+  return request.promise;
 }
 
 function displayName(userID) {
@@ -535,6 +466,7 @@ function highestMessageSeq(cache) {
 function renderMessages(scrollMode = "preserve", recordVisibility = true) {
   const cache = state.currentCache;
   if (!cache) return;
+  const renderVersion = ++state.renderVersion;
   const previousHeight = historyElement.scrollHeight;
   const previousTop = historyElement.scrollTop;
   const wasNearBottom = previousHeight - previousTop - historyElement.clientHeight < 48;
@@ -550,7 +482,7 @@ function renderMessages(scrollMode = "preserve", recordVisibility = true) {
     for (const message of messages) {
       const sent = message.sender_id === state.currentUserID;
       const item = document.createElement("article");
-      item.className = `message ${sent ? "sent" : "received"}`;
+      item.className = `message ${message.kind === "system" ? "system" : sent ? "sent" : "received"}`;
       item.dataset.seq = String(message.seq);
       item.dataset.kind = message.kind;
 
@@ -564,7 +496,7 @@ function renderMessages(scrollMode = "preserve", recordVisibility = true) {
         day: "2-digit",
         month: "2-digit",
       });
-      const readStatus = sent && message.seq <= cache.peerLastReadSeq ? " · Đã đọc" : "";
+      const readStatus = cache.summary?.kind === "direct" && sent && message.seq <= cache.peerLastReadSeq ? " · Đã đọc" : "";
       meta.textContent = `${displayName(message.sender_id)} · ${time}${readStatus}`;
       item.append(content, meta);
       historyElement.append(item);
@@ -578,12 +510,17 @@ function renderMessages(scrollMode = "preserve", recordVisibility = true) {
   } else {
     historyElement.scrollTop = previousTop;
   }
+  // Rendering may produce a scroll event even when the user did not scroll.
+  // Background catchup and sending must not mark newly fetched messages read.
+  state.renderedScrollTop = historyElement.scrollTop;
 
   loadOlderButton.hidden = cache.nextCursor === null;
   loadOlderButton.disabled = cache.nextCursor === null || Boolean(cache.olderRequest);
   if (recordVisibility) {
     const snapshot = conversationSnapshot();
-    requestAnimationFrame(() => recordVisibleMessages(snapshot));
+    requestAnimationFrame(() => {
+      if (renderVersion === state.renderVersion) recordVisibleMessages(snapshot);
+    });
   }
 }
 
@@ -596,95 +533,77 @@ function pageURL(threadID, beforeSeq = null) {
 }
 
 async function loadInitialHistory(cache = state.currentCache) {
-  if (!cache || !state.token || cache.messagesLoaded) {
-    return;
-  }
+  if (!cache || !state.token || cache.messagesLoaded) return;
+  if (cache.initialHistoryRequest) return cache.initialHistoryRequest.promise;
   const snapshot = cacheSnapshot(cache);
-  if (cache.initialHistoryRequest) {
-    cache.syncAfterInitial = true;
-    return;
-  }
-  const request = { ...snapshot };
+  const request = {};
   cache.initialHistoryRequest = request;
-  try {
-    const page = await apiRequest(pageURL(snapshot.threadID));
-    if (!cacheSnapshotMatches(snapshot)) {
-      return;
+  request.promise = (async () => {
+    try {
+      const page = await apiRequest(pageURL(snapshot.threadID));
+      if (!cacheSnapshotMatches(snapshot)) return;
+      mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
+      cache.nextCursor = page.next_cursor ?? null;
+      cache.syncedSeq = MiniHermesRealtime.confirmPage(cache, page);
+      cache.messagesLoaded = true;
+      if (state.currentCache === cache) renderMessages("initial");
+      const target = Math.max(highestMessageSeq(cache), Number(cache.summary?.last_seq || 0));
+      if (target > cache.syncedSeq) await catchUpConversation(cache, target);
+    } catch (error) {
+      if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+    } finally {
+      if (cache.initialHistoryRequest === request) cache.initialHistoryRequest = null;
     }
-    const messages = Array.isArray(page.messages) ? page.messages : [];
-    mergeMessages(cache, messages);
-    cache.nextCursor = page.next_cursor ?? null;
-    cache.syncedSeq = Math.max(0, ...messages.map((message) => Number(message.seq) || 0));
-    cache.messagesLoaded = true;
-    if (state.currentCache === cache) {
-      renderMessages("initial");
-      showError("");
-    }
-    // An event could have arrived while the first REST page was in flight.
-    if (cache.syncAfterInitial || highestMessageSeq(cache) > cache.syncedSeq) {
-      cache.syncAfterInitial = false;
-      await catchUpConversation(cache);
-    }
-  } catch (error) {
-    if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
-      showError(error.message);
-    }
-  } finally {
-    if (cache.initialHistoryRequest === request) {
-      cache.initialHistoryRequest = null;
-    }
-  }
+  })();
+  return request.promise;
 }
 
-async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
-  if (!cache || state.threadCaches.get(cache.threadID) !== cache || !cache.messagesLoaded || !state.token) {
-    return;
-  }
+async function catchUpConversation(cache = state.currentCache, targetSeq = 0, recordVisibility = false) {
+  if (!cache || state.threads.get(cache.threadID) !== cache || !cache.messagesLoaded || !state.token) return;
+  cache.catchupRecordVisibility ||= recordVisibility;
   if (cache.catchupRequest) {
     cache.catchupTargetSeq = Math.max(cache.catchupTargetSeq, targetSeq);
-    return;
+    return cache.catchupRequest.promise;
   }
   const snapshot = cacheSnapshot(cache);
-  const request = { ...snapshot };
+  const request = {};
   cache.catchupRequest = request;
-  const baseline = cache.syncedSeq;
-  const stale = new Error("session changed");
-  let completed = false;
-  try {
-    const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
-      async (beforeSeq) => {
-        const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
-        if (!cacheSnapshotMatches(snapshot)) {
-          throw stale;
-        }
-        return page;
-      },
-      baseline,
-      (messages) => mergeMessages(cache, messages),
-    );
-    if (!cacheSnapshotMatches(snapshot)) {
-      return;
-    }
-    cache.syncedSeq = Math.max(cache.syncedSeq, maxSeq);
-    completed = true;
-    if (state.currentCache === cache) {
-      renderMessages("new");
-      showError("");
-    }
-  } catch (error) {
-    if (error !== stale && cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
-      showError(error.message);
-    }
-  } finally {
-    if (cache.catchupRequest === request) {
+  request.promise = (async () => {
+    const baseline = cache.syncedSeq;
+    let completed = false;
+    try {
+      const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
+        async (beforeSeq) => {
+          const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
+          if (!cacheSnapshotMatches(snapshot)) throw new Error("session changed");
+          return page;
+        }, baseline,
+        (messages, page, beforeSeq) => {
+          mergeMessages(cache, messages);
+          MiniHermesRealtime.confirmPage(cache, page, beforeSeq);
+        },
+      );
+      if (!cacheSnapshotMatches(snapshot)) return;
+      cache.syncedSeq = Math.max(cache.syncedSeq, maxSeq);
+      completed = true;
+      if (state.currentCache === cache) renderMessages("new", cache.catchupRecordVisibility);
+    } catch (error) {
+      if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+    } finally {
+      if (cache.catchupRequest !== request) return;
       cache.catchupRequest = null;
       const nextTarget = cache.catchupTargetSeq;
+      const visible = cache.catchupRecordVisibility;
       cache.catchupTargetSeq = 0;
-      if (completed && nextTarget > cache.syncedSeq && cacheSnapshotMatches(snapshot)) {
-        void catchUpConversation(cache);
+      cache.catchupRecordVisibility = false;
+      // Only a newer event received during this fetch can cause one more pass.
+      // The same inaccessible target must never keep a group in a sync loop.
+      if (completed && nextTarget > cache.syncedSeq && nextTarget > targetSeq && cacheSnapshotMatches(snapshot)) {
+        void catchUpConversation(cache, nextTarget, visible);
       }
     }
-  }
+  })();
+  return request.promise;
 }
 
 async function syncCurrentConversation() {
@@ -807,7 +726,6 @@ function handleSocketMessage(data) {
   } catch {
     return;
   }
-  if (event.thread_kind === "group") return;
   const seq = Number(event.seq);
   if (event.type !== "message.created" || event.recipient_id !== state.currentUserID ||
       typeof event.message_id !== "string" || typeof event.thread_id !== "string" ||
@@ -925,6 +843,7 @@ async function loadOlderMessages() {
       return;
     }
     mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
+    MiniHermesRealtime.confirmPage(cache, page, request.beforeSeq);
     cache.nextCursor = page.next_cursor ?? null;
     if (state.currentCache === cache) {
       renderMessages("older");
@@ -972,26 +891,9 @@ function recordVisibleMessages(snapshot = conversationSnapshot()) {
     }
   }
 
-  let candidate = cache.lastReadSeq;
-  let sawReceived = false;
-  while (true) {
-    const nextSeq = candidate + 1;
-    const message = cache.messages.get(nextSeq);
-    if (!message) {
-      break;
-    }
-    if (message.sender_id !== state.currentUserID && message.kind !== "system") {
-      if (!cache.seenReceivedSeqs.has(nextSeq)) {
-        break;
-      }
-      sawReceived = true;
-    }
-    candidate = nextSeq;
-  }
-
-  if (sawReceived && candidate > cache.lastReadSeq) {
-    queueReadMarker(candidate, snapshot);
-  }
+  if (!canUseThread(cache)) return;
+  const candidate = MiniHermesRealtime.visibleReadCandidate(cache, state.currentUserID);
+  if (candidate > cache.lastReadSeq) queueReadMarker(candidate, snapshot);
 }
 
 function queueReadMarker(lastReadSeq, snapshot) {
@@ -1005,7 +907,7 @@ function queueReadMarker(lastReadSeq, snapshot) {
 async function flushReadMarker(snapshot = conversationSnapshot()) {
   const cache = snapshot.cache;
   if (
-    !cache || cache.readRequest ||
+    !canUseThread(cache) || cache.readRequest ||
     cache.pendingReadSeq <= cache.lastReadSeq ||
     !currentConversationMatches(snapshot) ||
     document.visibilityState !== "visible"
@@ -1024,9 +926,7 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ last_read_seq: target }),
     });
-    if (!cacheSnapshotMatches(snapshot)) {
-      return;
-    }
+    if (!membershipSnapshotMatches(snapshot) || !canUseThread(cache)) return;
 
     const previousReadSeq = cache.lastReadSeq;
     cache.lastReadSeq = Math.max(cache.lastReadSeq, Number(response.last_read_seq || 0));
@@ -1042,102 +942,247 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
       }
     }
   } catch (error) {
-    if (cacheSnapshotMatches(snapshot)) {
+    if (membershipSnapshotMatches(snapshot) && canUseThread(cache)) {
       // PUT may have committed despite a lost response; retrying a monotonic marker is safe.
       cache.pendingReadSeq = Math.max(cache.pendingReadSeq, target);
     }
-    if (currentConversationMatches(snapshot)) {
-      showError(error.message);
-    }
+    if (cacheSnapshotMatches(snapshot) && error.status === 403) void loadThreads();
+    if (currentConversationMatches(snapshot)) showError(error.message);
   } finally {
     if (cache.readRequest === request) {
       cache.readRequest = null;
     }
-    if (completed && currentConversationMatches(snapshot)) {
+    if (completed && membershipSnapshotMatches(snapshot) && currentConversationMatches(snapshot)) {
       recordVisibleMessages(snapshot);
-    } else if (completed && state.currentCache === cache) {
+    } else if (completed && membershipSnapshotMatches(snapshot) && state.currentCache === cache) {
       recordVisibleMessages();
     }
   }
 }
 
-async function openConversation(peerID) {
-  if (state.currentCache) {
-    state.currentCache.draftContent = contentInput.value;
-  }
-  const version = ++state.conversationVersion;
-  const sessionVersion = state.sessionVersion;
-  const token = state.token;
-  state.peerID = peerID;
-  state.threadID = "";
-  state.currentCache = null;
+async function openThread(threadID) {
+  const cache = state.threads.get(threadID);
+  if (!cache?.summary) return;
+  if (state.currentCache) state.currentCache.draftContent = contentInput.value;
+  state.conversationVersion += 1;
+  state.threadID = threadID;
+  state.currentCache = cache;
+  contentInput.value = cache.draftContent;
+  membersPanel.hidden = true;
   renderPeerList();
-
-  const peer = peerByID(peerID);
-  peerName.textContent = peer?.username || "Đang mở...";
-  historyElement.innerHTML = '<p class="empty">Đang tải lịch sử...</p>';
-  contentInput.disabled = true;
-  sendButton.disabled = true;
-  loadOlderButton.hidden = true;
+  renderThreadHeading();
   showError("");
+  if (cache.messagesLoaded) renderMessages("initial");
+  else {
+    historyElement.replaceChildren();
+    loadOlderButton.hidden = true;
+    await loadInitialHistory(cache);
+  }
+  if (state.currentCache === cache) {
+    void flushReadMarker();
+    if (canUseThread(cache)) contentInput.focus();
+  }
+}
 
+async function openDirect(peerID) {
+  const cached = directThreadForPeer(peerID);
+  if (cached) return openThread(cached.threadID);
+  if (state.currentCache) state.currentCache.draftContent = contentInput.value;
+  const version = ++state.conversationVersion;
+  const sessionVersion = state.sessionVersion, token = state.token;
+  state.currentCache = null;
+  state.threadID = "";
+  renderThreadHeading();
   try {
-    let thread = state.threadsByPeer.get(peerID);
-    if (!thread) {
-      let request = state.directRequestsByPeer.get(peerID);
-      if (!request) {
-        request = apiRequest("/threads/direct", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ peer_id: peerID }),
-        });
-        state.directRequestsByPeer.set(peerID, request);
-        void request.finally(() => {
-          if (state.directRequestsByPeer.get(peerID) === request) {
-            state.directRequestsByPeer.delete(peerID);
-          }
-        }).catch(() => {});
-      }
-      thread = await request;
-      if (!currentSessionMatches(sessionVersion, token)) return;
-      thread = reconcileThreadSummary(thread);
-      state.threadsByPeer.set(peerID, thread);
-      renderPeerList();
+    let request = state.directRequestsByPeer.get(peerID);
+    if (!request) {
+      request = apiRequest("/threads/direct", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ peer_id: peerID }) });
+      state.directRequestsByPeer.set(peerID, request);
+      void request.finally(() => {
+        if (state.directRequestsByPeer.get(peerID) === request) state.directRequestsByPeer.delete(peerID);
+      }).catch(() => {});
     }
-    if (
-      version !== state.conversationVersion ||
-      peerID !== state.peerID ||
-      !currentSessionMatches(sessionVersion, token)
-    ) {
-      return;
-    }
-
-    state.threadID = thread.id;
-    const cache = cacheForThread(thread.id);
-    state.currentCache = cache;
-    contentInput.value = cache.draftContent;
-    applyCurrentThreadSummary(thread);
+    const thread = await request;
+    if (!currentSessionMatches(sessionVersion, token)) return;
+    reconcileThreadSummary(thread);
     renderPeerList();
-    contentInput.disabled = false;
-    updateSendButton();
-    if (cache.messagesLoaded) {
-      renderMessages("initial");
-    } else {
-      await loadInitialHistory(cache);
-    }
-    if (state.currentCache === cache) {
-      void flushReadMarker();
-    }
-    if (version === state.conversationVersion && thread.id === state.threadID &&
-        currentSessionMatches(sessionVersion, token)) {
-      contentInput.focus();
-    }
+    if (version === state.conversationVersion) await openThread(thread.id);
   } catch (error) {
-    if (version === state.conversationVersion && currentSessionMatches(sessionVersion, token)) {
-      showError(error.message);
+    if (version === state.conversationVersion && currentSessionMatches(sessionVersion, token)) showError(error.message);
+  }
+}
+
+function renderMembers(cache) {
+  if (state.currentCache !== cache || membersPanel.hidden) return;
+  memberList.replaceChildren();
+  const admin = canUseThread(cache) && cache.summary.role === "admin";
+  for (const member of cache.members || []) {
+    const item = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = `${member.username} · ${member.role === "admin" ? "Quản trị viên" : "Thành viên"}`;
+    item.append(label);
+    if (admin && member.id !== state.currentUserID) {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Xóa";
+      remove.disabled = Boolean(cache.memberMutation);
+      remove.addEventListener("click", () => changeMembership(cache, "remove", member.id));
+      item.append(remove);
+    }
+    memberList.append(item);
+  }
+  addMemberForm.hidden = !admin;
+  const selected = addMemberUser.value;
+  addMemberUser.replaceChildren();
+  const memberIDs = new Set((cache.members || []).map((member) => member.id));
+  for (const user of state.users.filter((user) => !memberIDs.has(user.id))) {
+    const option = document.createElement("option");
+    option.value = user.id; option.textContent = user.username;
+    addMemberUser.append(option);
+  }
+  if ([...addMemberUser.options].some((option) => option.value === selected)) addMemberUser.value = selected;
+  addMemberButton.disabled = !admin || !cache.members || !addMemberUser.options.length || Boolean(cache.memberMutation);
+  leaveButton.disabled = !canUseThread(cache) || Boolean(cache.memberMutation);
+}
+async function loadMembers(cache = state.currentCache) {
+  if (!cache?.active || cache.summary?.kind !== "group") return;
+  if (cache.membersRequest) return cache.membersRequest;
+  const snapshot = cacheSnapshot(cache), serial = state.membershipSerial;
+  const request = (async () => {
+    try {
+      const members = await apiRequest(`/threads/${cache.threadID}/members`);
+      if (!membershipSnapshotMatches(snapshot) || !cache.active || serial !== state.membershipSerial) return;
+      cache.members = members;
+      cache.membersDirty = false;
+      renderMembers(cache);
+    } catch (error) {
+      if (!cacheSnapshotMatches(snapshot)) return;
+      if (error.status === 403) void loadThreads();
+      if (state.currentCache === cache) showError(error.message);
+    } finally {
+      if (cache.membersRequest === request) cache.membersRequest = null;
+      if (cacheSnapshotMatches(snapshot) && cache.active && cache.membersDirty &&
+          (serial !== state.membershipSerial || !membershipSnapshotMatches(snapshot)) &&
+          state.currentCache === cache && !membersPanel.hidden) {
+        void loadMembers(cache);
+      }
+    }
+  })();
+  cache.membersRequest = request;
+  return request;
+}
+async function changeMembership(cache, action, userID = "") {
+  if (!canUseThread(cache) || cache.memberMutation || (action !== "leave" && cache.summary.role !== "admin")) return;
+  const snapshot = cacheSnapshot(cache);
+  const request = {};
+  cache.memberMutation = request;
+  renderMembers(cache);
+  const path = action === "leave" ? `/threads/${cache.threadID}/leave`
+    : `/threads/${cache.threadID}/members${action === "remove" ? `/${userID}` : ""}`;
+  try {
+    const message = await apiRequest(path, { method: action === "remove" ? "DELETE" : "POST",
+      headers: { "Content-Type": "application/json" },
+      ...(action === "add" ? { body: JSON.stringify({ user_id: userID }) } : {}) });
+    if (!cacheSnapshotMatches(snapshot)) return;
+    updateThreadFromMessage(message);
+    acceptMessage(message, false);
+    if (state.currentCache === cache) renderMessages("new", false);
+  } catch (error) {
+    if (!cacheSnapshotMatches(snapshot)) return;
+    if (error.status === 503 && error.details?.thread_id) {
+      showNotice("Thay đổi thành viên đã lưu; realtime chưa được xác nhận. Đang đối chiếu trạng thái.");
+      void catchUpConversation(cache, Number(error.details.seq || 0));
+    } else if (state.currentCache === cache) showError(error.message);
+  } finally {
+    if (cache.memberMutation === request) cache.memberMutation = null;
+    if (cacheSnapshotMatches(snapshot)) {
+      state.membershipSerial += 1;
+      cache.permissionsPending = true;
+      cache.membersDirty = true;
+      state.threadListDirty = true;
+      if (state.currentCache === cache) { renderThreadHeading(); renderMembers(cache); }
+      await loadThreads();
+      if (cacheSnapshotMatches(snapshot) && cache.active && state.currentCache === cache && !membersPanel.hidden) await loadMembers(cache);
     }
   }
 }
+async function recoverCreatedGroup(creation) {
+  const sessionVersion = state.sessionVersion, token = state.token;
+  await loadThreads();
+  if (!currentSessionMatches(sessionVersion, token) || state.groupCreation !== creation) return;
+  if (creation.threadID && state.threads.get(creation.threadID)?.active) {
+    state.groupCreation = null;
+    createGroupButton.disabled = false;
+    recoverGroupButton.hidden = true;
+    groupForm.reset();
+    if (creation.conversationVersion === state.conversationVersion) await openThread(creation.threadID);
+    if (currentSessionMatches(sessionVersion, token)) showNotice("Nhóm đã được lưu. Đã đối chiếu và mở nhóm; không tạo lại nhóm.");
+  } else {
+    showNotice(creation.threadID
+      ? `Nhóm đã lưu với ID ${creation.threadID}. Chưa đối chiếu được; bấm Đối chiếu nhóm đã tạo khi API hoạt động lại.`
+      : "Chưa xác nhận kết quả tạo nhóm. Hãy kiểm tra danh sách nhóm trước khi tải lại trang và tạo nhóm khác.");
+    recoverGroupButton.hidden = false;
+  }
+}
+
+groupForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (state.groupCreation || !state.token) return;
+  const sessionVersion = state.sessionVersion, token = state.token;
+  const creation = { threadID: "", conversationVersion: state.conversationVersion };
+  state.groupCreation = creation;
+  createGroupButton.disabled = true;
+  showError(""); showNotice("");
+  const memberIDs = [...groupUsers.querySelectorAll("input:checked")].map((input) => input.value);
+  try {
+    const thread = await apiRequest("/threads/group", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: groupForm.elements.name.value, member_ids: memberIDs }) });
+    if (!currentSessionMatches(sessionVersion, token)) return;
+    state.membershipSerial += 1;
+    reconcileThreadSummary(thread);
+    state.groupCreation = null;
+    createGroupButton.disabled = false;
+    groupForm.reset();
+    renderPeerList();
+    if (creation.conversationVersion === state.conversationVersion) await openThread(thread.id);
+  } catch (error) {
+    if (!currentSessionMatches(sessionVersion, token)) return;
+    if (error.status === undefined || error.status >= 500) {
+      creation.threadID = error.details?.thread_id || "";
+      state.membershipSerial += 1;
+      state.threadListDirty = true;
+      await recoverCreatedGroup(creation);
+    } else {
+      state.groupCreation = null;
+      createGroupButton.disabled = false;
+      showError(error.message);
+    }
+  }
+});
+recoverGroupButton.addEventListener("click", () => {
+  if (state.groupCreation) {
+    state.groupCreation.conversationVersion = state.conversationVersion;
+    void recoverCreatedGroup(state.groupCreation);
+  }
+});
+membersButton.addEventListener("click", () => {
+  const cache = state.currentCache;
+  if (!cache?.active || cache.summary?.kind !== "group") return;
+  membersPanel.hidden = !membersPanel.hidden;
+  if (!membersPanel.hidden) {
+    renderMembers(cache);
+    if (!cache.members || cache.membersDirty) void loadMembers(cache);
+  }
+});
+addMemberForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (state.currentCache && addMemberUser.value) void changeMembership(state.currentCache, "add", addMemberUser.value);
+});
+leaveButton.addEventListener("click", () => {
+  if (state.currentCache) void changeMembership(state.currentCache, "leave");
+});
 
 registerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1145,6 +1190,7 @@ registerForm.addEventListener("submit", async (event) => {
   showNotice("");
   const username = registerForm.elements.username.value;
   const password = registerForm.elements.password.value;
+  const sessionVersion = state.sessionVersion;
 
   try {
     await apiRequest("/auth/register", {
@@ -1152,12 +1198,13 @@ registerForm.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
     }, false);
+    if (sessionVersion !== state.sessionVersion) return;
     loginForm.elements.username.value = username;
     loginForm.elements.password.focus();
     registerForm.reset();
     showNotice("Đăng ký thành công. Hãy đăng nhập bằng tài khoản vừa tạo.");
   } catch (error) {
-    showError(error.message);
+    if (sessionVersion === state.sessionVersion) showError(error.message);
   }
 });
 
@@ -1165,6 +1212,8 @@ loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   showError("");
   showNotice("");
+  const loginVersion = state.sessionVersion;
+  let activeLoginVersion = loginVersion;
   const username = loginForm.elements.username.value;
   const password = loginForm.elements.password.value;
 
@@ -1174,43 +1223,35 @@ loginForm.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
     }, false);
+    if (loginVersion !== state.sessionVersion) return;
     const userID = decodeSubject(response.access_token);
     if (!userID) {
       throw new Error("Token đăng nhập không hợp lệ.");
     }
 
-    stopWebSocket();
-    state.sessionVersion += 1;
+    clearSession();
+    activeLoginVersion = state.sessionVersion;
     state.token = response.access_token;
     state.currentUserID = userID;
     state.currentUsername = username.trim().toLowerCase();
-    state.users = [];
-    state.threadsByPeer = new Map();
-    state.threadCaches = new Map();
-    state.directRequestsByPeer = new Map();
-    state.threadEventSeqs = new Map();
-    state.threadSummaryBaseSeqs = new Map();
-    state.threadListRequest = null;
-    state.threadListDirty = false;
-    state.threadListCatchup = false;
     sessionStorage.setItem(sessionTokenKey, state.token);
     sessionStorage.setItem(sessionUsernameKey, state.currentUsername);
     loginForm.reset();
     resetConversation();
     showChatView();
     await loadUsers();
+    if (state.token !== response.access_token) return;
     await loadThreads();
+    if (state.token !== response.access_token) return;
     void connectWebSocket();
   } catch (error) {
-    showError(error.message);
+    if (activeLoginVersion === state.sessionVersion) showError(error.message);
   }
 });
 
 messageForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!state.threadID) {
-    return;
-  }
+  if (!canUseThread(state.currentCache)) return;
   const snapshot = conversationSnapshot();
   const cache = snapshot.cache;
   if (cache.pendingSend?.inFlight) {
@@ -1242,7 +1283,7 @@ messageForm.addEventListener("submit", async (event) => {
       cache.draftContent = "";
     }
     updateThreadFromMessage(message);
-    acceptMessage(message);
+    acceptMessage(message, false);
     if (state.currentCache === cache) {
       if (contentInput.value === pending.content) {
         contentInput.value = "";
@@ -1252,8 +1293,9 @@ messageForm.addEventListener("submit", async (event) => {
       }
       renderMessages(currentConversationMatches(snapshot) ? "bottom" : "new", false);
     }
-    scheduleThreadSummaryRefresh();
+    if (cache.summary?.kind === "direct") scheduleThreadSummaryRefresh();
   } catch (error) {
+    if (cacheSnapshotMatches(snapshot) && error.status === 403) void loadThreads();
     if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
       showError(contentInput.value === pending.content
         ? `${error.message} Tin chưa được xác nhận; bấm Gửi lại với nội dung cũ.`
@@ -1286,14 +1328,16 @@ logoutButton.addEventListener("click", () => {
 
 loadOlderButton.addEventListener("click", loadOlderMessages);
 
-let visibilityFrame = null;
 historyElement.addEventListener("scroll", () => {
-  if (visibilityFrame !== null) {
-    cancelAnimationFrame(visibilityFrame);
+  if (state.renderedScrollTop === historyElement.scrollTop) {
+    state.renderedScrollTop = null;
+    return;
   }
+  state.renderedScrollTop = null;
+  if (state.visibilityFrame !== null) cancelAnimationFrame(state.visibilityFrame);
   const snapshot = conversationSnapshot();
-  visibilityFrame = requestAnimationFrame(() => {
-    visibilityFrame = null;
+  state.visibilityFrame = requestAnimationFrame(() => {
+    state.visibilityFrame = null;
     recordVisibleMessages(snapshot);
   });
 });
@@ -1326,10 +1370,11 @@ state.currentUserID = decodeSubject(state.token);
 state.currentUsername = sessionStorage.getItem(sessionUsernameKey) || "";
 if (state.token && state.currentUserID) {
   state.sessionVersion += 1;
+  const sessionVersion = state.sessionVersion, token = state.token;
   showChatView();
   Promise.all([loadUsers(), loadThreads()])
-    .then(() => connectWebSocket())
-    .catch((error) => showError(error.message));
+    .then(() => { if (currentSessionMatches(sessionVersion, token)) return connectWebSocket(); })
+    .catch((error) => { if (currentSessionMatches(sessionVersion, token)) showError(error.message); });
 } else {
   clearSession();
 }

@@ -26,6 +26,7 @@ type Thread struct {
 	MemberCount     int64
 	Peer            Peer
 	LastSeq         int64
+	JoinedSeq       int64
 	LastReadSeq     int64
 	PeerLastReadSeq int64
 	UnreadCount     int64

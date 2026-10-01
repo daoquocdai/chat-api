@@ -11,7 +11,7 @@
     <header class="hero">
       <div>
         <p class="eyebrow">Mini-Hermes</p>
-        <h1>Chat 1-1</h1>
+        <h1>Chat trực tiếp và nhóm</h1>
       </div>
       <button id="logout-button" class="secondary" type="button" hidden>Đăng xuất</button>
     </header>
@@ -49,19 +49,50 @@
           <span>Đang đăng nhập</span>
           <strong id="current-username"></strong>
         </div>
-        <h2>Tài khoản khác</h2>
-        <div id="peer-list" class="peer-list">
-          <p class="empty">Đang tải...</p>
-        </div>
+        <section class="conversation-section" aria-labelledby="direct-heading">
+          <h2 id="direct-heading">Chat 1-1</h2>
+          <div id="direct-thread-list" class="peer-list"></div>
+          <div id="new-direct-section">
+            <h3>Mở chat mới</h3>
+            <div id="peer-list" class="peer-list"></div>
+          </div>
+        </section>
+        <section class="conversation-section" aria-labelledby="group-heading">
+          <h2 id="group-heading">Chat nhóm</h2>
+          <div id="group-thread-list" class="peer-list"></div>
+          <form id="group-form">
+            <h3>Tạo nhóm</h3>
+            <label for="group-name">Tên nhóm</label>
+            <input id="group-name" name="name" maxlength="100" required>
+            <label>Thành viên</label>
+            <div id="group-users" class="group-users"></div>
+            <button id="create-group-button" type="submit">Tạo nhóm</button>
+            <button id="recover-group-button" class="secondary" type="button" hidden>Đối chiếu nhóm đã tạo</button>
+          </form>
+        </section>
       </aside>
 
       <section class="card chat">
         <div class="chat-heading">
           <div>
             <span>Cuộc trò chuyện</span>
-            <h2 id="peer-name">Chọn một tài khoản</h2>
+            <h2 id="peer-name">Chọn cuộc trò chuyện</h2>
+            <p id="thread-status"></p>
           </div>
+          <button id="members-button" class="secondary" type="button" hidden>Thành viên</button>
         </div>
+
+        <section id="members-panel" hidden>
+          <ul id="member-list"></ul>
+          <form id="add-member-form" hidden>
+            <label for="add-member-user">Thêm thành viên</label>
+            <div class="row">
+              <select id="add-member-user" name="user_id"></select>
+              <button id="add-member-button" type="submit">Thêm</button>
+            </div>
+          </form>
+          <button id="leave-button" class="secondary" type="button">Rời nhóm</button>
+        </section>
 
         <div class="history-actions">
           <button id="load-older-button" class="secondary" type="button" hidden>Tin cũ hơn</button>
@@ -82,7 +113,7 @@
     </section>
   </main>
 
-  <script src="/realtime-core.js" defer></script>
-  <script src="/app.js?v=20260929-pending-retry" defer></script>
+  <script src="/realtime-core.js?v=20261001-group" defer></script>
+  <script src="/app.js?v=20261001-group" defer></script>
 </body>
 </html>

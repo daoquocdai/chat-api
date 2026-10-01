@@ -115,7 +115,7 @@ func threadFromRow(row sqlc.GetThreadSummaryForUserRow) model.Thread {
 	thread := model.Thread{
 		ID: row.ID, ExternalID: row.ExternalID.String(), Kind: row.Kind,
 		Name: row.Name, Role: row.Role, MemberCount: row.MemberCount,
-		LastSeq: row.LastSeq, LastReadSeq: row.LastReadSeq,
+		LastSeq: row.LastSeq, JoinedSeq: row.JoinedSeq, LastReadSeq: row.LastReadSeq,
 		PeerLastReadSeq: row.PeerLastReadSeq, UnreadCount: row.UnreadCount,
 		CreatedAt: row.CreatedAt.Time,
 	}

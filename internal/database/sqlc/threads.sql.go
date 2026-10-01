@@ -100,7 +100,7 @@ SELECT
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,
-    t.last_seq, mine.last_read_seq,
+    t.last_seq, mine.joined_seq, mine.last_read_seq,
     COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
     (SELECT COUNT(*) FROM participants AS member
      WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,
@@ -146,6 +146,7 @@ type GetThreadSummaryForUserRow struct {
 	PeerExternalID              pgtype.UUID
 	PeerUsername                string
 	LastSeq                     int64
+	JoinedSeq                   int64
 	LastReadSeq                 int64
 	PeerLastReadSeq             int64
 	MemberCount                 int64
@@ -169,6 +170,7 @@ func (q *Queries) GetThreadSummaryForUser(ctx context.Context, arg GetThreadSumm
 		&i.PeerExternalID,
 		&i.PeerUsername,
 		&i.LastSeq,
+		&i.JoinedSeq,
 		&i.LastReadSeq,
 		&i.PeerLastReadSeq,
 		&i.MemberCount,
@@ -188,7 +190,7 @@ SELECT
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,
-    t.last_seq, mine.last_read_seq,
+    t.last_seq, mine.joined_seq, mine.last_read_seq,
     COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
     (SELECT COUNT(*) FROM participants AS member
      WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,
@@ -229,6 +231,7 @@ type ListThreadsForUserRow struct {
 	PeerExternalID              pgtype.UUID
 	PeerUsername                string
 	LastSeq                     int64
+	JoinedSeq                   int64
 	LastReadSeq                 int64
 	PeerLastReadSeq             int64
 	MemberCount                 int64
@@ -258,6 +261,7 @@ func (q *Queries) ListThreadsForUser(ctx context.Context, userID int64) ([]ListT
 			&i.PeerExternalID,
 			&i.PeerUsername,
 			&i.LastSeq,
+			&i.JoinedSeq,
 			&i.LastReadSeq,
 			&i.PeerLastReadSeq,
 			&i.MemberCount,

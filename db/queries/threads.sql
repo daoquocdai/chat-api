@@ -34,7 +34,7 @@ SELECT
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,
-    t.last_seq, mine.last_read_seq,
+    t.last_seq, mine.joined_seq, mine.last_read_seq,
     COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
     (SELECT COUNT(*) FROM participants AS member
      WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,
@@ -71,7 +71,7 @@ SELECT
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,
-    t.last_seq, mine.last_read_seq,
+    t.last_seq, mine.joined_seq, mine.last_read_seq,
     COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
     (SELECT COUNT(*) FROM participants AS member
      WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,

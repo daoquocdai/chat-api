@@ -59,7 +59,7 @@ Thêm/xóa/rời nhóm khóa dòng thread, đọc lại actor/role và membershi
 
 Thêm người đang active hoặc xóa/rời người đã inactive trả system message ở `joined_seq`/`left_seq` hiện tại, không tăng seq; publish lại có thể tạo stream entry trùng. Tạo nhóm chưa có idempotency key: lỗi publish trả 503 kèm thread/message UUID đã lưu, client đối chiếu trước khi tạo lại. Các thao tác không có quyền hoặc transaction rollback không publish.
 
-PostgreSQL vẫn quyết định quyền. API có cache snapshot membership dùng thực tế trong publish; group UI còn chưa làm. Gateway fan-out theo danh sách trong event và không query DB/cache.
+PostgreSQL vẫn quyết định quyền. API có cache snapshot membership dùng thực tế trong publish; web dùng chung cache/luồng thread cho direct và group. Gateway fan-out theo danh sách trong event và không query DB/cache.
 
 ## Snapshot membership trong publish
 
@@ -119,21 +119,21 @@ Trang tiếp theo gọi `?before_seq=4&limit=2` và chỉ nhận message có `se
 
 `PUT /threads/:id/read` nhận `{ "last_read_seq": N }`; actor không bao giờ đến từ body. Repository khóa thread và kiểm tra membership; SQL chỉ update participant đang hoạt động khi `joined_seq - 1 <= N <= threads.last_seq`, đồng thời dùng `GREATEST(last_read_seq, N)`. Vì vậy request cũ đến muộn không thể làm marker giảm. Thread rỗng chấp nhận mốc `0`.
 
-Hai query summary thread cùng trả `last_read_seq`, `peer_last_read_seq` và `unread_count`. `unread_count` là `COUNT(*)` trên các message nằm trong phạm vi xem, có `seq > last_read_seq`, do người khác gửi và `kind <> 'system'`; không suy ra từ `last_seq - last_read_seq`. Với group, summary có `name`, `role`, `member_count`, không có peer. UI direct dùng `peer_last_read_seq` để hiện “Đã đọc” cho tin mình gửi có `seq` không lớn hơn marker đó.
+Hai query summary thread cùng trả `last_read_seq`, `peer_last_read_seq` và `unread_count`. `unread_count` là `COUNT(*)` trên các message nằm trong phạm vi xem, có `seq > last_read_seq`, do người khác gửi và `kind <> 'system'`; không suy ra từ `last_seq - last_read_seq`. Với group, summary có `name`, `role`, `member_count`, `joined_seq`, không có peer. `joined_seq` xác định khoảng membership đang hoạt động để web xóa marker đang chờ và bỏ response read/member cũ khi user đã tham gia lại; đây là metadata từ participant hiện có, không cần migration. UI direct dùng `peer_last_read_seq` để hiện “Đã đọc” cho tin mình gửi có `seq` không lớn hơn marker đó.
 
 ## Web demo
 
-Router phục vụ `web/index.html`, `web/app.js`, `web/realtime-core.js` và `web/style.css`. Giao diện:
+Router phục vụ HTML/CSS hiện có và hai file JS: `app.js` điều phối DOM, HTTP, phiên tài khoản và socket; `realtime-core.js` giữ các hàm thuần để gộp tin, phân trang lấy bù và kiểm tra khoảng seq/read marker.
 
-1. Đăng ký rồi đăng nhập.
-2. Lưu JWT vào `sessionStorage` của tab và lấy user hiện tại từ claim `sub`.
-3. Gọi `GET /users` bằng Bearer token và chỉ hiển thị các tài khoản khác.
-4. Khi chọn peer chưa biết thread ID, gọi `POST /threads/direct`; nếu đã có ID từ summary thì dùng lại. Trang lịch sử đầu chỉ tải một lần cho mỗi thread trong phiên trang.
-5. Gọi `POST /auth/ws-ticket` bằng Bearer JWT để lấy vé Redis TTL ngắn; gateway tiêu thụ vé bằng `GETDEL` trước WebSocket upgrade. Không đưa JWT vào URL. CLI vẫn dùng Bearer trực tiếp.
-6. Thread đã tải được hiển thị từ cache; nút **Tin cũ hơn** đi theo `next_cursor`. Tin mới nhận bằng WebSocket, gộp theo external `message_id`, render theo `seq`.
-7. Sau reconnect, web đối chiếu summary rồi lấy bù mọi thread đã cache có `last_seq` mới hơn mốc đồng bộ. Gap `seq` từ event hoặc response gửi tin cũng kích hoạt lấy bù đúng thread; không có timer dò tin.
-8. Chỉ gọi `PUT read` cho chuỗi tin nhận đã xuất hiện trong viewport khi cuộc chat hiện tại và tab đều đang hiển thị. PUT lỗi giữ lại mốc đã thấy để retry khi tab hiện hoặc kết nối phục hồi; GET nền và thao tác gửi không tự cập nhật marker.
-9. Response bất đồng bộ chỉ ghi vào cache đúng thread/phiên; DOM chỉ cập nhật cho thread đang mở. Đăng xuất/đổi tài khoản xóa cache, đóng socket và hủy reconnect cũ.
-10. Khi API trả `401`, xóa session local và đưa người dùng về màn hình đăng nhập.
+State có một map theo external thread UUID. Mỗi entry giữ summary, trạng thái active/quyền đang đối chiếu, messages theo seq/ID, khoảng đã xác nhận, cursor, draft, pending send và các request đang chạy. Lookup peer → direct thread được tính từ map khi mở chat; không có bản summary thứ hai theo peer.
 
-Không còn route `/messages` sender/receiver hoặc `POST /users`; client không có đường API để tự khai danh tính người gửi.
+1. Đăng ký/đăng nhập, lưu JWT trong sessionStorage của tab, lấy user từ `/users`. Chọn peer chưa có thread mới POST direct; sau đó direct/group đều đi qua `openThread(threadID)`. Cache đã tải được render ngay; mở lại không GET history hay xin vé.
+2. Form nhóm chọn user từ danh sách đang có. Tạo nhóm POST đúng một lần. `readResponse` giữ cả body lỗi; 503 có thread UUID chuyển sang GET `/threads` đối chiếu nhóm đã commit. Lỗi không có UUID giữ trạng thái chưa xác nhận để tránh tự tạo trùng. Thêm/xóa/rời cũng đối chiếu quyền từ REST sau thành công hoặc lỗi; không phân tích câu chữ system message.
+3. Mỗi phiên chỉ có một WebSocket. Vé chỉ xin khi bắt đầu/kết nối lại; đổi thread hay tab không xin vé ngoài lịch retry. Giữ heartbeat, watchdog và backoff hiện có. Socket mở lại mới GET summary và lấy bù các thread đã cache qua cursor đến baseline đã đồng bộ, kể cả hơn 30 tin.
+4. Text event cập nhật entry đúng thread, tăng unread một lần cho text từ người khác và gộp theo ID/seq. Event liên tục đúng thứ tự không GET history/summary mỗi tin. Event có gap lấy bù bằng REST; event system mới được gộp thành một lần đối chiếu summary và thành viên nếu panel đang mở. Event trùng không lặp đối chiếu. GET summary bắt đầu trước một thay đổi membership bị bỏ và lấy lại để tránh phục hồi quyền cũ.
+5. Summary REST là danh sách membership active. Nhóm không còn trong response được đánh inactive, tắt gửi/quản lý/read marker, không có unread. Có thể giữ entry ghi rõ **Đã rời (lịch sử)** trong phiên để xem phần đã được cấp quyền; lấy bù một lần lúc chuyển inactive để nhận thông báo rời/xóa đã bỏ lỡ. `joined_seq` mới làm tăng epoch membership, xóa pending marker/seen và bỏ response cũ. Role/admin đến từ REST; PostgreSQL vẫn kiểm tra mọi thao tác.
+6. Trang REST xác nhận một khoảng numeric seq giữa cursor và message cao nhất. Gap bên trong khoảng này là đã được server xác nhận (bao gồm khoảng vắng mặt); gap ngoài khoảng vẫn là chưa đồng bộ. Lấy bù không lặp lại cùng target không truy cập được. Read marker duyệt message đã được phép xem theo seq, chỉ vượt gap đã xác nhận và chỉ tăng tới tin nhận thực sự hiển thị. Tin mình gửi/system được bỏ qua; marker không nhảy qua tin nhận chưa thấy hoặc phần lịch sử chưa tải. Fetch nền và scroll do render/gửi tạo ra không tự đánh dấu đã đọc.
+7. Gửi/retry chung cho direct/group: giữ nguyên UUID/payload khi lỗi mạng/5xx, retry một lần tự động, sau đó giữ pending trong entry với nút **Gửi lại**. Nội dung đã sửa không được dùng cho UUID cũ. Response đến muộn cập nhật đúng cache; DOM chỉ cập nhật nếu thread/phiên tương ứng đang mở. Trạng thái “Đã đọc” theo peer chỉ hiển thị cho direct.
+8. Logout/đổi tài khoản abort HTTP của phiên cũ, hủy timer/socket và xóa map/cache/draft/pending. Mọi response và callback đều kiểm tra phiên; read/member còn kiểm tra epoch membership. `401` của phiên hiện tại đưa về đăng nhập.
+
+Không thêm E2EE, presence hay nhiều gateway instance. Không có test web/gateway thường trực; kịch bản browser/HTTP/WebSocket tạm phải được xóa sau khi chạy.

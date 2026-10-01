@@ -55,6 +55,7 @@ type ThreadResponse struct {
 	Role            string               `json:"role"`
 	MemberCount     int64                `json:"member_count"`
 	LastSeq         int64                `json:"last_seq"`
+	JoinedSeq       int64                `json:"joined_seq"`
 	LastReadSeq     int64                `json:"last_read_seq"`
 	PeerLastReadSeq int64                `json:"peer_last_read_seq"`
 	UnreadCount     int64                `json:"unread_count"`
@@ -70,6 +71,7 @@ func ToThreadResponse(thread model.Thread) ThreadResponse {
 		Role:            thread.Role,
 		MemberCount:     thread.MemberCount,
 		LastSeq:         thread.LastSeq,
+		JoinedSeq:       thread.JoinedSeq,
 		LastReadSeq:     thread.LastReadSeq,
 		PeerLastReadSeq: thread.PeerLastReadSeq,
 		UnreadCount:     thread.UnreadCount,

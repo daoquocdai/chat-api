@@ -1,6 +1,6 @@
 # Mini-Hermes Chat API
 
-Mini-Hermes là demo chat dùng Go, Gin, PostgreSQL và sqlc. Chat 1-1 có web demo; group chat hiện có API REST và fan-out WebSocket. Người dùng đăng ký bằng mật khẩu, đăng nhập nhận JWT, chọn một tài khoản khác và trao đổi tin nhắn được lưu trong PostgreSQL.
+Mini-Hermes là demo chat dùng Go, Gin, PostgreSQL và sqlc. Web demo hỗ trợ chat 1-1 và nhóm qua API REST và fan-out WebSocket. Người dùng đăng ký bằng mật khẩu, đăng nhập nhận JWT, chọn một tài khoản khác và trao đổi tin nhắn được lưu trong PostgreSQL.
 
 ERD 5 bảng vẫn đang chờ mentor duyệt. Migration mới trên nhánh `feat/auth` là bản thử nghiệm để review, chưa nên áp dụng cho môi trường dùng chung hoặc production.
 
@@ -49,7 +49,7 @@ Thay đổi membership và gửi tin cùng khóa dòng thread, nên không thể
 
 Unread dùng `last_read_seq` của khoảng membership hiện tại, đếm tin người khác gửi và bỏ qua system message. Thêm/xóa/rời đã ở trạng thái đích không tạo thêm `seq`: API trả và thử publish lại system message của lần chuyển trạng thái hiện tại. Đây không phải idempotency cho tạo nhóm. Nếu tạo nhóm trả `503` do XADD, nhóm **đã lưu**; dùng `thread_id` trong lỗi hoặc `GET /threads` để tìm nhóm, không gửi lại POST tạo nhóm một cách mù quáng.
 
-Bước này dùng các bảng hiện có, không cần migration mới. Backend có cache membership Redis được dùng khi publish; web demo vẫn chỉ hiển thị direct chat. API nhóm chạy thử bằng [docs/week4-groups.http](docs/week4-groups.http). Chưa có E2EE. Web nhận tin mới qua `ws-gateway`, không dò REST theo chu kỳ.
+Bước này dùng các bảng hiện có, không cần migration mới. Backend giữ cache membership Redis khi publish; web demo dùng chung luồng thread cho direct và group. API nhóm chạy thử bằng [docs/week4-groups.http](docs/week4-groups.http). Chưa có E2EE. Web nhận tin mới qua `ws-gateway`, không dò REST theo chu kỳ.
 
 ### Cache membership Redis
 
@@ -170,25 +170,30 @@ Migration giữ năm bảng trong ERD và thêm các invariant cần cho demo:
 Sau khi migration thành công:
 
 ```powershell
-go run ./cmd
-go run ./cmd/ws-gateway  # chạy ở terminal thứ hai
+make run
+make gateway  # chạy ở terminal thứ hai
 ```
+
+Nếu `make` không có hoặc không chạy được trên Windows, dùng `go run ./cmd` và `go run ./cmd/ws-gateway` tương ứng. Với database local đã có schema, dùng `make up` để bật PostgreSQL/Redis và `make migrate-status` để kiểm tra migration; không cần reset dữ liệu cho tính năng này.
 
 Mở `http://localhost:8080`:
 
-1. Đăng ký Alice và Bob.
-2. Mở hai tab độc lập hoặc cửa sổ riêng tư, đăng nhập Alice và Bob, chọn nhau.
-3. Alice gửi tin qua REST; Bob nhận ngay qua WebSocket. Ngắt gateway hoặc đưa Bob offline, gửi thêm hơn 30 tin, sau đó kết nối lại để kiểm tra web lấy bù hết các trang lịch sử.
-4. Tải lại trang hoặc khởi động lại server; đăng nhập và chọn lại peer để xem lịch sử còn trong PostgreSQL.
-5. Đăng nhập tài khoản thứ ba để xác nhận tài khoản đó không thể truy cập thread Alice–Bob bằng API.
+1. Đăng ký Alice, Bob và Charlie; đăng nhập ở ba tab/cửa sổ riêng biệt.
+2. Sidebar chia riêng **Chat 1-1** và **Chat nhóm**, mỗi cuộc trò chuyện có unread; nhóm hiển thị thêm số thành viên. Trong **Chat 1-1**, chọn tài khoản ở **Mở chat mới** nếu chưa có thread. Đổi qua lại thread đã tải để kiểm tra cache. Danh sách tự cập nhật qua realtime/reconnect, không có nút làm mới.
+3. Alice nhập tên nhóm và chọn Bob/Charlie trong form **Tạo nhóm**. Bob/Charlie nhận system message tạo nhóm và nhóm xuất hiện trong danh sách; chọn nhóm để gửi/nhận tin. Nội dung hệ thống hiển thị riêng, text có tên người gửi.
+4. Mở **Thành viên** để xem role. Alice có nút thêm/xóa người khác; mọi thành viên có nút **Rời nhóm**. Xóa Bob, gửi vài tin, rồi thêm Bob lại: Bob không thấy tin trong khoảng vắng mặt. Nhóm đã rời trong phiên hiện tại được ghi rõ **Đã rời (lịch sử)**, không còn unread/quyền gửi/quản lý.
+5. Alice rời khi là admin cuối: thành viên tham gia sớm nhất còn lại được nâng thành admin. Đối chiếu nút quản lý ở tab đó; quyền do API quyết định, không suy luận từ câu chữ system message.
+6. Cho Bob offline hoặc tắt `make gateway`, gửi hơn 30 tin rồi bật lại gateway. Web lấy bù qua nhiều trang; nút **Tin cũ hơn** tải phần lịch sử cũ. Chuyển tab liên tục khi gateway tắt để kiểm tra backoff, không xin thêm vé ngoài lịch retry.
+7. Cuộn qua các tin nhận để kiểm tra unread/read marker. Các tin nhận chưa hiển thị hoặc khoảng chưa tải vẫn chặn marker; gap trong khoảng đã được REST xác nhận không chặn marker. Tin mình gửi, system message và fetch nền không tự tăng marker. Nhóm không dùng trạng thái “Đã đọc” của peer direct.
+8. Nếu tạo nhóm trả 503 kèm `thread_id`, web chỉ GET đối chiếu nhóm đã lưu và mở nó; không tự POST tạo lại. Nếu chưa đối chiếu được, dùng **Đối chiếu nhóm đã tạo**. Khi lỗi mạng không có ID, web giữ trạng thái chưa xác nhận: kiểm tra danh sách nhóm trước khi tải lại trang và tạo nhóm khác.
 
-Web lưu JWT trong `sessionStorage` của từng tab, dùng Bearer token cho REST và đổi vé ngắn hạn để mở WebSocket. Mỗi tin mới được chủ động gửi có một `message_id` mới, kể cả nội dung giống hệt; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload. Nếu hai lần thử vẫn lỗi, web giữ tin chưa xác nhận trong cache của thread; nút **Gửi lại** tiếp tục dùng UUID và nội dung cũ cho đến khi thành công. Nếu người dùng sửa nội dung trong lúc đó, web chặn gửi và yêu cầu khôi phục nội dung cũ trước khi thử lại. Cache này chỉ tồn tại trong phiên trang, nên sau khi tải lại cần kiểm tra lịch sử trước khi gửi lại một tin chưa rõ kết quả. Tin mới đi qua WebSocket; khi mở thread, kết nối lại hoặc thấy gap `seq`, web lấy bù bằng REST và đi ngược `next_cursor` cho đến mốc đã biết. Tin từ REST/event được gộp theo `message_id`, render theo `seq`; nút **Tin cũ hơn** vẫn tải lịch sử cũ theo cursor. Web chỉ gửi read marker khi cuộc chat đang mở, tab đang hiển thị và các tin nhận liên tiếp đã thực sự xuất hiện trong viewport; PUT lỗi giữ lại mốc đã thấy để thử lại khi tab hiện hoặc kết nối phục hồi. Đăng xuất/đổi tài khoản đóng socket và hủy lịch reconnect cũ.
+Web lưu JWT trong `sessionStorage` của từng tab, dùng Bearer token cho REST và đổi vé ngắn hạn để mở WebSocket. Mỗi tin mới được chủ động gửi có một `message_id` mới, kể cả nội dung giống hệt; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload. Nếu hai lần thử vẫn lỗi, web giữ tin chưa xác nhận trong cache của thread; nút **Gửi lại** tiếp tục dùng UUID và nội dung cũ cho đến khi thành công. Nếu người dùng sửa nội dung trong lúc đó, web chặn gửi và yêu cầu khôi phục nội dung cũ trước khi thử lại. Cache này chỉ tồn tại trong phiên trang, nên sau khi tải lại cần kiểm tra lịch sử trước khi gửi lại một tin chưa rõ kết quả. Tin mới đi qua WebSocket; khi mở thread, kết nối lại hoặc thấy gap `seq`, web lấy bù bằng REST và đi ngược `next_cursor` cho đến mốc đã biết. Tin từ REST/event được gộp theo `message_id`, render theo `seq`; nút **Tin cũ hơn** vẫn tải lịch sử cũ theo cursor. Web chỉ gửi read marker khi cuộc chat đang mở, tab đang hiển thị và các tin nhận trong khoảng đã đồng bộ đã thực sự xuất hiện trong viewport; PUT lỗi giữ lại mốc đã thấy để thử lại khi tab hiện hoặc kết nối phục hồi. Đăng xuất/đổi tài khoản đóng socket và hủy lịch reconnect cũ.
 
 Collection nhóm: [docs/week4-groups.http](docs/week4-groups.http). Quyết định unread và thứ tự tin được ghi tại [ADR #2](docs/adr/002-unread-count.md) và [ADR #3](docs/adr/003-message-order.md).
 
 Collection [docs/week2-chat.http](docs/week2-chat.http) minh họa đầy đủ hai người chat, request thiếu JWT và cả thao tác đọc/gửi bị từ chối với tài khoản thứ ba. Đổi biến `@run`, rồi chạy request từ trên xuống dưới.
 
-Repo chỉ giữ test service cho user, thread, message và vé WebSocket. Chạy `go test ./...`, `go vet ./...`, `go build ./...` và `node --check web/app.js`. Gateway/web không còn test tự động thường trực; cần thử thủ công trên trình duyệt và với PostgreSQL/Redis khi thay đổi luồng tích hợp.
+Repo chỉ giữ test service cho user, thread, message và vé WebSocket. Chạy `make test`, `make build`, `go vet ./...`, `node --check web/app.js` và `node --check web/realtime-core.js`; nếu Make không chạy được, dùng `go test ./...` và `go build ./...`. Gateway/web không còn test tự động thường trực; cần thử thủ công trên trình duyệt và với PostgreSQL/Redis khi thay đổi luồng tích hợp.
 
 Với nhóm, cần kiểm tra thêm cache hit/miss và TTL, thêm/xóa/rời/thêm lại, gửi đồng thời với xóa thành viên, retry message cũ khi cache đã mất, pending cũ sau thay đổi membership, nhiều kết nối cùng user, lịch sử và unread trong từng khoảng. Dùng stream/cache riêng và tài khoản tạm cho kịch bản tích hợp; chỉ xóa dữ liệu/cổng/tiến trình của kịch bản, giữ nguyên dịch vụ có sẵn. Kiểm thử HTTP/WebSocket tự động bằng kịch bản tạm không thay thế demo giao diện nhóm trên trình duyệt.
 
@@ -196,7 +201,4 @@ Xem [docs/request-flow.md](docs/request-flow.md) để biết ranh giới handle
 
 ## Chưa có trong scope
 
-- Giao diện nhóm trên web và demo nhóm đầy đủ.
 - Nhiều gateway instance, E2EE, API prekey và chính sách retention/trim stream.
-
-Để bổ sung group UI: hiển thị summary group (`name`, `role`, `member_count`, `peer: null`), thêm form tạo nhóm và màn hình thành viên, nối thao tác thêm/xóa/rời theo role. Sau đó cho client nhận event group, gộp text/system theo `message_id` và `seq`, lấy bù history bằng cursor và dùng read/unread hiện có. Cần xử lý 503 tạo nhóm bằng cách đối chiếu `thread_id`, đồng thời demo nhiều tab với thêm/xóa/thêm lại và reconnect.

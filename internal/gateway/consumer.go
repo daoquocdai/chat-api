@@ -95,6 +95,9 @@ func (c *Consumer) recoverPending(ctx context.Context) error {
 func (c *Consumer) handleStreams(ctx context.Context, streams []redis.XStream) error {
 	for _, stream := range streams {
 		for _, entry := range stream.Messages {
+			if err := ctx.Err(); err != nil {
+				return err // Leave unprocessed entries pending for the next start.
+			}
 			event, err := decode(entry.Values)
 			if err != nil {
 				// A poison entry cannot be delivered; avoid a permanent pending loop.

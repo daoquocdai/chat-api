@@ -35,7 +35,7 @@ func run() error {
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: cfg.Redis.Address, Password: cfg.Redis.Password, DB: cfg.Redis.Database,
 		DialTimeout: cfg.Redis.PublishTimeout, ReadTimeout: 3 * time.Second,
-		WriteTimeout: cfg.Redis.PublishTimeout,
+		WriteTimeout: cfg.Redis.PublishTimeout, ContextTimeoutEnabled: true,
 	})
 	defer redisClient.Close()
 
@@ -45,20 +45,64 @@ func run() error {
 		gateway.DefaultGroup, gateway.DefaultConsumer, log.Default())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	go consumer.Run(ctx)
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /ws", gateway.NewHandler(hub, jwt, tickets, cfg.WSOrigins))
 	server := &http.Server{Addr: cfg.WSAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
-	}()
 	log.Printf("starting WebSocket gateway on %s", cfg.WSAddress)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	return serve(ctx, server, hub, consumer, redisClient)
+}
+
+// serve uses one shutdown deadline for HTTP, all sockets and the stream consumer.
+// Listen/Serve errors take the same cleanup path as a termination signal.
+func serve(ctx context.Context, server *http.Server, hub *gateway.Hub, consumer *gateway.Consumer, redisClient *redis.Client) error {
+	consumerCtx, cancelConsumer := context.WithCancel(ctx)
+	defer cancelConsumer()
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		consumer.Run(consumerCtx)
+	}()
+	serveDone := make(chan error, 1)
+	go func() {
+		err := server.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		serveDone <- err
+	}()
+	var serveErr error
+	serveReturned := false
+	select {
+	case <-ctx.Done():
+	case serveErr = <-serveDone:
+		serveReturned = true
 	}
-	return nil
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	hubDone := hub.Stop() // Reject upgrades/registrations before waiting on HTTP.
+	cancelConsumer()
+	shutdownDone := make(chan error, 1)
+	go func() {
+		err := server.Shutdown(shutdownCtx)
+		<-consumerDone
+		<-hubDone
+		if !serveReturned {
+			serveErr = <-serveDone
+		}
+		shutdownDone <- errors.Join(serveErr, err)
+	}()
+	select {
+	case err := <-shutdownDone:
+		log.Print("gateway shutdown complete: HTTP, consumer and WebSockets stopped")
+		return err
+	case <-shutdownCtx.Done():
+		// Shutdown does not force active HTTP requests; closing Redis also releases
+		// a consumer/authentication command still blocked on network I/O.
+		log.Print("gateway shutdown deadline reached; forcing remaining I/O closed")
+		_ = server.Close()
+		_ = redisClient.Close()
+		return errors.Join(shutdownCtx.Err(), <-shutdownDone)
+	}
 }

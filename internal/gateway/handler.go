@@ -29,6 +29,16 @@ func NewHandler(hub *Hub, jwt *token.JWT, tickets TicketConsumer, origins []stri
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.hub.begin() {
+		http.Error(w, "gateway shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer h.hub.wg.Done()
+	ctx, cancel := context.WithCancel(r.Context())
+	stopCancel := context.AfterFunc(h.hub.ctx, cancel)
+	defer stopCancel()
+	defer cancel()
+	r = r.WithContext(ctx)
 	userID, err := h.authenticate(r)
 	if err != nil {
 		if errors.Is(err, wsticket.ErrInvalidTicket) || errors.Is(err, errUnauthorized) {
@@ -48,6 +58,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client := h.hub.add(parsedID.String(), conn)
+	if client == nil {
+		_ = conn.CloseNow()
+		return
+	}
 	<-conn.CloseRead(r.Context()).Done()
 	h.hub.remove(client)
 }

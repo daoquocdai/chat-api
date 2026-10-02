@@ -385,7 +385,10 @@ async function loadThreads(catchUpCached = false) {
   state.threadListCatchup ||= catchUpCached;
   if (state.threadSummaryTimer !== null) clearTimeout(state.threadSummaryTimer);
   state.threadSummaryTimer = null;
-  if (state.threadListRequest) return state.threadListRequest.promise;
+  if (state.threadListRequest) {
+    state.threadListDirty = true;
+    return state.threadListRequest.promise;
+  }
   const sessionVersion = state.sessionVersion, token = state.token;
   const request = {};
   state.threadListRequest = request;
@@ -908,18 +911,21 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
     if (!membershipSnapshotMatches(snapshot) || !canUseThread(cache)) return;
 
     const previousReadSeq = cache.lastReadSeq;
-    const hadUnread = Number(cache.summary.unread_count || 0) > 0;
     cache.lastReadSeq = Math.max(cache.lastReadSeq, Number(response.last_read_seq || 0));
     if (cache.lastReadSeq > previousReadSeq) {
       state.readSerial += 1;
       cache.summary.last_read_seq = cache.lastReadSeq;
-      if (cache.lastReadSeq >= Number(cache.summary.last_seq || 0)) cache.summary.unread_count = 0;
+      const lastSeq = Number(cache.summary.last_seq);
+      const lastSeqKnown = cache.summary.last_seq != null && Number.isSafeInteger(lastSeq) && lastSeq >= 0;
+      if (lastSeqKnown && cache.lastReadSeq >= lastSeq) cache.summary.unread_count = 0;
       renderPeerList();
       // Existing GETs must not restore a marker from before this PUT.
       if (state.threadListRequest) state.threadListDirty = true;
-      // Zero unread stays zero when only our own messages advance the marker.
-      // Otherwise recount pages not loaded here, including another tab's read.
-      if (hadUnread || cache.lastReadSeq > target) void loadThreads();
+      // Decide from the state AFTER the PUT, including events received in flight.
+      // PostgreSQL recounts remaining/unknown unread, including unloaded pages.
+      const unread = Number(cache.summary.unread_count);
+      const unreadKnown = cache.summary.unread_count != null && Number.isSafeInteger(unread) && unread >= 0;
+      if (!lastSeqKnown || !unreadKnown || unread > 0 || cache.lastReadSeq > target) void loadThreads();
     }
     completed = true;
   } catch (error) {

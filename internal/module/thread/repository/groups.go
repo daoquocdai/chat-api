@@ -183,7 +183,7 @@ func createSystemMessage(ctx context.Context, q *sqlc.Queries, threadID, actorID
 	if err != nil {
 		return messagemodel.Message{}, err
 	}
-	return systemMessageFromRow(ctx, q, threadID, sqlc.GetThreadMessageAtSequenceRow(row))
+	return systemMessageFromRow(sqlc.GetThreadMessageAtSequenceRow(row)), nil
 }
 
 func systemMessageAt(ctx context.Context, q *sqlc.Queries, threadID, seq int64) (messagemodel.Message, error) {
@@ -191,15 +191,9 @@ func systemMessageAt(ctx context.Context, q *sqlc.Queries, threadID, seq int64) 
 	if err != nil {
 		return messagemodel.Message{}, err
 	}
-	return systemMessageFromRow(ctx, q, threadID, row)
+	return systemMessageFromRow(row), nil
 }
 
-func systemMessageFromRow(ctx context.Context, q *sqlc.Queries, threadID int64, row sqlc.GetThreadMessageAtSequenceRow) (messagemodel.Message, error) {
-	message := messagemodel.Message{ID: row.ID, ExternalID: row.ExternalID.String(), ThreadExternalID: row.ThreadExternalID.String(), ThreadKind: row.ThreadKind, SenderExternalID: row.SenderExternalID.String(), Seq: row.Seq, Kind: row.Kind, ContentFormat: row.ContentFormat, Content: row.Content, CreatedAt: row.CreatedAt.Time}
-	version, err := q.GetMembershipVersion(ctx, sqlc.GetMembershipVersionParams{ThreadID: threadID, Seq: row.Seq})
-	if err != nil {
-		return messagemodel.Message{}, err
-	}
-	message.MembershipVersion = version
-	return message, nil
+func systemMessageFromRow(row sqlc.GetThreadMessageAtSequenceRow) messagemodel.Message {
+	return messagemodel.Message{ID: row.ID, ExternalID: row.ExternalID.String(), ThreadExternalID: row.ThreadExternalID.String(), ThreadKind: row.ThreadKind, SenderExternalID: row.SenderExternalID.String(), Seq: row.Seq, Kind: row.Kind, ContentFormat: row.ContentFormat, Content: row.Content, CreatedAt: row.CreatedAt.Time}
 }

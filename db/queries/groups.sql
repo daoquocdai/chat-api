@@ -22,15 +22,6 @@ WHERE thread_id = sqlc.arg(thread_id) AND user_id = sqlc.arg(user_id)
 ORDER BY joined_seq DESC
 LIMIT 1;
 
--- name: GetMembershipVersion :one
--- A removal includes its system message: the recipient set changes at left_seq + 1.
--- The greatest boundary at/before seq identifies an immutable membership snapshot.
-SELECT COALESCE(MAX(boundary.seq), 0)::BIGINT AS version
-FROM participants AS participant
-CROSS JOIN LATERAL (VALUES (participant.joined_seq), (participant.left_seq + 1)) AS boundary(seq)
-WHERE participant.thread_id = sqlc.arg(thread_id)
-  AND boundary.seq <= sqlc.arg(seq)::BIGINT;
-
 -- name: CreateGroupParticipant :exec
 INSERT INTO participants (thread_id, user_id, role, joined_seq, last_read_seq)
 VALUES (sqlc.arg(thread_id), sqlc.arg(user_id), sqlc.arg(role),

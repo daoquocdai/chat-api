@@ -14,6 +14,8 @@ import (
 const maximumContentCharacters = 1000
 
 type Repository interface {
+	MembershipVersionAtSequence(context.Context, string, int64) (int64, error)
+	ListMemberIDsAtSequence(context.Context, string, int64) ([]string, error)
 	Send(
 		ctx context.Context,
 		threadExternalID string,
@@ -41,6 +43,7 @@ type Service struct {
 	repository     Repository
 	users          UserFinder
 	publisher      Publisher
+	cache          MembershipCache
 	publishTimeout time.Duration
 }
 
@@ -48,12 +51,14 @@ func New(
 	repository Repository,
 	users UserFinder,
 	publisher Publisher,
+	cache MembershipCache,
 	publishTimeout time.Duration,
 ) *Service {
 	return &Service{
 		repository:     repository,
 		users:          users,
 		publisher:      publisher,
+		cache:          cache,
 		publishTimeout: publishTimeout,
 	}
 }
@@ -86,7 +91,7 @@ func (s *Service) Send(
 		return model.Message{}, false, err
 	}
 
-	if err := PublishMessage(ctx, s.publisher, s.publishTimeout, message); err != nil {
+	if err := s.PublishMessage(ctx, message); err != nil {
 		return message, created, err
 	}
 

@@ -95,6 +95,29 @@ func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessa
 	return i, err
 }
 
+const getMembershipVersion = `-- name: GetMembershipVersion :one
+SELECT COALESCE(MAX(boundary.seq), 0)::BIGINT AS version
+FROM participants AS participant
+JOIN threads AS thread ON thread.id = participant.thread_id
+CROSS JOIN LATERAL (VALUES (participant.joined_seq), (participant.left_seq + 1)) AS boundary(seq)
+WHERE thread.external_id = $1
+  AND boundary.seq <= $2::BIGINT
+`
+
+type GetMembershipVersionParams struct {
+	ThreadExternalID pgtype.UUID
+	Seq              int64
+}
+
+// A removal includes its system message; the snapshot changes at left_seq + 1.
+// Resolve after commit at the message seq, for both direct and group messages.
+func (q *Queries) GetMembershipVersion(ctx context.Context, arg GetMembershipVersionParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getMembershipVersion, arg.ThreadExternalID, arg.Seq)
+	var version int64
+	err := row.Scan(&version)
+	return version, err
+}
+
 const getMessageByExternalID = `-- name: GetMessageByExternalID :one
 SELECT
     m.id,

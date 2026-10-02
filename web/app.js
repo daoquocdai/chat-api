@@ -5,6 +5,7 @@ const threadSummaryDebounceMs = 750;
 const websocketConnectTimeoutMs = 10000;
 const websocketHeartbeatTimeoutMs = 15000;
 const websocketResumeGraceMs = 5000;
+const historyBottomTolerance = 4;
 const pendingSendMismatchMessage = "Tin trước chưa được xác nhận. Khôi phục đúng nội dung cũ để bấm Gửi lại; chỉ gửi tin mới sau khi tin cũ thành công.";
 
 const authView = document.querySelector("#auth-view");
@@ -44,7 +45,7 @@ const state = {
   // One entry per thread: summary, permissions, messages, drafts and requests.
   threads: new Map(), directRequestsByPeer: new Map(),
   threadID: "", currentCache: null, conversationVersion: 0,
-  visibilityFrame: null, renderedScrollTop: null, renderVersion: 0,
+  readFrame: null, readSerial: 0,
   membershipSerial: 0, threadListRequest: null, threadListDirty: false,
   threadListCatchup: false, threadSummaryTimer: null, groupCreation: null,
   socket: null, socketConnecting: false, socketGeneration: 0,
@@ -163,9 +164,9 @@ function clearSession() {
   state.threadListCatchup = false;
   state.membershipSerial = 0;
   state.groupCreation = null;
-  if (state.visibilityFrame !== null) cancelAnimationFrame(state.visibilityFrame);
-  state.visibilityFrame = null;
-  state.renderedScrollTop = null;
+  if (state.readFrame !== null) cancelAnimationFrame(state.readFrame);
+  state.readFrame = null;
+  state.readSerial = 0;
   createGroupButton.disabled = false;
   recoverGroupButton.hidden = true;
   groupForm.reset();
@@ -199,9 +200,8 @@ function newThreadCache(threadID) {
     membershipEpoch: 0, members: null, membersDirty: true, membersRequest: null,
     memberMutation: null, eventMessages: new Map(), summaryBaseSeq: 0,
     messages: new Map(), messageIDs: new Map(), messagesLoaded: false,
-    confirmedRanges: [], syncedSeq: 0, nextCursor: null, lastReadSeq: 0, peerLastReadSeq: 0,
-    seenReceivedSeqs: new Set(), initialHistoryRequest: null,
-    catchupRequest: null, catchupTargetSeq: 0, catchupRecordVisibility: false,
+    syncedSeq: 0, nextCursor: null, lastReadSeq: 0, peerLastReadSeq: 0,
+    initialHistoryRequest: null, catchupRequest: null, catchupTargetSeq: 0,
     olderRequest: null, readRequest: null, pendingReadSeq: 0,
     pendingSend: null, draftContent: "" };
 }
@@ -294,12 +294,8 @@ async function loadUsers() {
   }
   renderPeerList();
 }
-function receivedText(message) {
-  return message.sender_id !== state.currentUserID && message.kind !== "system";
-}
-function countReceived(cache, low, high) {
-  return [...cache.messages.values()].filter((message) =>
-    message.seq > low && message.seq <= high && receivedText(message)).length;
+function receivedMessage(message) {
+  return message.sender_id !== state.currentUserID;
 }
 function reconcileThreadSummary(thread) {
   const cache = cacheForThread(thread.id);
@@ -310,12 +306,15 @@ function reconcileThreadSummary(thread) {
     cache.lastReadSeq = Number(thread.last_read_seq || 0);
     cache.pendingReadSeq = 0;
     cache.readRequest = null;
-    cache.seenReceivedSeqs.clear();
     cache.members = null;
     cache.membersDirty = true;
   } else if (cache.lastReadSeq > Number(thread.last_read_seq || 0)) {
-    thread.unread_count = Math.max(0, Number(thread.unread_count || 0) -
-      countReceived(cache, Number(thread.last_read_seq || 0), cache.lastReadSeq));
+    // An older summary cannot undo a PUT that already completed.
+    if (cache.lastReadSeq < Number(thread.last_seq || 0)) {
+      scheduleThreadSummaryRefresh();
+      return cache;
+    }
+    thread.unread_count = 0;
   }
   cache.lastReadSeq = Math.max(cache.lastReadSeq, Number(thread.last_read_seq || 0));
   thread.last_read_seq = cache.lastReadSeq;
@@ -326,7 +325,7 @@ function reconcileThreadSummary(thread) {
     if (seq <= cache.summaryBaseSeq) cache.eventMessages.delete(seq);
     else {
       thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
-      if (receivedText(message) && seq > cache.lastReadSeq) thread.unread_count += 1;
+      if (receivedMessage(message) && seq > cache.lastReadSeq) thread.unread_count += 1;
     }
   }
   cache.summary = thread;
@@ -351,7 +350,7 @@ function updateThreadFromMessage(message) {
   if (!thread) scheduleThreadSummaryRefresh();
   else {
     thread.last_seq = Math.max(Number(thread.last_seq || 0), seq);
-    if (cache.active && receivedText(message) && seq > cache.lastReadSeq) thread.unread_count += 1;
+    if (cache.active && receivedMessage(message) && seq > cache.lastReadSeq) thread.unread_count += 1;
   }
   if (message.kind === "system") {
     state.membershipSerial += 1;
@@ -363,23 +362,15 @@ function updateThreadFromMessage(message) {
   }
   renderPeerList();
 }
-function acceptMessage(message, recordVisibility = true) {
+function acceptMessage(message) {
   const cache = cacheForThread(message.thread_id);
   const changed = mergeMessages(cache, [message]);
   if (cache.messagesLoaded && changed) {
     const seq = Number(message.seq);
-    MiniHermesRealtime.confirmRange(cache.confirmedRanges, seq, seq);
-    if (seq > cache.syncedSeq + 1) void catchUpConversation(cache, seq, recordVisibility);
+    if (seq > cache.syncedSeq + 1) void catchUpConversation(cache, seq);
     else while (cache.messages.has(cache.syncedSeq + 1)) cache.syncedSeq += 1;
   }
   return { cache, changed };
-}
-function applyLocalReadMarker(threadID, previous, current) {
-  const cache = state.threads.get(threadID);
-  if (!cache?.summary || !cache.active || current <= previous) return;
-  cache.summary.last_read_seq = current;
-  cache.summary.unread_count = Math.max(0, Number(cache.summary.unread_count || 0) - countReceived(cache, previous, current));
-  renderPeerList();
 }
 function scheduleThreadSummaryRefresh() {
   if (state.threadSummaryTimer !== null) return;
@@ -403,10 +394,14 @@ async function loadThreads(catchUpCached = false) {
       do {
         state.threadListDirty = false;
         const serial = state.membershipSerial;
+        const readSerial = state.readSerial;
         const threads = await apiRequest("/threads");
         if (!currentSessionMatches(sessionVersion, token)) return;
-        // A membership event or local mutation after GET began invalidates its permissions.
-        if (serial !== state.membershipSerial) { state.threadListDirty = true; continue; }
+        // Membership/read changes after GET began invalidate its permissions/counts.
+        if (serial !== state.membershipSerial || readSerial !== state.readSerial) {
+          state.threadListDirty = true;
+          continue;
+        }
         const activeIDs = new Set(threads.map((thread) => thread.id));
         for (const thread of threads) {
           const cache = reconcileThreadSummary(thread);
@@ -425,7 +420,7 @@ async function loadThreads(catchUpCached = false) {
         renderPeerList();
         renderThreadHeading();
         const cache = state.currentCache;
-        if (cache?.messagesLoaded) renderMessages("preserve", false);
+        if (cache?.messagesLoaded) renderMessages("preserve");
         if (cache?.summary?.kind === "group" && cache.active && !membersPanel.hidden && cache.membersDirty) {
           void loadMembers(cache);
         }
@@ -463,13 +458,16 @@ function highestMessageSeq(cache) {
   return highest;
 }
 
-function renderMessages(scrollMode = "preserve", recordVisibility = true) {
+function atConversationBottom() {
+  return historyElement.scrollHeight - historyElement.scrollTop - historyElement.clientHeight <= historyBottomTolerance;
+}
+
+function renderMessages(scrollMode = "preserve") {
   const cache = state.currentCache;
   if (!cache) return;
-  const renderVersion = ++state.renderVersion;
   const previousHeight = historyElement.scrollHeight;
   const previousTop = historyElement.scrollTop;
-  const wasNearBottom = previousHeight - previousTop - historyElement.clientHeight < 48;
+  const wasAtBottom = atConversationBottom();
   const messages = sortedMessages(cache);
 
   historyElement.replaceChildren();
@@ -503,25 +501,16 @@ function renderMessages(scrollMode = "preserve", recordVisibility = true) {
     }
   }
 
-  if (scrollMode === "initial" || scrollMode === "bottom" || (scrollMode === "new" && wasNearBottom)) {
+  if (scrollMode === "initial" || scrollMode === "bottom" || (scrollMode === "new" && wasAtBottom)) {
     historyElement.scrollTop = historyElement.scrollHeight;
   } else if (scrollMode === "older") {
     historyElement.scrollTop = previousTop + historyElement.scrollHeight - previousHeight;
   } else {
     historyElement.scrollTop = previousTop;
   }
-  // Rendering may produce a scroll event even when the user did not scroll.
-  // Background catchup and sending must not mark newly fetched messages read.
-  state.renderedScrollTop = historyElement.scrollTop;
-
   loadOlderButton.hidden = cache.nextCursor === null;
   loadOlderButton.disabled = cache.nextCursor === null || Boolean(cache.olderRequest);
-  if (recordVisibility) {
-    const snapshot = conversationSnapshot();
-    requestAnimationFrame(() => {
-      if (renderVersion === state.renderVersion) recordVisibleMessages(snapshot);
-    });
-  }
+  scheduleReadMarker();
 }
 
 function pageURL(threadID, beforeSeq = null) {
@@ -544,7 +533,7 @@ async function loadInitialHistory(cache = state.currentCache) {
       if (!cacheSnapshotMatches(snapshot)) return;
       mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
       cache.nextCursor = page.next_cursor ?? null;
-      cache.syncedSeq = MiniHermesRealtime.confirmPage(cache, page);
+      cache.syncedSeq = Math.max(0, ...(page.messages || []).map((message) => Number(message.seq) || 0));
       cache.messagesLoaded = true;
       if (state.currentCache === cache) renderMessages("initial");
       const target = Math.max(highestMessageSeq(cache), Number(cache.summary?.last_seq || 0));
@@ -558,9 +547,8 @@ async function loadInitialHistory(cache = state.currentCache) {
   return request.promise;
 }
 
-async function catchUpConversation(cache = state.currentCache, targetSeq = 0, recordVisibility = false) {
+async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
   if (!cache || state.threads.get(cache.threadID) !== cache || !cache.messagesLoaded || !state.token) return;
-  cache.catchupRecordVisibility ||= recordVisibility;
   if (cache.catchupRequest) {
     cache.catchupTargetSeq = Math.max(cache.catchupTargetSeq, targetSeq);
     return cache.catchupRequest.promise;
@@ -578,28 +566,23 @@ async function catchUpConversation(cache = state.currentCache, targetSeq = 0, re
           if (!cacheSnapshotMatches(snapshot)) throw new Error("session changed");
           return page;
         }, baseline,
-        (messages, page, beforeSeq) => {
-          mergeMessages(cache, messages);
-          MiniHermesRealtime.confirmPage(cache, page, beforeSeq);
-        },
+        (messages) => mergeMessages(cache, messages),
       );
       if (!cacheSnapshotMatches(snapshot)) return;
       cache.syncedSeq = Math.max(cache.syncedSeq, maxSeq);
       completed = true;
-      if (state.currentCache === cache) renderMessages("new", cache.catchupRecordVisibility);
+      if (state.currentCache === cache) renderMessages("new");
     } catch (error) {
       if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
     } finally {
       if (cache.catchupRequest !== request) return;
       cache.catchupRequest = null;
       const nextTarget = cache.catchupTargetSeq;
-      const visible = cache.catchupRecordVisibility;
       cache.catchupTargetSeq = 0;
-      cache.catchupRecordVisibility = false;
       // Only a newer event received during this fetch can cause one more pass.
       // The same inaccessible target must never keep a group in a sync loop.
       if (completed && nextTarget > cache.syncedSeq && nextTarget > targetSeq && cacheSnapshotMatches(snapshot)) {
-        void catchUpConversation(cache, nextTarget, visible);
+        void catchUpConversation(cache, nextTarget);
       }
     }
   })();
@@ -843,7 +826,6 @@ async function loadOlderMessages() {
       return;
     }
     mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
-    MiniHermesRealtime.confirmPage(cache, page, request.beforeSeq);
     cache.nextCursor = page.next_cursor ?? null;
     if (state.currentCache === cache) {
       renderMessages("older");
@@ -864,58 +846,55 @@ async function loadOlderMessages() {
   }
 }
 
-function isElementVisibleInHistory(element) {
-  const historyRect = historyElement.getBoundingClientRect();
-  const messageRect = element.getBoundingClientRect();
-  return messageRect.bottom > historyRect.top && messageRect.top < historyRect.bottom;
-}
-
-function recordVisibleMessages(snapshot = conversationSnapshot()) {
+function renderedReadSequence(snapshot) {
   const cache = snapshot.cache;
   if (
     !currentConversationMatches(snapshot) ||
+    !membershipSnapshotMatches(snapshot) ||
     document.visibilityState !== "visible" ||
     chatView.hidden ||
-    !cache.messagesLoaded
+    !cache.messagesLoaded || !canUseThread(cache) || !atConversationBottom()
   ) {
-    return;
+    return 0;
   }
-
-  for (const element of historyElement.querySelectorAll(".message.received[data-seq]")) {
-    if (element.dataset.kind === "system" || !isElementVisibleInHistory(element)) {
-      continue;
-    }
-    const seq = Number(element.dataset.seq);
-    if (Number.isSafeInteger(seq) && seq > cache.lastReadSeq) {
-      cache.seenReceivedSeqs.add(seq);
-    }
-  }
-
-  if (!canUseThread(cache)) return;
-  const candidate = MiniHermesRealtime.visibleReadCandidate(cache, state.currentUserID);
-  if (candidate > cache.lastReadSeq) queueReadMarker(candidate, snapshot);
+  const latest = historyElement.querySelector(".message:last-child");
+  if (!latest) return 0;
+  const historyRect = historyElement.getBoundingClientRect();
+  const messageRect = latest.getBoundingClientRect();
+  const visibleTop = Math.max(0, historyRect.top);
+  const visibleBottom = Math.min(window.innerHeight, historyRect.bottom);
+  if (messageRect.bottom <= visibleTop || messageRect.top >= visibleBottom ||
+      messageRect.bottom > visibleBottom + historyBottomTolerance ||
+      messageRect.right <= 0 || messageRect.left >= window.innerWidth) return 0;
+  const seq = Number(latest.dataset.seq);
+  return Number.isSafeInteger(seq) && seq >= Number(cache.summary.joined_seq || 1) ? seq : 0;
 }
 
-function queueReadMarker(lastReadSeq, snapshot) {
-  if (!currentConversationMatches(snapshot) || document.visibilityState !== "visible") {
-    return;
-  }
-  snapshot.cache.pendingReadSeq = Math.max(snapshot.cache.pendingReadSeq, lastReadSeq);
-  flushReadMarker(snapshot);
+function markConversationRead(snapshot = conversationSnapshot()) {
+  const seq = renderedReadSequence(snapshot);
+  if (seq <= (snapshot.cache?.lastReadSeq || 0)) return;
+  snapshot.cache.pendingReadSeq = Math.max(snapshot.cache.pendingReadSeq, seq);
+  void flushReadMarker(snapshot);
+}
+
+function scheduleReadMarker() {
+  if (state.readFrame !== null) cancelAnimationFrame(state.readFrame);
+  const snapshot = conversationSnapshot();
+  state.readFrame = requestAnimationFrame(() => {
+    state.readFrame = null;
+    markConversationRead(snapshot);
+  });
 }
 
 async function flushReadMarker(snapshot = conversationSnapshot()) {
   const cache = snapshot.cache;
-  if (
-    !canUseThread(cache) || cache.readRequest ||
-    cache.pendingReadSeq <= cache.lastReadSeq ||
-    !currentConversationMatches(snapshot) ||
-    document.visibilityState !== "visible"
-  ) {
+  const renderedSeq = renderedReadSequence(snapshot);
+  if (!renderedSeq || cache.readRequest || cache.pendingReadSeq <= cache.lastReadSeq) {
     return;
   }
 
-  const target = cache.pendingReadSeq;
+  const target = Math.min(cache.pendingReadSeq, renderedSeq);
+  if (target <= cache.lastReadSeq) return;
   cache.pendingReadSeq = 0;
   const request = { ...snapshot, target };
   let completed = false;
@@ -929,18 +908,20 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
     if (!membershipSnapshotMatches(snapshot) || !canUseThread(cache)) return;
 
     const previousReadSeq = cache.lastReadSeq;
+    const hadUnread = Number(cache.summary.unread_count || 0) > 0;
     cache.lastReadSeq = Math.max(cache.lastReadSeq, Number(response.last_read_seq || 0));
-    applyLocalReadMarker(snapshot.threadID, previousReadSeq, cache.lastReadSeq);
-    if (cache.lastReadSeq > target) {
-      // Another tab advanced the marker; local messages may not cover that range.
-      void loadThreads();
+    if (cache.lastReadSeq > previousReadSeq) {
+      state.readSerial += 1;
+      cache.summary.last_read_seq = cache.lastReadSeq;
+      if (cache.lastReadSeq >= Number(cache.summary.last_seq || 0)) cache.summary.unread_count = 0;
+      renderPeerList();
+      // Existing GETs must not restore a marker from before this PUT.
+      if (state.threadListRequest) state.threadListDirty = true;
+      // Zero unread stays zero when only our own messages advance the marker.
+      // Otherwise recount pages not loaded here, including another tab's read.
+      if (hadUnread || cache.lastReadSeq > target) void loadThreads();
     }
     completed = true;
-    for (const seq of cache.seenReceivedSeqs) {
-      if (seq <= cache.lastReadSeq) {
-        cache.seenReceivedSeqs.delete(seq);
-      }
-    }
   } catch (error) {
     if (membershipSnapshotMatches(snapshot) && canUseThread(cache)) {
       // PUT may have committed despite a lost response; retrying a monotonic marker is safe.
@@ -953,9 +934,9 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
       cache.readRequest = null;
     }
     if (completed && membershipSnapshotMatches(snapshot) && currentConversationMatches(snapshot)) {
-      recordVisibleMessages(snapshot);
+      markConversationRead(snapshot);
     } else if (completed && membershipSnapshotMatches(snapshot) && state.currentCache === cache) {
-      recordVisibleMessages();
+      markConversationRead();
     }
   }
 }
@@ -1086,8 +1067,8 @@ async function changeMembership(cache, action, userID = "") {
       ...(action === "add" ? { body: JSON.stringify({ user_id: userID }) } : {}) });
     if (!cacheSnapshotMatches(snapshot)) return;
     updateThreadFromMessage(message);
-    acceptMessage(message, false);
-    if (state.currentCache === cache) renderMessages("new", false);
+    acceptMessage(message);
+    if (state.currentCache === cache) renderMessages("new");
   } catch (error) {
     if (!cacheSnapshotMatches(snapshot)) return;
     if (error.status === 503 && error.details?.thread_id) {
@@ -1283,7 +1264,7 @@ messageForm.addEventListener("submit", async (event) => {
       cache.draftContent = "";
     }
     updateThreadFromMessage(message);
-    acceptMessage(message, false);
+    acceptMessage(message);
     if (state.currentCache === cache) {
       if (contentInput.value === pending.content) {
         contentInput.value = "";
@@ -1291,9 +1272,8 @@ messageForm.addEventListener("submit", async (event) => {
         cache.draftContent = contentInput.value;
         showNotice("Tin trước đã gửi; nội dung đã sửa vẫn ở ô nhập. Bấm Gửi để gửi thành tin mới.");
       }
-      renderMessages(currentConversationMatches(snapshot) ? "bottom" : "new", false);
+      renderMessages(currentConversationMatches(snapshot) ? "bottom" : "new");
     }
-    if (cache.summary?.kind === "direct") scheduleThreadSummaryRefresh();
   } catch (error) {
     if (cacheSnapshotMatches(snapshot) && error.status === 403) void loadThreads();
     if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
@@ -1328,19 +1308,9 @@ logoutButton.addEventListener("click", () => {
 
 loadOlderButton.addEventListener("click", loadOlderMessages);
 
-historyElement.addEventListener("scroll", () => {
-  if (state.renderedScrollTop === historyElement.scrollTop) {
-    state.renderedScrollTop = null;
-    return;
-  }
-  state.renderedScrollTop = null;
-  if (state.visibilityFrame !== null) cancelAnimationFrame(state.visibilityFrame);
-  const snapshot = conversationSnapshot();
-  state.visibilityFrame = requestAnimationFrame(() => {
-    state.visibilityFrame = null;
-    recordVisibleMessages(snapshot);
-  });
-});
+historyElement.addEventListener("scroll", scheduleReadMarker);
+window.addEventListener("scroll", scheduleReadMarker);
+window.addEventListener("resize", scheduleReadMarker);
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState !== "visible") {
@@ -1353,7 +1323,7 @@ document.addEventListener("visibilitychange", () => {
     return;
   }
   const snapshot = conversationSnapshot();
-  recordVisibleMessages(snapshot);
+  markConversationRead(snapshot);
   void flushReadMarker(snapshot);
   ensureWebSocket();
 });

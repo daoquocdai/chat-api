@@ -53,48 +53,7 @@ const MiniHermesRealtime = (() => {
     }
   }
 
-  // A REST page confirms both returned messages and gaps inside its numeric range.
-  // A gap outside these ranges still needs fetching; an event alone confirms only its seq.
-  function confirmRange(ranges, start, end) {
-    if (end < start) return;
-    const merged = [];
-    for (const range of [...ranges, [start, end]].sort((a, b) => a[0] - b[0])) {
-      const last = merged[merged.length - 1];
-      if (last && range[0] <= last[1] + 1) last[1] = Math.max(last[1], range[1]);
-      else merged.push([...range]);
-    }
-    ranges.splice(0, ranges.length, ...merged);
-  }
-
-  function covers(ranges, start, end) {
-    return end < start || ranges.some(([low, high]) => low <= start && high >= end);
-  }
-
-  function confirmPage(cache, page, beforeSeq = null) {
-    const messages = Array.isArray(page.messages) ? page.messages : [];
-    const seqs = messages.map((message) => Number(message.seq));
-    const end = beforeSeq === null ? Math.max(0, ...seqs) : beforeSeq - 1;
-    const start = page.next_cursor == null ? 1 : Math.min(...seqs);
-    confirmRange(cache.confirmedRanges, start, end);
-    return end;
-  }
-
-  function visibleReadCandidate(cache, userID) {
-    let candidate = cache.lastReadSeq;
-    let target = candidate;
-    for (const message of [...cache.messages.values()].sort((a, b) => a.seq - b.seq)) {
-      if (message.seq <= candidate) continue;
-      if (!covers(cache.confirmedRanges, candidate + 1, message.seq)) break;
-      if (message.sender_id !== userID && message.kind !== "system") {
-        if (!cache.seenReceivedSeqs.has(message.seq)) break;
-        target = message.seq;
-      }
-      candidate = message.seq;
-    }
-    return target;
-  }
-
-  return { merge, fetchThroughBoundary, confirmRange, covers, confirmPage, visibleReadCandidate };
+  return { merge, fetchThroughBoundary };
 })();
 
 if (typeof module !== "undefined") {

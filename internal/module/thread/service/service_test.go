@@ -6,9 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
-	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
 	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
 	"github.com/daoquocdai/chat-api/internal/module/thread/service"
@@ -127,7 +125,7 @@ func TestCreateOrGetDirect(t *testing.T) {
 				return wantThread, true, tt.repositoryError
 			}}
 
-			got, created, err := service.New(repository, users, &fakeGroupPublisher{}, time.Second).CreateOrGetDirect(
+			got, created, err := service.New(repository, users, &fakeGroupPublisher{}).CreateOrGetDirect(
 				ctx,
 				actorExternalID,
 				tt.peerID,
@@ -181,7 +179,7 @@ func TestMarkRead(t *testing.T) {
 				return tt.want, tt.repositoryErr
 			}}
 
-			got, err := service.New(repository, users, &fakeGroupPublisher{}, time.Second).MarkRead(ctx, actorExternalID, tt.threadID, tt.lastReadSeq)
+			got, err := service.New(repository, users, &fakeGroupPublisher{}).MarkRead(ctx, actorExternalID, tt.threadID, tt.lastReadSeq)
 			if !errors.Is(err, tt.wantError) || got != tt.want {
 				t.Fatalf("result = (%d, %v), want (%d, %v)", got, err, tt.want, tt.wantError)
 			}
@@ -206,17 +204,20 @@ func (r *fakeThreadRepository) ListMembers(ctx context.Context, thread string, a
 }
 
 type fakeGroupPublisher struct {
-	events    []messageevent.MessageCreated
+	messages  []messagemodel.Message
 	err       error
-	onPublish func(context.Context, messageevent.MessageCreated)
+	onPublish func(context.Context, messagemodel.Message)
 }
 
-func (p *fakeGroupPublisher) Publish(ctx context.Context, event messageevent.MessageCreated) error {
-	p.events = append(p.events, event)
+func (p *fakeGroupPublisher) PublishMessage(ctx context.Context, event messagemodel.Message) error {
+	p.messages = append(p.messages, event)
 	if p.onPublish != nil {
 		p.onPublish(ctx, event)
 	}
-	return p.err
+	if p.err != nil {
+		return &messagemodel.EventPublishError{MessageID: event.ExternalID, ThreadID: event.ThreadExternalID, SenderID: event.SenderExternalID, Seq: event.Seq, Cause: p.err}
+	}
+	return nil
 }
 
 func TestCreateGroup(t *testing.T) {
@@ -253,7 +254,7 @@ func TestCreateGroup(t *testing.T) {
 				return usermodel.User{}, usermodel.ErrUserNotFound
 			}}
 			saved := threadmodel.Thread{ID: 7, ExternalID: threadExternalID, Kind: "group", Name: strings.TrimSpace(tc.groupName), Role: "admin"}
-			system := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, ThreadKind: "group", MembershipVersion: 1, SenderExternalID: actorExternalID, Kind: "system", Seq: 1, RecipientIDs: []string{actorExternalID, peerExternalID}}
+			system := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, ThreadKind: "group", SenderExternalID: actorExternalID, Kind: "system", Seq: 1}
 			order := []string{}
 			repo := &fakeThreadRepository{createGroup: func(_ context.Context, actor int64, name string, ids []int64, content string) (threadmodel.Thread, messagemodel.Message, error) {
 				order = append(order, "repository")
@@ -266,21 +267,18 @@ func TestCreateGroup(t *testing.T) {
 				return saved, system, tc.repoErr
 			}}
 			publisher := &fakeGroupPublisher{err: tc.publishErr}
-			publisher.onPublish = func(ctx context.Context, event messageevent.MessageCreated) {
+			publisher.onPublish = func(ctx context.Context, event messagemodel.Message) {
 				order = append(order, "publisher")
-				if _, ok := ctx.Deadline(); !ok {
-					t.Fatal("publish timeout missing")
-				}
-				if !reflect.DeepEqual(event.RecipientIDs, system.RecipientIDs) || event.MessageID != system.ExternalID || event.ThreadKind != "group" || event.MembershipVersion != 1 {
+				if !reflect.DeepEqual(event, system) {
 					t.Fatalf("event = %+v", event)
 				}
 			}
-			got, err := service.New(repo, users, publisher, time.Second).CreateGroup(context.Background(), actorExternalID, tc.groupName, tc.ids)
+			got, err := service.New(repo, users, publisher).CreateGroup(context.Background(), actorExternalID, tc.groupName, tc.ids)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("error = %v, want %v", err, tc.wantErr)
 			}
-			if repo.calls != tc.wantRepo || len(publisher.events) != tc.wantPublish {
-				t.Fatalf("calls = %d/%d", repo.calls, len(publisher.events))
+			if repo.calls != tc.wantRepo || len(publisher.messages) != tc.wantPublish {
+				t.Fatalf("calls = %d/%d", repo.calls, len(publisher.messages))
 			}
 			if tc.wantPublish == 1 && (got != saved || strings.Join(order, ",") != "repository,publisher") {
 				t.Fatalf("saved result/order = %+v/%v", got, order)
@@ -315,7 +313,7 @@ func TestGroupMembership(t *testing.T) {
 				}
 				return usermodel.User{ID: 22, Username: "Bob"}, nil
 			}}
-			saved := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, ThreadKind: "group", MembershipVersion: 6, Kind: "system", Seq: 9}
+			saved := messagemodel.Message{ExternalID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", ThreadExternalID: threadExternalID, ThreadKind: "group", Kind: "system", Seq: 9}
 			repo := &fakeThreadRepository{changeMember: func(_ context.Context, thread string, actor, target int64, action threadmodel.MembershipAction, content string) (messagemodel.Message, error) {
 				wantTarget := int64(22)
 				if action == threadmodel.LeaveGroup {
@@ -327,7 +325,7 @@ func TestGroupMembership(t *testing.T) {
 				return saved, tc.repoErr
 			}}
 			pub := &fakeGroupPublisher{err: tc.publishErr}
-			svc := service.New(repo, users, pub, time.Second)
+			svc := service.New(repo, users, pub)
 			var got messagemodel.Message
 			var err error
 			switch tc.action {
@@ -348,11 +346,11 @@ func TestGroupMembership(t *testing.T) {
 					t.Fatal("lost saved message")
 				}
 			}
-			if len(pub.events) != wantPublish {
+			if len(pub.messages) != wantPublish {
 				t.Fatal("published before successful repository return")
 			}
-			if wantPublish == 1 && (pub.events[0].ThreadKind != "group" || pub.events[0].MembershipVersion != 6) {
-				t.Fatal("membership operation lost the publishing snapshot version")
+			if wantPublish == 1 && !reflect.DeepEqual(pub.messages[0], saved) {
+				t.Fatal("membership operation lost the saved message")
 			}
 		})
 	}
@@ -366,7 +364,7 @@ func TestGroupMembers(t *testing.T) {
 		}
 		return nil, nil
 	}}
-	got, err := service.New(repo, users, &fakeGroupPublisher{}, time.Second).Members(context.Background(), actorExternalID, threadExternalID)
+	got, err := service.New(repo, users, &fakeGroupPublisher{}).Members(context.Background(), actorExternalID, threadExternalID)
 	if err != nil || got == nil || len(got) != 0 {
 		t.Fatalf("members=%v error=%v", got, err)
 	}

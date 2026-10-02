@@ -80,21 +80,16 @@ func run() error {
 
 	threadRepository := threadrepository.New(pool)
 	messageRepository := messagerepository.New(pool)
-	messagePublisher := messageservice.NewCachedPublisher(
-		messageRepository,
-		membership.NewRedis(redisClient, cfg.Redis.Stream),
-		messagepublisher.NewRedis(redisClient, cfg.Redis.Stream),
-	)
-	threadService := threadservice.New(threadRepository, userService, messagePublisher, cfg.Redis.PublishTimeout)
-	threadHandler := threadhandler.New(threadService)
-
 	messageService := messageservice.New(
 		messageRepository,
 		userService,
-		messagePublisher,
+		messagepublisher.NewRedis(redisClient, cfg.Redis.Stream),
+		membership.NewRedis(redisClient, cfg.Redis.Stream),
 		cfg.Redis.PublishTimeout,
 	)
 	messageHandler := messagehandler.New(messageService)
+	threadService := threadservice.New(threadRepository, userService, messageService)
+	threadHandler := threadhandler.New(threadService)
 	wsTicketService := wsticket.NewService(wsticket.NewRedisRepository(redisClient), cfg.WSTicketTTL)
 	wsTicketHandler := wsticket.NewHandler(wsTicketService, cfg.WSPublicURL, cfg.Redis.PublishTimeout)
 

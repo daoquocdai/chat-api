@@ -32,6 +32,16 @@ WHERE thread.external_id = sqlc.arg(thread_external_id)
   AND (participant.left_seq IS NULL OR participant.left_seq >= sqlc.arg(seq)::BIGINT)
 ORDER BY member.external_id;
 
+-- name: GetMembershipVersion :one
+-- A removal includes its system message; the snapshot changes at left_seq + 1.
+-- Resolve after commit at the message seq, for both direct and group messages.
+SELECT COALESCE(MAX(boundary.seq), 0)::BIGINT AS version
+FROM participants AS participant
+JOIN threads AS thread ON thread.id = participant.thread_id
+CROSS JOIN LATERAL (VALUES (participant.joined_seq), (participant.left_seq + 1)) AS boundary(seq)
+WHERE thread.external_id = sqlc.arg(thread_external_id)
+  AND boundary.seq <= sqlc.arg(seq)::BIGINT;
+
 -- name: GetMessageByExternalID :one
 SELECT
     m.id,

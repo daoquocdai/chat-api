@@ -72,7 +72,7 @@ func (r *PostgresRepository) Send(
 				existing.SenderExternalID, existing.Seq, existing.ThreadKind, existing.Kind,
 				existing.ContentFormat, existing.Content, existing.CreatedAt,
 			)
-			return setAudience(ctx, queries, threadInternalID, &result)
+			return nil
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -99,7 +99,7 @@ func (r *PostgresRepository) Send(
 			message.SenderExternalID, message.Seq, message.ThreadKind, message.Kind,
 			message.ContentFormat, message.Content, message.CreatedAt,
 		)
-		return setAudience(ctx, queries, threadInternalID, &result)
+		return nil
 	})
 	if err != nil {
 		if isExternalIDUniqueViolation(err) {
@@ -216,29 +216,13 @@ func isExternalIDUniqueViolation(err error) bool {
 		postgresError.ConstraintName == "messages_external_id_key"
 }
 
-func setAudience(ctx context.Context, queries *sqlc.Queries, threadID int64, message *model.Message) error {
-	if message.ThreadKind == "group" {
-		version, err := queries.GetMembershipVersion(ctx, sqlc.GetMembershipVersionParams{ThreadID: threadID, Seq: message.Seq})
-		message.MembershipVersion = version
-		return err
-	}
-	id, err := parseUUID(message.ThreadExternalID, model.ErrInvalidThreadID)
+// MembershipVersionAtSequence resolves the immutable snapshot key after commit.
+func (r *PostgresRepository) MembershipVersionAtSequence(ctx context.Context, threadExternalID string, seq int64) (int64, error) {
+	id, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	members, err := queries.ListMemberIDsAtSequence(ctx, sqlc.ListMemberIDsAtSequenceParams{
-		ThreadExternalID: id, Seq: message.Seq,
-	})
-	if err != nil {
-		return err
-	}
-	message.RecipientIDs = make([]string, 0, len(members))
-	for _, id := range members {
-		if externalID := id.String(); externalID != message.SenderExternalID {
-			message.RecipientIDs = append(message.RecipientIDs, externalID)
-		}
-	}
-	return nil
+	return sqlc.New(r.pool).GetMembershipVersion(ctx, sqlc.GetMembershipVersionParams{ThreadExternalID: id, Seq: seq})
 }
 
 // ListMemberIDsAtSequence is only used by the publishing service after commit.

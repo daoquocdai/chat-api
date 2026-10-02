@@ -3,10 +3,8 @@ package service
 import (
 	"context"
 	"strings"
-	"time"
 
 	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
-	messageservice "github.com/daoquocdai/chat-api/internal/module/message/service"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 )
@@ -24,15 +22,18 @@ type UserFinder interface {
 	GetByExternalID(ctx context.Context, externalID string) (usermodel.User, error)
 }
 
-type Service struct {
-	repository     Repository
-	users          UserFinder
-	publisher      messageservice.Publisher
-	publishTimeout time.Duration
+type MessagePublisher interface {
+	PublishMessage(context.Context, messagemodel.Message) error
 }
 
-func New(repository Repository, users UserFinder, publisher messageservice.Publisher, publishTimeout time.Duration) *Service {
-	return &Service{repository: repository, users: users, publisher: publisher, publishTimeout: publishTimeout}
+type Service struct {
+	repository Repository
+	users      UserFinder
+	publisher  MessagePublisher
+}
+
+func New(repository Repository, users UserFinder, publisher MessagePublisher) *Service {
+	return &Service{repository: repository, users: users, publisher: publisher}
 }
 
 func (s *Service) CreateOrGetDirect(

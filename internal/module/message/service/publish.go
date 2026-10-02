@@ -10,10 +10,6 @@ import (
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 )
 
-type MembershipRepository interface {
-	ListMemberIDsAtSequence(context.Context, string, int64) ([]string, error)
-}
-
 const cacheOperationTimeout = 100 * time.Millisecond
 
 type MembershipCache interface {
@@ -21,65 +17,65 @@ type MembershipCache interface {
 	Put(context.Context, string, int64, []string) error
 }
 
-// CachedPublisher resolves group recipients once per membership version, then publishes
-// a self-contained event. The gateway needs neither this cache nor PostgreSQL.
-type CachedPublisher struct {
-	repository MembershipRepository
-	cache      MembershipCache
-	publisher  Publisher
-}
-
-func NewCachedPublisher(repository MembershipRepository, cache MembershipCache, publisher Publisher) *CachedPublisher {
-	return &CachedPublisher{repository: repository, cache: cache, publisher: publisher}
-}
-
-func (p *CachedPublisher) Publish(ctx context.Context, event messageevent.MessageCreated) error {
-	if event.ThreadKind == "group" {
-		if event.MembershipVersion < 1 || event.MembershipVersion > event.Seq {
-			return fmt.Errorf("invalid membership version")
-		}
-		// Cache work has a small separate budget; a slow cache must leave time for DB fallback/XADD.
-		cacheCtx, cancel := context.WithTimeout(ctx, cacheOperationTimeout)
-		members, err := p.cache.Get(cacheCtx, event.ThreadID, event.MembershipVersion)
-		cancel()
-		if err != nil {
-			log.Printf("membership cache read failed thread_id=%s: %v", event.ThreadID, err)
-		}
-		if err != nil || members == nil {
-			members, err = p.repository.ListMemberIDsAtSequence(ctx, event.ThreadID, event.Seq)
-			if err != nil {
-				return fmt.Errorf("load membership snapshot: %w", err)
-			}
-			if len(members) == 0 {
-				return fmt.Errorf("empty membership snapshot")
-			}
-			cacheCtx, cancel := context.WithTimeout(ctx, cacheOperationTimeout)
-			err = p.cache.Put(cacheCtx, event.ThreadID, event.MembershipVersion, members)
-			cancel()
-			if err != nil {
-				log.Printf("membership cache write failed thread_id=%s: %v", event.ThreadID, err)
-			}
-		}
-		// Cache includes the sender so every sender can reuse the same snapshot.
-		event.RecipientIDs = make([]string, 0, len(members))
-		for _, id := range members {
-			if event.Kind == "system" || id != event.SenderID {
-				event.RecipientIDs = append(event.RecipientIDs, id)
-			}
-		}
-	}
-	return p.publisher.Publish(ctx, event)
-}
-
-// PublishMessage is the single post-commit timeout/error path for text and system messages.
-func PublishMessage(ctx context.Context, publisher Publisher, timeout time.Duration, message model.Message) error {
-	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+// PublishMessage is shared by text and group operations, after their transaction commits.
+func (s *Service) PublishMessage(ctx context.Context, message model.Message) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.publishTimeout)
 	defer cancel()
-	if err := publisher.Publish(publishCtx, messageevent.FromMessage(message)); err != nil {
+	recipients, err := s.messageRecipients(ctx, message)
+	if err == nil {
+		event := messageevent.FromMessage(message, recipients)
+		err = s.publisher.Publish(ctx, event)
+	}
+	if err != nil {
 		return &model.EventPublishError{
 			MessageID: message.ExternalID, ThreadID: message.ThreadExternalID,
 			SenderID: message.SenderExternalID, Seq: message.Seq, Cause: err,
 		}
 	}
 	return nil
+}
+
+func (s *Service) messageRecipients(ctx context.Context, message model.Message) ([]string, error) {
+	// Membership boundaries after this seq cannot change its historical snapshot.
+	version, err := s.repository.MembershipVersionAtSequence(ctx, message.ThreadExternalID, message.Seq)
+	if err != nil {
+		return nil, fmt.Errorf("load membership version: %w", err)
+	}
+	if version < 1 || version > message.Seq {
+		return nil, fmt.Errorf("invalid membership version")
+	}
+	var members []string
+	if s.cache != nil {
+		cacheCtx, cancel := context.WithTimeout(ctx, cacheOperationTimeout)
+		members, err = s.cache.Get(cacheCtx, message.ThreadExternalID, version)
+		cancel()
+		if err != nil {
+			log.Printf("membership cache read failed thread_id=%s: %v", message.ThreadExternalID, err)
+		}
+	}
+	if err != nil || members == nil {
+		members, err = s.repository.ListMemberIDsAtSequence(ctx, message.ThreadExternalID, message.Seq)
+		if err != nil {
+			return nil, fmt.Errorf("load membership snapshot: %w", err)
+		}
+		if len(members) == 0 {
+			return nil, fmt.Errorf("empty membership snapshot")
+		}
+		if s.cache != nil {
+			cacheCtx, cancel := context.WithTimeout(ctx, cacheOperationTimeout)
+			err = s.cache.Put(cacheCtx, message.ThreadExternalID, version, members)
+			cancel()
+			if err != nil {
+				log.Printf("membership cache write failed thread_id=%s: %v", message.ThreadExternalID, err)
+			}
+		}
+	}
+	// The shared snapshot includes the sender; only text removes them from delivery.
+	recipients := make([]string, 0, len(members))
+	for _, id := range members {
+		if message.Kind == "system" || id != message.SenderExternalID {
+			recipients = append(recipients, id)
+		}
+	}
+	return recipients, nil
 }

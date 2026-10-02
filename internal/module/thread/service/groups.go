@@ -6,7 +6,6 @@ import (
 	"unicode/utf8"
 
 	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
-	messageservice "github.com/daoquocdai/chat-api/internal/module/message/service"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 )
 
@@ -50,7 +49,7 @@ func (s *Service) CreateGroup(ctx context.Context, actorExternalID, name string,
 	if err != nil {
 		return model.Thread{}, err
 	}
-	if err := messageservice.PublishMessage(ctx, s.publisher, s.publishTimeout, message); err != nil {
+	if err := s.publisher.PublishMessage(ctx, message); err != nil {
 		return thread, err
 	}
 	return thread, nil
@@ -99,7 +98,7 @@ func (s *Service) changeMember(ctx context.Context, actorExternalID, threadExter
 	if err != nil {
 		return messagemodel.Message{}, err
 	}
-	if err := messageservice.PublishMessage(ctx, s.publisher, s.publishTimeout, message); err != nil {
+	if err := s.publisher.PublishMessage(ctx, message); err != nil {
 		return message, err
 	}
 	return message, nil

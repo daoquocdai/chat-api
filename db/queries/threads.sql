@@ -42,8 +42,7 @@ SELECT
      WHERE unread_message.thread_id = t.id
        AND unread_message.seq >= mine.joined_seq
        AND unread_message.seq > mine.last_read_seq
-       AND unread_message.sender_id <> mine.user_id
-       AND unread_message.kind <> 'system') AS unread_count,
+       AND unread_message.sender_id <> mine.user_id) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
@@ -79,8 +78,7 @@ SELECT
      WHERE unread_message.thread_id = t.id
        AND unread_message.seq >= mine.joined_seq
        AND unread_message.seq > mine.last_read_seq
-       AND unread_message.sender_id <> mine.user_id
-       AND unread_message.kind <> 'system') AS unread_count,
+       AND unread_message.sender_id <> mine.user_id) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,

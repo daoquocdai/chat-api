@@ -208,28 +208,6 @@ func (q *Queries) GetLatestMembership(ctx context.Context, arg GetLatestMembersh
 	return i, err
 }
 
-const getMembershipVersion = `-- name: GetMembershipVersion :one
-SELECT COALESCE(MAX(boundary.seq), 0)::BIGINT AS version
-FROM participants AS participant
-CROSS JOIN LATERAL (VALUES (participant.joined_seq), (participant.left_seq + 1)) AS boundary(seq)
-WHERE participant.thread_id = $1
-  AND boundary.seq <= $2::BIGINT
-`
-
-type GetMembershipVersionParams struct {
-	ThreadID int64
-	Seq      int64
-}
-
-// A removal includes its system message: the recipient set changes at left_seq + 1.
-// The greatest boundary at/before seq identifies an immutable membership snapshot.
-func (q *Queries) GetMembershipVersion(ctx context.Context, arg GetMembershipVersionParams) (int64, error) {
-	row := q.db.QueryRow(ctx, getMembershipVersion, arg.ThreadID, arg.Seq)
-	var version int64
-	err := row.Scan(&version)
-	return version, err
-}
-
 const getThreadMessageAtSequence = `-- name: GetThreadMessageAtSequence :one
 SELECT m.id, m.external_id, t.external_id AS thread_external_id, t.kind AS thread_kind,
        sender.external_id AS sender_external_id, m.seq, m.kind,

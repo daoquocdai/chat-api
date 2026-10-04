@@ -1,13 +1,33 @@
 package dto
 
 import (
+	"bytes"
+	"encoding/json"
 	"time"
 
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 )
 
 type CreateDirectRequest struct {
-	PeerID string `json:"peer_id"`
+	PeerID         string  `json:"peer_id"`
+	EncryptionMode *string `json:"encryption_mode"`
+}
+
+func (r *CreateDirectRequest) UnmarshalJSON(body []byte) error {
+	type wire CreateDirectRequest
+	var value wire
+	if err := json.Unmarshal(body, &value); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return err
+	}
+	if raw, present := fields["encryption_mode"]; present && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return model.ErrInvalidEncryptionMode
+	}
+	*r = CreateDirectRequest(value)
+	return nil
 }
 
 type CreateGroupRequest struct {
@@ -50,6 +70,7 @@ type LastMessageResponse struct {
 type ThreadResponse struct {
 	ID              string               `json:"id"`
 	Kind            string               `json:"kind"`
+	EncryptionMode  string               `json:"encryption_mode"`
 	Peer            *PeerResponse        `json:"peer"`
 	Name            string               `json:"name,omitempty"`
 	Role            string               `json:"role"`
@@ -67,6 +88,7 @@ func ToThreadResponse(thread model.Thread) ThreadResponse {
 	response := ThreadResponse{
 		ID:              thread.ExternalID,
 		Kind:            thread.Kind,
+		EncryptionMode:  thread.EncryptionMode,
 		Name:            thread.Name,
 		Role:            thread.Role,
 		MemberCount:     thread.MemberCount,

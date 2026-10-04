@@ -2,10 +2,12 @@ package repository
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
+	"github.com/daoquocdai/chat-api/internal/e2ee"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -23,6 +25,7 @@ func New(pool *pgxpool.Pool) *PostgresRepository {
 func (r *PostgresRepository) CreateOrGetDirect(
 	ctx context.Context,
 	creatorID, peerID int64,
+	encryptionMode *string,
 ) (model.Thread, bool, error) {
 	lowID, highID := creatorID, peerID
 	if lowID > highID {
@@ -50,17 +53,42 @@ func (r *PostgresRepository) CreateOrGetDirect(
 			sqlc.GetDirectThreadByParticipantsParams{UserLowID: lowID, UserHighID: highID},
 		)
 		if err == nil {
+			if encryptionMode != nil && *encryptionMode != existing.EncryptionMode {
+				return model.ErrEncryptionModeConflict
+			}
 			thread = sqlc.CreateDirectThreadRow{
-				ID:         existing.ID,
-				ExternalID: existing.ExternalID,
-				Kind:       existing.Kind,
-				LastSeq:    existing.LastSeq,
-				CreatedAt:  existing.CreatedAt,
+				ID:             existing.ID,
+				ExternalID:     existing.ExternalID,
+				Kind:           existing.Kind,
+				EncryptionMode: existing.EncryptionMode,
+				LastSeq:        existing.LastSeq,
+				CreatedAt:      existing.CreatedAt,
 			}
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		} else {
-			thread, err = queries.CreateDirectThread(ctx, creatorID)
+			mode := "plaintext"
+			if encryptionMode != nil {
+				mode = *encryptionMode
+			}
+			if mode == "e2ee" {
+				for _, user := range lockedUsers {
+					spks, err := queries.GetE2EESignedPrekeys(ctx, user.ID)
+					if err != nil {
+						return err
+					}
+					if len(spks) != 1 {
+						return model.ErrE2EEBundleRequired
+					}
+					if err := e2ee.VerifyBundle(e2ee.Bundle{UserID: user.ExternalID.String(),
+						IdentityPublicKey: base64.StdEncoding.EncodeToString(user.IdentityPublicKey),
+						SignedPrekey:      e2ee.SignedPrekey{KeyID: spks[0].KeyID, PublicKey: base64.StdEncoding.EncodeToString(spks[0].PublicKey), Signature: base64.StdEncoding.EncodeToString(spks[0].Signature)},
+					}); err != nil {
+						return model.ErrE2EEBundleRequired
+					}
+				}
+			}
+			thread, err = queries.CreateDirectThread(ctx, sqlc.CreateDirectThreadParams{CreatedBy: creatorID, EncryptionMode: mode})
 			if err != nil {
 				return err
 			}
@@ -114,7 +142,8 @@ func (r *PostgresRepository) ListByUser(ctx context.Context, userID int64) ([]mo
 func threadFromRow(row sqlc.GetThreadSummaryForUserRow) model.Thread {
 	thread := model.Thread{
 		ID: row.ID, ExternalID: row.ExternalID.String(), Kind: row.Kind,
-		Name: row.Name, Role: row.Role, MemberCount: row.MemberCount,
+		EncryptionMode: row.EncryptionMode,
+		Name:           row.Name, Role: row.Role, MemberCount: row.MemberCount,
 		LastSeq: row.LastSeq, JoinedSeq: row.JoinedSeq, LastReadSeq: row.LastReadSeq,
 		PeerLastReadSeq: row.PeerLastReadSeq, UnreadCount: row.UnreadCount,
 		CreatedAt: row.CreatedAt.Time,

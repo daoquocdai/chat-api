@@ -2,10 +2,13 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"unicode/utf8"
 
 	authmiddleware "github.com/daoquocdai/chat-api/internal/middleware"
 	"github.com/daoquocdai/chat-api/internal/module/message/dto"
@@ -18,7 +21,7 @@ import (
 type MessageService interface {
 	Send(
 		ctx context.Context,
-		actorExternalID, threadExternalID, messageID, content string,
+		actorExternalID, threadExternalID, messageID, contentFormat, content string,
 	) (model.Message, bool, error)
 	List(
 		ctx context.Context,
@@ -44,7 +47,17 @@ func (h *Handler) Send(c *gin.Context) {
 	}
 
 	var request dto.SendMessageRequest
-	if err := c.ShouldBindJSON(&request); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 16*1024))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body exceeds 16 KiB"})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
+		}
+		return
+	}
+	if !utf8.Valid(body) || json.Unmarshal(body, &request) != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
 		return
 	}
@@ -54,6 +67,7 @@ func (h *Handler) Send(c *gin.Context) {
 		actorExternalID,
 		c.Param("id"),
 		request.MessageID,
+		request.ContentFormat,
 		request.Content,
 	)
 	if err != nil {
@@ -137,6 +151,9 @@ func writeError(c *gin.Context, err error) {
 		errors.Is(err, model.ErrMessageIDRequired),
 		errors.Is(err, model.ErrInvalidMessageID),
 		errors.Is(err, model.ErrInvalidContent),
+		errors.Is(err, model.ErrInvalidContentFormat),
+		errors.Is(err, model.ErrInvalidEnvelope),
+		errors.Is(err, model.ErrInvalidEnvelopeHeader),
 		errors.Is(err, model.ErrInvalidBeforeSeq),
 		errors.Is(err, model.ErrInvalidLimit):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -149,6 +166,9 @@ func writeError(c *gin.Context, err error) {
 
 	case errors.Is(err, model.ErrMessageIDConflict):
 		c.JSON(http.StatusConflict, gin.H{"error": model.ErrMessageIDConflict.Error()})
+
+	case errors.Is(err, model.ErrContentFormatConflict):
+		c.JSON(http.StatusConflict, gin.H{"error": model.ErrContentFormatConflict.Error()})
 
 	case errors.Is(err, model.ErrEventPublishFailed):
 		log.Printf("message handler: %v", err)

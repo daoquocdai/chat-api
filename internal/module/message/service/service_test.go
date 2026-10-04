@@ -2,12 +2,14 @@ package service_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/daoquocdai/chat-api/internal/e2ee"
 	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	"github.com/daoquocdai/chat-api/internal/module/message/service"
@@ -25,7 +27,7 @@ type fakeMessageRepository struct {
 	version                   func(context.Context, string, int64) (int64, error)
 	load                      func(context.Context, string, int64) ([]string, error)
 	versionCalls, memberCalls int
-	send                      func(context.Context, string, int64, string, string) (model.Message, bool, error)
+	send                      func(context.Context, string, int64, string, string, string) (model.Message, bool, error)
 	list                      func(context.Context, string, int64, *int64, int) (model.Page, error)
 	sendCalls                 int
 	listCalls                 int
@@ -51,10 +53,10 @@ func (r *fakeMessageRepository) Send(
 	ctx context.Context,
 	threadID string,
 	senderID int64,
-	messageID, content string,
+	messageID, contentFormat, content string,
 ) (model.Message, bool, error) {
 	r.sendCalls++
-	return r.send(ctx, threadID, senderID, messageID, content)
+	return r.send(ctx, threadID, senderID, messageID, contentFormat, content)
 }
 
 func (r *fakeMessageRepository) List(
@@ -149,9 +151,9 @@ func TestSend(t *testing.T) {
 				gotCtx context.Context,
 				threadID string,
 				senderID int64,
-				messageID, content string,
+				messageID, contentFormat, content string,
 			) (model.Message, bool, error) {
-				if gotCtx != ctx || threadID != threadExternalID || senderID != 11 || messageID != messageExternalID || content != tt.wantContent {
+				if gotCtx != ctx || threadID != threadExternalID || senderID != 11 || messageID != messageExternalID || contentFormat != "plaintext" || content != tt.wantContent {
 					t.Fatalf("unexpected Send arguments: %q %d %q %q", threadID, senderID, messageID, content)
 				}
 				return wantMessage, true, tt.repositoryError
@@ -163,6 +165,7 @@ func TestSend(t *testing.T) {
 				actorExternalID,
 				tt.threadID,
 				tt.messageID,
+				"",
 				tt.content,
 			)
 			if !errors.Is(err, tt.wantError) {
@@ -288,6 +291,7 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 					int64,
 					string,
 					string,
+					string,
 				) (model.Message, bool, error) {
 					order = append(order, "repository")
 					if tt.repositoryError != nil {
@@ -324,6 +328,7 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 				actorExternalID,
 				threadExternalID,
 				messageExternalID,
+				"plaintext",
 				"hello",
 			)
 			if !errors.Is(err, tt.wantError) {
@@ -365,6 +370,7 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 		int64,
 		string,
 		string,
+		string,
 	) (model.Message, bool, error) {
 		repositoryCalls++
 		return message, repositoryCalls == 1, nil
@@ -382,10 +388,10 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 	messageService := service.New(repository, users, publisher, nil, time.Second)
 
 	first, firstCreated, firstError := messageService.Send(
-		ctx, actorExternalID, threadExternalID, messageExternalID, "retry me",
+		ctx, actorExternalID, threadExternalID, messageExternalID, "", "retry me",
 	)
 	second, secondCreated, secondError := messageService.Send(
-		ctx, actorExternalID, threadExternalID, messageExternalID, "retry me",
+		ctx, actorExternalID, threadExternalID, messageExternalID, "plaintext", "retry me",
 	)
 
 	if !errors.Is(firstError, model.ErrEventPublishFailed) || secondError != nil {
@@ -399,6 +405,111 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 	}
 	if publisher.calls != 2 {
 		t.Fatalf("publisher calls = %d, want 2", publisher.calls)
+	}
+}
+
+func e2eeContent(t *testing.T) string {
+	t.Helper()
+	identity, err := e2ee.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ephemeral, err := e2ee.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := e2ee.EncodeEnvelope(e2ee.Envelope{
+		Version: 1, RecipientID: "22222222-2222-4222-8222-222222222222",
+		SenderIdentityKey: base64.StdEncoding.EncodeToString(identity.Public[:]),
+		EphemeralKey:      base64.StdEncoding.EncodeToString(ephemeral.Public[:]),
+		SignedPrekeyID:    1, Nonce: base64.StdEncoding.EncodeToString(make([]byte, 12)),
+		Ciphertext: base64.StdEncoding.EncodeToString(make([]byte, 17)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "\n" + content + strings.Repeat(" ", 1200) + "\n"
+}
+
+func TestSendE2EEValidationAndOpaquePublishing(t *testing.T) {
+	content := e2eeContent(t)
+	tests := []struct {
+		name, format, content string
+		repoErr, wantErr      error
+	}{
+		{name: "opaque bytes exceed plaintext rune limit", format: "e2ee_v1", content: content},
+		{name: "unknown format", format: "E2EE_V1", content: content, wantErr: model.ErrInvalidContentFormat},
+		{name: "plaintext in e2ee format", format: "e2ee_v1", content: "hello", wantErr: model.ErrInvalidEnvelope},
+		{name: "missing fields", format: "e2ee_v1", content: "{}", wantErr: model.ErrInvalidEnvelope},
+		{name: "extra field", format: "e2ee_v1", content: strings.Replace(content, "{", `{"extra":true,`, 1), wantErr: model.ErrInvalidEnvelope},
+		{name: "duplicate field", format: "e2ee_v1", content: strings.Replace(content, "{", `{"version":1,`, 1), wantErr: model.ErrInvalidEnvelope},
+		{name: "oversized envelope", format: "e2ee_v1", content: content + strings.Repeat(" ", 8192), wantErr: model.ErrInvalidEnvelope},
+		{name: "invalid UTF8", format: "e2ee_v1", content: content + "\xff", wantErr: model.ErrInvalidEnvelope},
+		{name: "trailing JSON", format: "e2ee_v1", content: content + "{}", wantErr: model.ErrInvalidEnvelope},
+		{name: "wrong thread mode preserved", format: "e2ee_v1", content: content, repoErr: model.ErrContentFormatConflict, wantErr: model.ErrContentFormatConflict},
+		{name: "wrong header preserved", format: "e2ee_v1", content: content, repoErr: model.ErrInvalidEnvelopeHeader, wantErr: model.ErrInvalidEnvelopeHeader},
+		{name: "inactive membership preserved", format: "e2ee_v1", content: content, repoErr: threadmodel.ErrNotParticipant, wantErr: threadmodel.ErrNotParticipant},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &fakeUserFinder{get: func(context.Context, string) (usermodel.User, error) { return usermodel.User{ID: 11}, nil }}
+			repo := &fakeMessageRepository{send: func(_ context.Context, thread string, actor int64, id, format, raw string) (model.Message, bool, error) {
+				if thread != threadExternalID || actor != 11 || id != messageExternalID || format != tt.format || raw != tt.content {
+					t.Fatal("envelope bytes/format/context changed")
+				}
+				return model.Message{ExternalID: id, ThreadExternalID: thread, ThreadKind: "direct", SenderExternalID: actorExternalID, Seq: 1, Kind: "text", ContentFormat: format, Content: raw}, true, tt.repoErr
+			}}
+			publisher := &fakePublisher{}
+			got, _, err := service.New(repo, users, publisher, nil, time.Second).Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, tt.format, tt.content)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil && tt.repoErr == nil && (repo.sendCalls != 0 || users.calls != 0) {
+				t.Fatal("invalid request reached repository/user lookup")
+			}
+			if tt.wantErr != nil && publisher.calls != 0 {
+				t.Fatal("rejected message was published")
+			}
+			if err == nil && (got.Content != content || got.ContentFormat != "e2ee_v1" || publisher.calls != 1 || publisher.events[0].Content != content || publisher.events[0].ContentFormat != "e2ee_v1") {
+				t.Fatal("response/event did not preserve opaque content/format")
+			}
+		})
+	}
+}
+
+func TestE2EERetryAfterPublishFailureKeepsExactPayload(t *testing.T) {
+	content := e2eeContent(t)
+	var saved *model.Message
+	repo := &fakeMessageRepository{send: func(_ context.Context, thread string, actor int64, id, format, raw string) (model.Message, bool, error) {
+		if saved != nil {
+			if saved.Content != raw || saved.ContentFormat != format {
+				return model.Message{}, false, model.ErrMessageIDConflict
+			}
+			return *saved, false, nil
+		}
+		saved = &model.Message{ID: 9, ExternalID: id, ThreadExternalID: thread, ThreadKind: "direct", SenderExternalID: actorExternalID, Seq: 1, Kind: "text", ContentFormat: format, Content: raw}
+		return *saved, true, nil
+	}}
+	users := &fakeUserFinder{get: func(context.Context, string) (usermodel.User, error) { return usermodel.User{ID: 11}, nil }}
+	publisher := &fakePublisher{}
+	publisher.publish = func(context.Context, messageevent.MessageCreated) error {
+		if publisher.calls == 1 {
+			return errors.New("publish unavailable")
+		}
+		return nil
+	}
+	svc := service.New(repo, users, publisher, nil, time.Second)
+	first, created, err := svc.Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, "e2ee_v1", content)
+	if !created || !errors.Is(err, model.ErrEventPublishFailed) {
+		t.Fatal("expected committed message with publish failure")
+	}
+	second, created, err := svc.Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, "e2ee_v1", content)
+	if created || err != nil || !reflect.DeepEqual(first, second) {
+		t.Fatal("retry did not return saved message")
+	}
+	_, _, err = svc.Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, "e2ee_v1", content+" ")
+	if !errors.Is(err, model.ErrMessageIDConflict) || publisher.calls != 2 || publisher.events[0].Content != publisher.events[1].Content {
+		t.Fatal("changed bytes were not rejected or retry changed event")
 	}
 }
 

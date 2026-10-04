@@ -7,8 +7,9 @@ import (
 )
 
 type SendMessageRequest struct {
-	MessageID string `json:"message_id"`
-	Content   string `json:"content"`
+	MessageID     string `json:"message_id"`
+	ContentFormat string `json:"content_format"`
+	Content       string `json:"content"`
 }
 
 type MessageResponse struct {

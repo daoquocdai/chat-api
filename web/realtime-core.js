@@ -2,26 +2,33 @@
 const MiniHermesRealtime = (() => {
   function merge(bySeq, byID, messages) {
     let changed = false;
+    const stagedSeq = new Map(), stagedID = new Map();
     for (const raw of messages) {
       const id = raw.id || raw.message_id;
       const seq = Number(raw.seq);
       if (typeof id !== "string" || !id || !Number.isSafeInteger(seq) || seq <= 0) {
         continue;
       }
-      const existingSeq = byID.get(id);
+      const existingSeq = stagedID.get(id) ?? byID.get(id);
       if (existingSeq !== undefined && existingSeq !== seq) {
-        continue;
+        throw new Error("UUID message đã xuất hiện với seq khác.");
       }
-      const existing = bySeq.get(seq);
+      const existing = stagedSeq.get(seq) || bySeq.get(seq);
       if (existing && existing.id !== id) {
-        continue;
+        throw new Error("Seq message đã xuất hiện với UUID khác.");
+      }
+      if (existing && ["thread_id", "sender_id", "kind", "content_format", "content"].some((field) => existing[field] !== raw[field])) {
+        throw new Error("Context hoặc nội dung của UUID message đã thay đổi.");
       }
       const message = { ...raw, id, seq };
       delete message.message_id;
-      bySeq.set(seq, message);
-      byID.set(id, seq);
+      stagedSeq.set(seq, message);
+      stagedID.set(id, seq);
       changed ||= !existing;
     }
+    // Validate the complete page before allowing any raw payload to overwrite a cache.
+    for (const [seq, message] of stagedSeq) bySeq.set(seq, message);
+    for (const [id, seq] of stagedID) byID.set(id, seq);
     return changed;
   }
 

@@ -6,6 +6,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/daoquocdai/chat-api/internal/e2ee"
 	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
@@ -20,7 +21,7 @@ type Repository interface {
 		ctx context.Context,
 		threadExternalID string,
 		senderID int64,
-		messageID, content string,
+		messageID, contentFormat, content string,
 	) (model.Message, bool, error)
 	List(
 		ctx context.Context,
@@ -65,7 +66,7 @@ func New(
 
 func (s *Service) Send(
 	ctx context.Context,
-	actorExternalID, threadExternalID, messageID, content string,
+	actorExternalID, threadExternalID, messageID, contentFormat, content string,
 ) (model.Message, bool, error) {
 	threadExternalID = strings.TrimSpace(threadExternalID)
 	if threadExternalID == "" {
@@ -75,10 +76,22 @@ func (s *Service) Send(
 	if messageID == "" {
 		return model.Message{}, false, model.ErrMessageIDRequired
 	}
-	content = strings.TrimSpace(content)
-	if length := utf8.RuneCountInString(content); !utf8.ValidString(content) ||
-		length == 0 || length > maximumContentCharacters || strings.ContainsRune(content, '\x00') {
-		return model.Message{}, false, model.ErrInvalidContent
+	if contentFormat == "" {
+		contentFormat = "plaintext"
+	}
+	switch contentFormat {
+	case "plaintext":
+		content = strings.TrimSpace(content)
+		if length := utf8.RuneCountInString(content); !utf8.ValidString(content) ||
+			length == 0 || length > maximumContentCharacters || strings.ContainsRune(content, '\x00') {
+			return model.Message{}, false, model.ErrInvalidContent
+		}
+	case "e2ee_v1":
+		if _, err := e2ee.ParseEnvelope(content); err != nil {
+			return model.Message{}, false, model.ErrInvalidEnvelope
+		}
+	default:
+		return model.Message{}, false, model.ErrInvalidContentFormat
 	}
 
 	actor, err := s.users.GetByExternalID(ctx, actorExternalID)
@@ -86,7 +99,7 @@ func (s *Service) Send(
 		return model.Message{}, false, err
 	}
 
-	message, created, err := s.repository.Send(ctx, threadExternalID, actor.ID, messageID, content)
+	message, created, err := s.repository.Send(ctx, threadExternalID, actor.ID, messageID, contentFormat, content)
 	if err != nil {
 		return model.Message{}, false, err
 	}

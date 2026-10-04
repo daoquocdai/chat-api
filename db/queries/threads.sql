@@ -1,17 +1,17 @@
 -- name: CreateDirectThread :one
 INSERT INTO threads (kind, created_by, encryption_mode)
-VALUES ('direct', sqlc.arg(created_by), 'plaintext')
-RETURNING id, external_id, kind, last_seq, created_at;
+VALUES ('direct', sqlc.arg(created_by), sqlc.arg(encryption_mode))
+RETURNING id, external_id, kind, encryption_mode, last_seq, created_at;
 
 -- name: LockUsersForDirectThread :many
-SELECT id
+SELECT id, external_id, identity_public_key
 FROM users
 WHERE id IN (sqlc.arg(user_low_id), sqlc.arg(user_high_id))
 ORDER BY id
 FOR UPDATE;
 
 -- name: GetDirectThreadByParticipants :one
-SELECT thread.id, thread.external_id, thread.kind, thread.last_seq, thread.created_at
+SELECT thread.id, thread.external_id, thread.kind, thread.encryption_mode, thread.last_seq, thread.created_at
 FROM threads AS thread
 JOIN participants AS participant
   ON participant.thread_id = thread.id
@@ -30,7 +30,7 @@ VALUES (sqlc.arg(thread_id), sqlc.arg(user_id), 'member', 1, 0);
 
 -- name: GetThreadSummaryForUser :one
 SELECT
-    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
+    t.id, t.external_id, t.kind, t.encryption_mode, COALESCE(t.name, '') AS name,
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,
@@ -66,7 +66,7 @@ WHERE t.external_id = sqlc.arg(thread_external_id);
 
 -- name: ListThreadsForUser :many
 SELECT
-    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
+    t.id, t.external_id, t.kind, t.encryption_mode, COALESCE(t.name, '') AS name,
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,

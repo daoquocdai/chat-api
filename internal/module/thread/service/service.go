@@ -10,7 +10,7 @@ import (
 )
 
 type Repository interface {
-	CreateOrGetDirect(ctx context.Context, creatorID, peerID int64) (model.Thread, bool, error)
+	CreateOrGetDirect(ctx context.Context, creatorID, peerID int64, encryptionMode *string) (model.Thread, bool, error)
 	ListByUser(ctx context.Context, userID int64) ([]model.Thread, error)
 	MarkRead(ctx context.Context, threadExternalID string, userID, lastReadSeq int64) (int64, error)
 	CreateGroup(ctx context.Context, creatorID int64, name string, memberIDs []int64, content string) (model.Thread, messagemodel.Message, error)
@@ -39,7 +39,11 @@ func New(repository Repository, users UserFinder, publisher MessagePublisher) *S
 func (s *Service) CreateOrGetDirect(
 	ctx context.Context,
 	actorExternalID, peerExternalID string,
+	encryptionMode *string,
 ) (model.Thread, bool, error) {
+	if encryptionMode != nil && *encryptionMode != "plaintext" && *encryptionMode != "e2ee" {
+		return model.Thread{}, false, model.ErrInvalidEncryptionMode
+	}
 	peerExternalID = strings.TrimSpace(peerExternalID)
 	if peerExternalID == "" {
 		return model.Thread{}, false, model.ErrPeerIDRequired
@@ -60,7 +64,7 @@ func (s *Service) CreateOrGetDirect(
 		return model.Thread{}, false, model.ErrSameUser
 	}
 
-	return s.repository.CreateOrGetDirect(ctx, actor.ID, peer.ID)
+	return s.repository.CreateOrGetDirect(ctx, actor.ID, peer.ID, encryptionMode)
 }
 
 func (s *Service) List(ctx context.Context, actorExternalID string) ([]model.Thread, error) {

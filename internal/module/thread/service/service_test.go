@@ -20,7 +20,7 @@ const (
 )
 
 type fakeThreadRepository struct {
-	createOrGet  func(context.Context, int64, int64) (threadmodel.Thread, bool, error)
+	createOrGet  func(context.Context, int64, int64, *string) (threadmodel.Thread, bool, error)
 	list         func(context.Context, int64) ([]threadmodel.Thread, error)
 	markRead     func(context.Context, string, int64, int64) (int64, error)
 	createGroup  func(context.Context, int64, string, []int64, string) (threadmodel.Thread, messagemodel.Message, error)
@@ -32,9 +32,10 @@ type fakeThreadRepository struct {
 func (r *fakeThreadRepository) CreateOrGetDirect(
 	ctx context.Context,
 	creatorID, peerID int64,
+	encryptionMode *string,
 ) (threadmodel.Thread, bool, error) {
 	r.calls++
-	return r.createOrGet(ctx, creatorID, peerID)
+	return r.createOrGet(ctx, creatorID, peerID, encryptionMode)
 }
 
 func (r *fakeThreadRepository) ListByUser(ctx context.Context, userID int64) ([]threadmodel.Thread, error) {
@@ -115,11 +116,12 @@ func TestCreateOrGetDirect(t *testing.T) {
 			repository := &fakeThreadRepository{createOrGet: func(
 				gotCtx context.Context,
 				creatorID, peerID int64,
+				mode *string,
 			) (threadmodel.Thread, bool, error) {
 				if gotCtx != ctx {
 					t.Fatal("context was not passed to repository")
 				}
-				if creatorID != 11 || peerID != 22 {
+				if creatorID != 11 || peerID != 22 || mode != nil {
 					t.Fatalf("user IDs = (%d, %d), want (11, 22)", creatorID, peerID)
 				}
 				return wantThread, true, tt.repositoryError
@@ -129,6 +131,7 @@ func TestCreateOrGetDirect(t *testing.T) {
 				ctx,
 				actorExternalID,
 				tt.peerID,
+				nil,
 			)
 			if !errors.Is(err, tt.wantError) {
 				t.Fatalf("error = %v, want %v", err, tt.wantError)
@@ -185,6 +188,54 @@ func TestMarkRead(t *testing.T) {
 			}
 			if repository.calls != tt.wantRepoCalls {
 				t.Fatalf("repository calls = %d, want %d", repository.calls, tt.wantRepoCalls)
+			}
+		})
+	}
+}
+
+func TestDirectEncryptionMode(t *testing.T) {
+	plain, encrypted, empty, unknown := "plaintext", "e2ee", "", "E2EE"
+	tests := []struct {
+		name             string
+		mode             *string
+		actual           string
+		repoErr, wantErr error
+	}{
+		{name: "omitted keeps actual encrypted mode", actual: encrypted},
+		{name: "explicit plaintext", mode: &plain, actual: plain},
+		{name: "explicit e2ee", mode: &encrypted, actual: encrypted},
+		{name: "empty is explicit invalid mode", mode: &empty, wantErr: threadmodel.ErrInvalidEncryptionMode},
+		{name: "unknown mode", mode: &unknown, wantErr: threadmodel.ErrInvalidEncryptionMode},
+		{name: "existing mode conflict", mode: &encrypted, repoErr: threadmodel.ErrEncryptionModeConflict, wantErr: threadmodel.ErrEncryptionModeConflict},
+		{name: "new e2ee missing bundle", mode: &encrypted, repoErr: threadmodel.ErrE2EEBundleRequired, wantErr: threadmodel.ErrE2EEBundleRequired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &fakeUserFinder{get: func(_ context.Context, id string) (usermodel.User, error) {
+				if id == actorExternalID {
+					return usermodel.User{ID: 11}, nil
+				}
+				return usermodel.User{ID: 22}, nil
+			}}
+			repo := &fakeThreadRepository{createOrGet: func(_ context.Context, actor, peer int64, mode *string) (threadmodel.Thread, bool, error) {
+				if actor != 11 || peer != 22 || mode != tt.mode {
+					t.Fatal("mode/actor/peer was not forwarded unchanged")
+				}
+				return threadmodel.Thread{ExternalID: threadExternalID, Kind: "direct", EncryptionMode: tt.actual}, false, tt.repoErr
+			}}
+			got, created, err := service.New(repo, users, &fakeGroupPublisher{}).CreateOrGetDirect(context.Background(), actorExternalID, peerExternalID, tt.mode)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if errors.Is(tt.wantErr, threadmodel.ErrInvalidEncryptionMode) {
+				if repo.calls != 0 || users.calls != 0 {
+					t.Fatal("invalid mode reached user lookup/repository")
+				}
+			} else if repo.calls != 1 {
+				t.Fatal("expected repository call")
+			}
+			if err == nil && (created || got.EncryptionMode != tt.actual) {
+				t.Fatal("actual mode/created flag changed")
 			}
 		})
 	}

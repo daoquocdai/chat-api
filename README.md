@@ -1,6 +1,6 @@
 # Mini-Hermes Chat API
 
-Mini-Hermes là demo chat dùng Go, Gin, PostgreSQL và sqlc. Web demo hỗ trợ chat 1-1 và nhóm qua API REST và fan-out WebSocket. Người dùng đăng ký bằng mật khẩu, đăng nhập nhận JWT, chọn một tài khoản khác và trao đổi tin nhắn được lưu trong PostgreSQL.
+Mini-Hermes là demo chat dùng Go, Gin, PostgreSQL và sqlc. Web hỗ trợ direct plaintext/E2EE và nhóm plaintext qua REST và fan-out WebSocket. E2EE chạy crypto Go/WASM tại browser; PostgreSQL lưu ciphertext. Người dùng đăng ký bằng mật khẩu, đăng nhập nhận JWT rồi chọn cuộc trò chuyện.
 
 ERD 5 bảng vẫn đang chờ mentor duyệt. Migration mới trên nhánh `feat/auth` là bản thử nghiệm để review, chưa nên áp dụng cho môi trường dùng chung hoặc production.
 
@@ -20,7 +20,9 @@ Yêu cầu `Authorization: Bearer <access_token>`:
 | --- | --- | --- |
 | `GET` | `/users` | Danh sách tài khoản trong PostgreSQL |
 | `POST` | `/auth/ws-ticket` | Cấp vé WebSocket ngắn hạn, dùng một lần |
-| `POST` | `/threads/direct` | Tạo hoặc mở direct thread với `peer_id` |
+| `POST` | `/threads/direct` | Tạo/mở direct với `peer_id`, tùy chọn `encryption_mode`; trả mode thực tế |
+| `POST` | `/e2ee/prekeys` | Đăng ký/refill public IK/SPK/OPK của JWT actor |
+| `POST` | `/e2ee/bundles/:user_id/claim` | Claim bundle peer trong direct E2EE qua `thread_id`, consume một public OPK nếu còn |
 | `POST` | `/threads/group` | Tạo nhóm với `name`, `member_ids`; creator là admin |
 | `GET` | `/threads/:id/members` | Danh sách thành viên đang trong nhóm |
 | `POST` | `/threads/:id/members` | Admin thêm thành viên bằng `user_id` |
@@ -28,12 +30,14 @@ Yêu cầu `Authorization: Bearer <access_token>`:
 | `POST` | `/threads/:id/leave` | Tự rời nhóm |
 | `GET` | `/threads` | Danh sách direct/group thread đang tham gia của người gọi |
 | `GET` | `/threads/:id/messages` | Một trang lịch sử theo cursor `before_seq`, `limit` |
-| `POST` | `/threads/:id/messages` | Gửi tin plaintext |
+| `POST` | `/threads/:id/messages` | Gửi plaintext hoặc chuỗi envelope `e2ee_v1`, đúng mode thread |
 | `PUT` | `/threads/:id/read` | Tăng read marker bằng `last_read_seq` |
 
 JWT chứa external user UUID trong `sub`. Client không được chọn danh tính người thực hiện bằng `sender_id` hoặc `user_id`. `user_id` ở API thêm thành viên chỉ chọn tài khoản đích. Service tra actor nội bộ từ JWT; repository kiểm tra membership trong PostgreSQL. Gửi tin, đọc marker và quản lý thành viên cần membership đang hoạt động; lịch sử được giới hạn theo từng khoảng membership.
 
 Gửi tin nhận `message_id` UUID và `content`. `message_id` chính là `messages.external_id`: client sinh một UUID cho mỗi lần gửi logic và giữ nguyên UUID lẫn payload khi retry. Retry bởi đúng người gửi, thread và nội dung trả lại tin đã lưu, không tăng `seq`; dùng lại UUID với dữ liệu khác trả `409 Conflict`. Response vẫn dùng trường `id` cho external message ID. Tin hệ thống khi tạo nhóm/thay đổi thành viên dùng UUID do PostgreSQL sinh, cùng bộ đếm `seq` với tin text.
+
+`content_format` omitted/empty tương đương `plaintext`; direct E2EE chỉ nhận `e2ee_v1`. `content` E2EE là chuỗi JSON envelope được lưu nguyên byte. Direct mới omitted mode mặc định plaintext; direct đã có trả actual mode nếu omitted, yêu cầu mode khác trả 409. Không upgrade thread plaintext hoặc tạo cặp thứ hai. API chỉ xử lý public keys/header/quyền/retry, không nhận private key hay mã hóa/giải mã hộ. Xem [contract](docs/e2ee-contract.md) cho JSON và lỗi cố định.
 
 `GET /threads/:id/messages` mặc định lấy 30 tin mới nhất, tối đa 100. API trả message theo `seq DESC` trong `{ "messages": [...], "next_cursor": ... }`; truyền `before_seq=<next_cursor>` để lấy trang cũ hơn. Danh sách thread và response tạo/mở thread có `last_read_seq`, `peer_last_read_seq` và `unread_count`. `unread_count` đếm cả text và system message do người khác tạo trong lần tham gia active; thao tác do chính mình tạo không tăng unread.
 
@@ -49,7 +53,7 @@ Thay đổi membership và gửi tin cùng khóa dòng thread, nên không thể
 
 Unread dùng `last_read_seq` của membership hiện tại, đếm text/system do người khác tạo. System message thêm người tại `joined_seq` tính unread cho người vừa được thêm nếu actor là người khác. Thêm/xóa/rời đã ở trạng thái đích không tạo thêm `seq`: API trả và thử publish lại system message của lần chuyển trạng thái hiện tại. Đây không phải idempotency cho tạo nhóm. Nếu tạo nhóm trả `503` do XADD, nhóm **đã lưu**; dùng `thread_id` trong lỗi hoặc `GET /threads` để tìm nhóm, không gửi lại POST tạo nhóm một cách mù quáng.
 
-Bước này dùng các bảng hiện có, không cần migration mới. Backend giữ cache membership Redis khi publish; web demo dùng chung luồng thread cho direct và group. API nhóm và kịch bản thử được mô tả tại [luồng request](docs/request-flow.md) và phần chạy thử bên dưới. Chưa có E2EE. Web nhận tin mới qua `ws-gateway`, không dò REST theo chu kỳ.
+Bước này dùng các bảng hiện có, không cần migration mới. Backend giữ cache membership Redis khi publish; web dùng chung luồng thread cho direct và group. API nhóm và kịch bản thử được mô tả tại [luồng request](docs/request-flow.md) và phần chạy thử bên dưới. Direct E2EE dùng Go/WASM theo [demo E2EE](docs/e2ee-demo.md); group giữ plaintext. Web nhận tin mới qua `ws-gateway`, không dò REST theo chu kỳ.
 
 ### Cache membership Redis
 
@@ -83,7 +87,7 @@ Sau khi transaction PostgreSQL của `POST /threads/:id/messages` commit thành 
 | `recipient_ids` | Mảng JSON external UUID của các thành viên có quyền xem ở `seq` của message |
 | `seq` | Sequence trong thread |
 | `kind` | `text` hoặc `system` |
-| `content_format` | `plaintext` hoặc định dạng hỗ trợ về sau |
+| `content_format` | `plaintext` hoặc `e2ee_v1` |
 | `content` | Nội dung đã lưu |
 | `created_at` | UTC RFC3339 với độ chính xác nano giây |
 
@@ -164,7 +168,7 @@ Migration giữ năm bảng trong ERD và thêm các invariant cần cho demo:
 - Vì không còn unique index cho cặp direct user, tính duy nhất chỉ được bảo đảm khi mọi đường tạo thread đều đi qua transaction/row-lock trên. SQL thủ công hoặc code mới bỏ qua khóa vẫn có thể tạo trùng; mentor cần chấp nhận giới hạn này hoặc chọn một khóa tư vấn/quy tắc DB khác trước production.
 - `threads.last_seq` được khóa, tăng và ghi message trong cùng transaction.
 - `messages.external_id` có unique constraint toàn cục. Repository chỉ trả message cũ khi UUID khớp đồng thời sender, thread, kind/format và nội dung; mọi cách dùng lại khác trả conflict chung, không trả dữ liệu message đã tồn tại.
-- `prekeys` có schema để mentor review nhưng chưa có API hoặc nghiệp vụ E2EE.
+- `prekeys` chỉ lưu public material; upload/claim có user lock/transaction và watermark chống retry hồi sinh OPK đã consume. Private keys/message keys ở browser.
 - `participants.last_read_seq` lưu một read marker tăng đơn điệu; không tạo `is_read` trên từng message.
 
 ## Chạy thử thủ công
@@ -191,16 +195,21 @@ Mở `http://localhost:8080`:
 
 Để đo request đọc ngay: Bob mở direct chat với Alice, giữ tab visible ở cuối chat. Sau khi tải ban đầu và WebSocket đã mở, xóa log Network ở tab Bob. Alice gửi 3 tin lần lượt, đợi PUT read của Bob hoàn tất trước tin tiếp theo. Khi mỗi marker đã phủ last seq đang biết, kỳ vọng **3 PUT `/read`, 0 GET `/threads` phát sinh từ việc đọc**; không tính request tải ban đầu/reconnect. Để demo lấy bù trong nhóm, Charlie mở nhóm trước rồi ngắt mạng mà không tải lại trang, Alice/Bob gửi hơn 30 tin, bật mạng lại: cache giữ `syncedSeq`, tải trang mới nhất rồi lùi bằng `before_seq`, không trùng message ID.
 
-Web lưu JWT trong `sessionStorage` của từng tab, dùng Bearer token cho REST và đổi vé ngắn hạn để mở WebSocket. Mỗi tin mới được chủ động gửi có một `message_id` mới, kể cả nội dung giống hệt; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload. Nếu hai lần thử vẫn lỗi, web giữ tin chưa xác nhận trong cache của thread; nút **Gửi lại** tiếp tục dùng UUID và nội dung cũ cho đến khi thành công. Nếu người dùng sửa nội dung trong lúc đó, web chặn gửi và yêu cầu khôi phục nội dung cũ trước khi thử lại. Cache này chỉ tồn tại trong phiên trang, nên sau khi tải lại cần kiểm tra lịch sử trước khi gửi lại một tin chưa rõ kết quả. Tin mới đi qua WebSocket; khi mở thread, kết nối lại hoặc thấy gap `seq`, web lấy bù bằng REST và đi ngược `next_cursor` cho đến mốc đã biết. Tin từ REST/event được gộp theo `message_id`, render theo `seq`; nút **Tin cũ hơn** vẫn tải lịch sử cũ theo cursor. Web gửi read marker tới message cuối thực tế đã render khi đúng chat active đang mở, tab đang hiển thị và người dùng ở cuối chat trong viewport. Không lấy mốc chưa render từ summary, không yêu cầu tải/xem từng tin phía trước. PUT lỗi giữ mốc để thử lại tại trigger phù hợp; không polling. Response cũ bị bỏ khi đổi tài khoản hoặc membership; summary bắt đầu trước PUT thành công được lấy lại để tránh khôi phục unread cũ. Đăng xuất/đổi tài khoản đóng socket và hủy lịch reconnect cũ.
+Web lưu JWT trong `sessionStorage` của từng tab, dùng Bearer token cho REST và đổi vé ngắn hạn để mở WebSocket. Với plaintext, mỗi tin mới có UUID mới; lỗi mạng hoặc 5xx được retry một lần bằng đúng UUID và payload. Nếu hai lần thử vẫn lỗi, web giữ pending trong RAM của thread; nút **Gửi lại** tiếp tục dùng UUID/nội dung cũ. Sửa ô nhập không sửa pending; reload cần đối chiếu lịch sử trước khi gửi lại tin chưa rõ kết quả. Với E2EE, pending body/key được commit IndexedDB trước POST và còn sau reload; **Gửi lại pending** dùng nguyên body/UUID, không claim/seal lại. Tin mới đi qua WebSocket; khi mở thread, kết nối lại hoặc thấy gap `seq`, web lấy bù bằng REST/cursor, gộp UUID và render theo seq. **Tin cũ hơn** giữ pagination. Read marker chỉ tới tin đã render trong chat active/tab visible/cuối viewport; E2EE còn yêu cầu decrypt/local commit và tất cả loaded ciphertext trước mốc đó không pending/error. PUT lỗi giữ mốc để thử lại tại trigger phù hợp, không polling. Snapshot phiên/membership loại callback cũ; logout đóng socket/hủy HTTP và giải phóng Web Lock sau khi local state đã settle.
 
-Quyết định kiến trúc được ghi tại [ADR #1: gateway/stream](docs/adr/001-gateway-and-stream.md), [ADR #2: unread](docs/adr/002-unread-count.md) và [ADR #3: thứ tự tin](docs/adr/003-message-order.md). Khi demo ba tài khoản, kiểm tra thêm request thiếu JWT trả 401 và tài khoản không tham gia thread bị từ chối gửi/đọc marker.
+Quyết định kiến trúc được ghi tại [ADR #1: gateway/stream](docs/adr/001-gateway-and-stream.md), [ADR #2: unread](docs/adr/002-unread-count.md), [ADR #3: thứ tự tin](docs/adr/003-message-order.md) và [ADR #4: E2EE mỗi message](docs/adr/004-e2ee-without-double-ratchet.md). Khi demo ba tài khoản, kiểm tra thêm request thiếu JWT trả 401 và tài khoản không tham gia thread bị từ chối gửi/đọc marker.
 
-Repo chỉ giữ test service cho user, thread, message và vé WebSocket. Chạy `make test`, `make build`, `go vet ./...`, `node --check web/app.js` và `node --check web/realtime-core.js`; nếu Make không chạy được, dùng `go test ./...` và `go build ./...`. Gateway/web không còn test tự động thường trực; cần thử thủ công trên trình duyệt và với PostgreSQL/Redis khi thay đổi luồng tích hợp.
+Repo chỉ giữ sáu test files theo [AGENTS.md](AGENTS.md), gồm crypto/E2EE service và bốn service test cũ. Chạy `make test`, `make build`, `make wasm`, `go vet ./...` và `node --check` cho app/realtime-core/e2ee/e2ee-state/e2ee-wasm. Dùng `go test -count=1 ./...` khi cần evidence không cache. Nếu Make không chạy được, dùng Go/PowerShell tương đương trong [demo E2EE](docs/e2ee-demo.md). Gateway/web dùng kiểm chứng browser hoặc script tạm rồi xóa; native/Node mock không thay browser và PostgreSQL/Redis thật.
 
 Với nhóm, cần kiểm tra thêm cache hit/miss và TTL, thêm/xóa/rời/thêm lại, gửi đồng thời với xóa thành viên, retry message cũ khi cache đã mất, pending cũ sau thay đổi membership, nhiều kết nối cùng user, lịch sử và unread trong từng khoảng. Dùng stream/cache riêng và tài khoản tạm cho kịch bản tích hợp; chỉ xóa dữ liệu/cổng/tiến trình của kịch bản, giữ nguyên dịch vụ có sẵn. Kiểm thử HTTP/WebSocket tự động bằng kịch bản tạm không thay thế demo giao diện nhóm trên trình duyệt.
 
 Xem [docs/request-flow.md](docs/request-flow.md) để biết ranh giới handler/service/repository và transaction.
 
+## E2EE direct trên web
+
+Chạy `make wasm` trước demo; hai artifacts được build từ cùng compiler Go và ignored. Mở hai profile độc lập, mỗi tài khoản một client E2EE active; init/register public bundle, chọn E2EE cho direct mới, gửi/nhận ngay trong chat. IndexedDB phân vùng API URL/user UUID và Web Locks chọn một owner tab. Hướng dẫn hai chiều, reload/offline/lấy bù, pending/fingerprint, query SQL ciphertext và evidence thực tế tại [docs/e2ee-demo.md](docs/e2ee-demo.md).
+
 ## Chưa có trong scope
 
-- Nhiều gateway instance, E2EE, API prekey và chính sách retention/trim stream.
+- Nhiều gateway instance và chính sách retention/trim stream.
+- Double Ratchet, rotation/backup/key recovery, multi-device và E2EE nhóm. Giới hạn của X3DH từng tin, message-key cache, TOFU và client web được ghi tại ADR #4.

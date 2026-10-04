@@ -15,7 +15,7 @@ import (
 )
 
 type ThreadService interface {
-	CreateOrGetDirect(ctx context.Context, actorExternalID, peerExternalID string) (model.Thread, bool, error)
+	CreateOrGetDirect(ctx context.Context, actorExternalID, peerExternalID string, encryptionMode *string) (model.Thread, bool, error)
 	List(ctx context.Context, actorExternalID string) ([]model.Thread, error)
 	MarkRead(ctx context.Context, actorExternalID, threadExternalID string, lastReadSeq int64) (int64, error)
 	CreateGroup(ctx context.Context, actorExternalID, name string, memberIDs []string) (model.Thread, error)
@@ -50,6 +50,7 @@ func (h *Handler) CreateOrGetDirect(c *gin.Context) {
 		c.Request.Context(),
 		actorExternalID,
 		request.PeerID,
+		request.EncryptionMode,
 	)
 	if err != nil {
 		writeError(c, err)
@@ -126,7 +127,7 @@ func writeError(c *gin.Context, err error) {
 		return
 	}
 	switch {
-	case errors.Is(err, model.ErrPeerIDRequired), errors.Is(err, model.ErrSameUser),
+	case errors.Is(err, model.ErrInvalidEncryptionMode), errors.Is(err, model.ErrPeerIDRequired), errors.Is(err, model.ErrSameUser),
 		errors.Is(err, model.ErrThreadIDRequired), errors.Is(err, model.ErrInvalidThreadID),
 		errors.Is(err, model.ErrReadSequenceRequired), errors.Is(err, model.ErrInvalidReadSequence),
 		errors.Is(err, usermodel.ErrInvalidUserID), errors.Is(err, model.ErrInvalidGroupName),
@@ -139,6 +140,8 @@ func writeError(c *gin.Context, err error) {
 
 	case errors.Is(err, model.ErrNotParticipant):
 		c.JSON(http.StatusForbidden, gin.H{"error": model.ErrNotParticipant.Error()})
+	case errors.Is(err, model.ErrEncryptionModeConflict), errors.Is(err, model.ErrE2EEBundleRequired):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 	case errors.Is(err, model.ErrAdminRequired):
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 	case errors.Is(err, model.ErrMemberNotFound):

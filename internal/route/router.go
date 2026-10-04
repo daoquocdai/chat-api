@@ -32,11 +32,17 @@ type WSTicketHandler interface {
 	Issue(c *gin.Context)
 }
 
+type E2EEHandler interface {
+	Upload(c *gin.Context)
+	Claim(c *gin.Context)
+}
+
 func New(
 	userHandler UserHandler,
 	threadHandler ThreadHandler,
 	messageHandler MessageHandler,
 	wsTicketHandler WSTicketHandler,
+	e2eeHandler E2EEHandler,
 	authenticate gin.HandlerFunc,
 ) *gin.Engine {
 	router := gin.Default()
@@ -53,7 +59,12 @@ func New(
 	router.GET("/", indexHandler)
 	router.StaticFile("/app.js", "web/app.js")
 	router.StaticFile("/realtime-core.js", "web/realtime-core.js")
+	router.StaticFile("/e2ee-wasm.js", "web/e2ee-wasm.js")
+	router.StaticFile("/e2ee-state.js", "web/e2ee-state.js")
+	router.StaticFile("/e2ee.js", "web/e2ee.js")
 	router.StaticFile("/style.css", "web/style.css")
+	router.GET("/e2ee.wasm", wasmHandler)
+	router.StaticFile("/wasm_exec.js", "web/wasm_exec.js")
 	router.POST("/auth/register", userHandler.Register)
 	router.POST("/auth/login", userHandler.Login)
 
@@ -61,6 +72,8 @@ func New(
 	authenticated.Use(authenticate)
 	authenticated.GET("/users", userHandler.List)
 	authenticated.POST("/auth/ws-ticket", wsTicketHandler.Issue)
+	authenticated.POST("/e2ee/prekeys", e2eeHandler.Upload)
+	authenticated.POST("/e2ee/bundles/:user_id/claim", e2eeHandler.Claim)
 	authenticated.POST("/threads/direct", threadHandler.CreateOrGetDirect)
 	authenticated.POST("/threads/group", threadHandler.CreateGroup)
 	authenticated.GET("/threads/:id/members", threadHandler.Members)
@@ -77,7 +90,7 @@ func New(
 
 func webAssetCachePolicy(c *gin.Context) {
 	switch c.Request.URL.Path {
-	case "/", "/app.js", "/realtime-core.js", "/style.css":
+	case "/", "/app.js", "/realtime-core.js", "/e2ee-wasm.js", "/e2ee-state.js", "/e2ee.js", "/style.css", "/e2ee.wasm", "/wasm_exec.js":
 		c.Header("Cache-Control", "no-store")
 	}
 	c.Next()
@@ -85,6 +98,11 @@ func webAssetCachePolicy(c *gin.Context) {
 
 func indexHandler(c *gin.Context) {
 	c.File("web/index.html")
+}
+
+func wasmHandler(c *gin.Context) {
+	c.Header("Content-Type", "application/wasm")
+	c.File("web/e2ee.wasm")
 }
 
 func healthHandler(c *gin.Context) {

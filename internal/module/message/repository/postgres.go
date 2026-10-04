@@ -2,9 +2,11 @@ package repository
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
+	"github.com/daoquocdai/chat-api/internal/e2ee"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
 	"github.com/jackc/pgx/v5"
@@ -25,7 +27,7 @@ func (r *PostgresRepository) Send(
 	ctx context.Context,
 	threadExternalID string,
 	senderID int64,
-	messageID, content string,
+	messageID, contentFormat, content string,
 ) (model.Message, bool, error) {
 	threadID, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
 	if err != nil {
@@ -40,7 +42,7 @@ func (r *PostgresRepository) Send(
 	created := false
 	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		queries := sqlc.New(tx)
-		threadInternalID, err := queries.LockThreadForParticipant(ctx, sqlc.LockThreadForParticipantParams{
+		thread, err := queries.LockThreadForParticipant(ctx, sqlc.LockThreadForParticipantParams{
 			UserID:           senderID,
 			ThreadExternalID: threadID,
 		})
@@ -52,7 +54,7 @@ func (r *PostgresRepository) Send(
 		}
 		// Recheck after obtaining the thread lock: membership may have changed while waiting.
 		if _, err := queries.GetActiveParticipant(ctx, sqlc.GetActiveParticipantParams{
-			ThreadID: threadInternalID, UserID: senderID,
+			ThreadID: thread.ID, UserID: senderID,
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return threadmodel.ErrNotParticipant
@@ -62,8 +64,8 @@ func (r *PostgresRepository) Send(
 
 		existing, err := queries.GetMessageByExternalID(ctx, messageExternalID)
 		if err == nil {
-			if existing.ThreadID != threadInternalID || existing.SenderID != senderID ||
-				existing.Kind != "text" || existing.ContentFormat != "plaintext" ||
+			if existing.ThreadID != thread.ID || existing.SenderID != senderID ||
+				existing.Kind != "text" || existing.ContentFormat != contentFormat ||
 				existing.Content != content {
 				return model.ErrMessageIDConflict
 			}
@@ -78,15 +80,29 @@ func (r *PostgresRepository) Send(
 			return err
 		}
 
-		seq, err := queries.IncrementThreadSequence(ctx, threadInternalID)
+		expectedFormat := "plaintext"
+		if thread.Kind == "direct" && thread.EncryptionMode == "e2ee" {
+			expectedFormat = "e2ee_v1"
+		}
+		if contentFormat != expectedFormat {
+			return model.ErrContentFormatConflict
+		}
+		if contentFormat == "e2ee_v1" {
+			if err := validateEnvelopeHeader(ctx, queries, thread.ID, senderID, content); err != nil {
+				return err
+			}
+		}
+
+		seq, err := queries.IncrementThreadSequence(ctx, thread.ID)
 		if err != nil {
 			return err
 		}
 		message, err := queries.CreateThreadMessage(ctx, sqlc.CreateThreadMessageParams{
 			MessageExternalID: messageExternalID,
-			ThreadID:          threadInternalID,
+			ThreadID:          thread.ID,
 			SenderID:          senderID,
 			Seq:               seq,
+			ContentFormat:     contentFormat,
 			Content:           content,
 		})
 		if err != nil {
@@ -109,6 +125,42 @@ func (r *PostgresRepository) Send(
 	}
 
 	return result, created, nil
+}
+
+// The server checks public metadata only. Claimed OPKs have already been deleted;
+// neither their presence nor successful AEAD decryption is a prerequisite here.
+func validateEnvelopeHeader(ctx context.Context, queries *sqlc.Queries, threadID, senderID int64, content string) error {
+	envelope, err := e2ee.ParseEnvelope(content)
+	if err != nil {
+		return model.ErrInvalidEnvelope
+	}
+	participants, err := queries.GetE2EEMessageParticipants(ctx, threadID)
+	if err != nil {
+		return err
+	}
+	if len(participants) != 2 {
+		return model.ErrInvalidEnvelopeHeader
+	}
+	var recipientID int64
+	var senderMatches bool
+	for _, participant := range participants {
+		if participant.ID == senderID {
+			senderMatches = base64.StdEncoding.EncodeToString(participant.IdentityPublicKey) == envelope.SenderIdentityKey
+		} else if participant.ExternalID.String() == envelope.RecipientID {
+			recipientID = participant.ID
+		}
+	}
+	if !senderMatches || recipientID == 0 {
+		return model.ErrInvalidEnvelopeHeader
+	}
+	prekeys, err := queries.GetE2EESignedPrekeys(ctx, recipientID)
+	if err != nil {
+		return err
+	}
+	if len(prekeys) != 1 || prekeys[0].KeyID != envelope.SignedPrekeyID {
+		return model.ErrInvalidEnvelopeHeader
+	}
+	return nil
 }
 
 func (r *PostgresRepository) List(

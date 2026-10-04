@@ -8,6 +8,9 @@ import (
 	"github.com/daoquocdai/chat-api/config"
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
 	authmiddleware "github.com/daoquocdai/chat-api/internal/middleware"
+	e2eehandler "github.com/daoquocdai/chat-api/internal/module/e2ee/handler"
+	e2eerepository "github.com/daoquocdai/chat-api/internal/module/e2ee/repository"
+	e2eeservice "github.com/daoquocdai/chat-api/internal/module/e2ee/service"
 	messagehandler "github.com/daoquocdai/chat-api/internal/module/message/handler"
 	messagepublisher "github.com/daoquocdai/chat-api/internal/module/message/publisher"
 	messagerepository "github.com/daoquocdai/chat-api/internal/module/message/repository"
@@ -77,6 +80,8 @@ func run() error {
 	userRepository := userrepository.New(queries)
 	userService := userservice.New(userRepository, jwtManager)
 	userHandler := userhandler.New(userService)
+	e2eeService := e2eeservice.New(e2eerepository.New(pool), userService)
+	e2eeHandler := e2eehandler.New(e2eeService)
 
 	threadRepository := threadrepository.New(pool)
 	messageRepository := messagerepository.New(pool)
@@ -98,6 +103,7 @@ func run() error {
 		threadHandler,
 		messageHandler,
 		wsTicketHandler,
+		e2eeHandler,
 		authmiddleware.RequireAuthentication(jwtManager),
 	)
 

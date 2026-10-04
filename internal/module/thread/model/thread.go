@@ -21,6 +21,7 @@ type Thread struct {
 	ID              int64
 	ExternalID      string
 	Kind            string
+	EncryptionMode  string
 	Name            string
 	Role            string
 	MemberCount     int64

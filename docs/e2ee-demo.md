@@ -2,6 +2,14 @@
 
 Luồng hai chiều dùng giao diện Mini-Hermes, crypto Go/WASM, REST gửi, WebSocket nhận và REST lịch sử/lấy bù. Hợp đồng cố định nằm trong [e2ee-contract.md](e2ee-contract.md); quyết định và điều kiện bảo mật nằm trong [ADR #4](adr/004-e2ee-without-double-ratchet.md). Controller dùng sender/recipient tổng quát, mỗi tin mới có lượt X3DH riêng.
 
+File sơ đồ riêng để nộp: [e2ee-sequence.md](e2ee-sequence.md), gồm đăng ký/claim bundle và tính secret/mã hóa/gửi/giải mã; sơ đồ tổng thể cũng có ở [contract, phần II.2](e2ee-contract.md#2-sequence-diagram-web-rest-websocket-và-gowasm).
+
+**Phạm vi demo đề xuất để mentor xem xét:** chat direct E2EE A→B và B→A trên web, mỗi tài khoản dùng một browser profile cố định và một tab E2EE hoạt động. Web Lock chọn owner trong cùng origin/profile; tab thứ hai chưa decrypt/send/read E2EE cho đến khi tiếp quản. Phạm vi này chưa được mentor xác nhận duyệt.
+
+Client giữ private keys, tính secret và mã hóa trước POST. Server lưu/truyền public bundle, ciphertext/envelope và metadata. REST gửi, WebSocket nhận, REST lấy bù; mỗi tin mới dùng lượt X3DH mới, retry giữ nguyên UUID/payload. Demo khởi tạo 20 OPK; hết OPK dùng 3DH với giới hạn trong ADR #4.
+
+Plaintext direct/group giữ luồng hiện có, không chuyển thread plaintext cũ sang E2EE. Chưa làm Double Ratchet, E2EE nhóm, multi-device, backup/rotation hoặc đồng bộ khóa giữa tab. Gateway fan-out tới nhiều connections của recipient không đồng nghĩa nhiều tab cùng decrypt; text không echo sang connections khác của sender, nên chưa có đồng bộ đầy đủ các tab cùng tài khoản.
+
 ## Chạy demo
 
 Dùng cấu hình local và schema đã có như README; PostgreSQL và Redis phải chạy. Build ở thư mục repo:
@@ -42,7 +50,7 @@ go run ./cmd
 4. So UUID và fingerprint của mình với fingerprint peer ở phía còn lại qua kênh tin cậy. Peer chưa biết được ghi rõ; fingerprint peer có sau lần gửi/nhận hợp lệ đầu tiên. Xem fingerprint không claim OPK. TOFU lần đầu chưa bảo vệ khỏi MITM; identity thay đổi chặn thao tác và không ghi đè pin.
 5. Ở DevTools Network của A, kiểm tra POST `/threads/<UUID>/messages`: `content_format=e2ee_v1`, `content` là chuỗi JSON envelope chứa ciphertext. Nội dung tin không nằm dưới dạng plaintext trong body. Upload/claim chỉ chứa public keys và metadata; không có private key hoặc message key.
 6. Query PostgreSQL theo UUID tin/thread để xác nhận `content_format`, envelope và ciphertext; so nguyên chuỗi `content` với request/response. Server, Redis và gateway giữ opaque content, không mã hóa/giải mã. Không đưa private keys/JWT hoặc toàn bộ profile vào log/query.
-7. Reload cả A và B trong đúng profile, mở lại thread và dùng **Tin cũ hơn** nếu có: cả tin own/peer từ REST giải mã bằng cached message key dù private OPK đã xóa sau lần nhận. Ngắt mạng B khi thread đã mở, A gửi thêm tin, rồi kết nối lại: socket mở lại kích hoạt REST lấy bù và decrypt. Khi gateway không phát event, mở thread vẫn lấy lịch sử REST; không dùng polling.
+7. Reload cả A và B trong đúng profile, mở lại thread: cache mới chụp `last_read_seq` từ summary rồi lấy trang mới nhất và đi lùi bằng cursor đến mốc đó hoặc hết lịch sử được phép; mốc 0 lấy đến hết cursor. Read marker chờ initial sync thành công và decrypt/local commit/render. Trang lỗi giữ trạng thái chưa hoàn tất; mở lại thread hoặc reconnect để thử lại. **Tin cũ hơn** tiếp tục từ trang cũ nhất đã tải, dành cho lịch sử trước phần vừa lấy bù. Own/peer history dùng cached message key nếu đã lưu dù private OPK đã xóa; tin chưa cache dùng bộ private prekeys local. Ngắt mạng B khi thread đã mở, A gửi thêm tin, rồi kết nối lại: socket mở lại kích hoạt REST lấy bù và decrypt. Khi gateway không phát event, mở thread vẫn lấy REST; không polling.
 8. Mở tab thứ hai cùng profile, API URL và tài khoản A: trạng thái **E2EE đang dùng ở tab khác**, không decrypt/send/refill/retry/read E2EE. Đóng hoặc đăng xuất tab sở hữu, rồi bấm **Thử tiếp quản E2EE** ở tab còn lại. Plaintext/group vẫn hoạt động ở tab không sở hữu.
 9. Để thử retry, làm response POST bị mất sau khi DB đã lưu, giữ tab hoặc reload cùng profile. Banner pending hiển thị UUID/thread. Bấm **Gửi lại pending**: nguyên body/UUID/envelope/nonce được dùng lại, không claim/seal lại; DB vẫn một row và cùng seq. **Đối chiếu lịch sử** có thể xác nhận payload đã lưu. **Hủy pending này** bỏ pending nhưng giữ cached key vì tin có thể đã commit; không chứng minh server chưa nhận tin.
 10. **Bổ sung 20 OPK** lưu batch private và request trước upload. Nếu upload chưa xác nhận, gửi lại bằng **Gửi lại public bundle**, giữ signature/ID/payload cũ. Watermark là ID cao nhất đã xác nhận; số OPK server là số tại response gần nhất, có thể đã giảm sau claim.
@@ -128,3 +136,30 @@ Core helper dừng ở bước retry vì mở REST history đã xác nhận pend
 **CHƯA CHẠY:** quota/eviction tự nhiên, power loss/process crash, runtime Go thực tế lệch phiên bản, browser khác/mobile/Unix và race detector. Native transaction.abort của Prompt 4 và clear IndexedDB có chủ đích của Prompt 5 chỉ chứng minh các fault đó; không suy quota/crash PASS. Lỗi response được mô phỏng sau HTTP thành công/commit, không phải TCP disconnect hoặc crash backend. Mentor chưa review sơ đồ. Các giới hạn bảo mật và phạm vi được giải thích trong ADR #4; không có Double Ratchet, rotation, backup, multi-device hoặc E2EE nhóm.
 
 Cleanup Prompt 5 đã hoàn tất: kiểm tra độc lập còn **0 fixture users/threads, 0 Redis namespace/ticket keys, 0 owned harness/Edge processes**. Đã đóng API/gateway/consumer/Hub/pool, kiểm tra đường dẫn rồi xóa `.tmp-e2ee-p5`, hai profiles, scripts/exe/log/private fixture JSON; PostgreSQL/Redis có sẵn và dữ liệu khác giữ nguyên. Helpers/profile/fixture tạm dùng để tạo evidence, không phải lệnh demo còn tồn tại trong repo; tái hiện bằng các bước web ở đầu tài liệu với tài khoản/profile mới.
+
+## Sửa initial catch-up — bàn giao 05/10/2026
+
+Branch `feat/e2ee`, HEAD `0bff8cf436fa1f3855ce1b675ce11b808ec0f370`, đúng baseline của tài liệu catch-up; giữ các thay đổi tài liệu đã có. Trước sửa, cache mới đặt `syncedSeq` bằng seq cao nhất của trang đầu, nên đã đọc đến 5/mới nhất 50 chỉ tự tải 21–50 và có thể xác nhận đọc 50 khi còn thiếu 6–20.
+
+`web/app.js` hiện chụp `last_read_seq` từ summary trước HTTP, dùng `fetchThroughBoundary` để lấy đến boundary/hết cursor, chỉ đặt `messagesLoaded`/`syncedSeq` khi lượt thành công. Dùng các state hiện có, không thêm state đồng bộ mới. Lỗi giữ flag chưa hoàn tất, cache đã merge được khử trùng khi mở lại thread/reconnect thử lại. Cursor của trang cũ nhất được giữ cho nút Tin cũ hơn; nút này chờ initial sync hoàn tất. Read không vượt `syncedSeq`, nên realtime có gap chưa lấy bù cũng không được xác nhận sớm. Initial/catch-up/older bỏ callback khi phiên/cache/membership epoch thay đổi.
+
+README, sơ đồ riêng và đoạn hướng dẫn demo đã khớp hành vi mới. Hai đoạn cũ trong ADR #2/request-flow cho phép đọc hết từ trang đầu 30 tin được chỉnh đúng điều kiện initial sync; các quyết định và evidence lịch sử khác giữ nguyên. Phạm vi đề xuất cho mentor nằm ở đầu tài liệu, chưa ghi đã được duyệt.
+
+| Lệnh / case | Môi trường và kết quả thực tế |
+| --- | --- |
+| `node --check web/app.js`; `node --check web/realtime-core.js` | PASS syntax trên Node `v24.11.1` |
+| `make test`; `make build` | PASS trên Go `go1.27.1 windows/amd64`; sáu package test dùng cache, không phải browser/DB integration |
+| Helper `.tmp-initial-catchup-check.cjs --baseline` trước patch | Tái hiện lỗi bằng 3 assertions: chỉ 21–50, một request, read có thể tới 50; đây là xác nhận bug, không phải behavior mong muốn |
+| `node .tmp-initial-catchup-check.cjs` sau patch | PASS/exit 0, **33 assertions tập trung**; chạy app/realtime implementation thật trong Node VM, DOM/HTTP và kết quả decrypt/local commit giả lập |
+| Direct boundary 5/latest 50/page size 30 | PASS trong Node: hai trang, đủ 6–50 và phần cũ lấy dư, UUID không trùng, render tăng dần; trang thứ hai đang chờ chưa hoàn tất sync/read |
+| Ít hơn 30 tin bỏ lỡ/không tin mới/cache đã tải | PASS trong Node: một trang, đổi lại thread không tải toàn bộ lần nữa. Boundary 0 đi hết cursor, kể cả lịch sử rỗng |
+| Group có khoảng không được xem | PASS trong Node với 50 messages được phép qua hai trang, gap seq 11–30 bị loại; dừng bằng cursor/boundary, không cố lấp gap |
+| Page tiếp theo lỗi và retry | PASS trong Node: `messagesLoaded=false`, không read, request guard được nhả; trigger sync hiện có lấy đủ và gộp partial cache |
+| Cursor tải cũ | PASS trong Node: boundary 55/latest 150 lấy bốn trang tới cursor 31; Tin cũ hơn chỉ lấy 1–30 bằng cursor 31, không lấy lại trang mới nhất |
+| E2EE read gate | PASS ở app với kết quả receive/commit giả lập: ciphertext pending, chưa render, tab non-owner hoặc ngoài cuối viewport không read; kết quả ready/committed/rendered mới được tính |
+| Realtime/stale callbacks | PASS trong Node: duplicate lúc initial fetch không trùng; seq 65 tới sau REST snapshot 50 bị chặn read trong lúc gap 51–64 pending/lỗi, sync lại mới tới 65. Logout/chuyển thread/membership không render/read nhầm; cached catch-up và older response của membership cũ không merge |
+| Diff/hash/links/test scope | PASS kiểm tra tĩnh; 99 files bảo vệ giữ nguyên, crypto/API/Go-WASM/IndexedDB/Web Locks/schema/dependencies/contract và nguồn prompt không đổi; vẫn chỉ sáu permanent test files |
+
+Hai case stale membership của cached catch-up và older đã tái hiện thất bại trước guard mới rồi đạt trong suite cuối; không ghi các lượt tái hiện bug là PASS behavior đúng. Helper đã xóa sau kiểm chứng, không giữ thành test thường trực. Không tạo fixture DB/profile hoặc sửa dữ liệu người dùng trong lượt này.
+
+**CHƯA CHẠY cho sửa đổi này:** browser/DB/Redis/gateway thật, native WASM/IndexedDB/Web Locks, network disconnect và storage failure thật. Các browser/DB results Prompt 4–5 ở trên là evidence lịch sử, không biến thành PASS mới cho initial catch-up. Không chạy lại `make wasm` vì crypto/bridge/build không đổi. Không migration/reset/TRUNCATE, thêm endpoint/polling/timer retry hoặc mở rộng phạm vi E2EE.

@@ -691,7 +691,7 @@ function renderMessages(scrollMode = "preserve") {
     historyElement.scrollTop = previousTop;
   }
   loadOlderButton.hidden = cache.nextCursor === null;
-  loadOlderButton.disabled = cache.nextCursor === null || Boolean(cache.olderRequest);
+  loadOlderButton.disabled = !cache.messagesLoaded || cache.nextCursor === null || Boolean(cache.olderRequest);
   renderThreadHeading();
   scheduleReadMarker();
 }
@@ -708,21 +708,31 @@ async function loadInitialHistory(cache = state.currentCache) {
   if (!cache || !state.token || cache.messagesLoaded) return;
   if (cache.initialHistoryRequest) return cache.initialHistoryRequest.promise;
   const snapshot = cacheSnapshot(cache);
+  // A read marker is a conservative boundary, not proof of a synced cache.
+  const baseline = Math.max(0, Number(cache.summary?.last_read_seq || 0));
   const request = {};
   cache.initialHistoryRequest = request;
   request.promise = (async () => {
     try {
-      const page = await apiRequest(pageURL(snapshot.threadID));
-      if (!cacheSnapshotMatches(snapshot)) return;
-      mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
-      cache.nextCursor = page.next_cursor ?? null;
-      cache.syncedSeq = Math.max(0, ...(page.messages || []).map((message) => Number(message.seq) || 0));
+      const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
+        async (beforeSeq) => {
+          const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
+          if (!membershipSnapshotMatches(snapshot)) throw new Error("session or membership changed");
+          return page;
+        }, baseline,
+        (messages, page) => {
+          mergeMessages(cache, messages);
+          cache.nextCursor = page.next_cursor ?? null;
+        },
+      );
+      if (!membershipSnapshotMatches(snapshot)) return;
+      cache.syncedSeq = maxSeq;
       cache.messagesLoaded = true;
       if (state.currentCache === cache) renderMessages("initial");
       const target = Math.max(highestMessageSeq(cache), Number(cache.summary?.last_seq || 0));
       if (target > cache.syncedSeq) await catchUpConversation(cache, target);
     } catch (error) {
-      if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
     } finally {
       if (cache.initialHistoryRequest === request) cache.initialHistoryRequest = null;
     }
@@ -746,17 +756,17 @@ async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
       const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
         async (beforeSeq) => {
           const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
-          if (!cacheSnapshotMatches(snapshot)) throw new Error("session changed");
+          if (!membershipSnapshotMatches(snapshot)) throw new Error("session or membership changed");
           return page;
         }, baseline,
         (messages) => mergeMessages(cache, messages),
       );
-      if (!cacheSnapshotMatches(snapshot)) return;
+      if (!membershipSnapshotMatches(snapshot)) return;
       cache.syncedSeq = Math.max(cache.syncedSeq, maxSeq);
       completed = true;
       if (state.currentCache === cache) renderMessages("new");
     } catch (error) {
-      if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
     } finally {
       if (cache.catchupRequest !== request) return;
       cache.catchupRequest = null;
@@ -764,7 +774,7 @@ async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
       cache.catchupTargetSeq = 0;
       // Only a newer event received during this fetch can cause one more pass.
       // The same inaccessible target must never keep a group in a sync loop.
-      if (completed && nextTarget > cache.syncedSeq && nextTarget > targetSeq && cacheSnapshotMatches(snapshot)) {
+      if (completed && nextTarget > cache.syncedSeq && nextTarget > targetSeq && membershipSnapshotMatches(snapshot)) {
         void catchUpConversation(cache, nextTarget);
       }
     }
@@ -996,7 +1006,7 @@ async function connectWebSocket() {
 
 async function loadOlderMessages() {
   const cache = state.currentCache;
-  if (!cache || cache.nextCursor === null || cache.olderRequest) {
+  if (!cache?.messagesLoaded || cache.nextCursor === null || cache.olderRequest) {
     return;
   }
   const snapshot = cacheSnapshot(cache);
@@ -1006,7 +1016,7 @@ async function loadOlderMessages() {
 
   try {
     const page = await apiRequest(pageURL(snapshot.threadID, request.beforeSeq));
-    if (!cacheSnapshotMatches(snapshot)) {
+    if (!membershipSnapshotMatches(snapshot)) {
       return;
     }
     mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
@@ -1016,7 +1026,7 @@ async function loadOlderMessages() {
       showError("");
     }
   } catch (error) {
-    if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
+    if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) {
       showError(error.message);
     }
   } finally {
@@ -1060,7 +1070,7 @@ function renderedReadSequence(snapshot) {
       messageRect.bottom > visibleBottom + historyBottomTolerance ||
       messageRect.right <= 0 || messageRect.left >= window.innerWidth) return 0;
   const seq = Number(latest.dataset.seq);
-  return Number.isSafeInteger(seq) && seq >= Number(cache.summary.joined_seq || 1) ? seq : 0;
+  return Number.isSafeInteger(seq) && seq <= cache.syncedSeq && seq >= Number(cache.summary.joined_seq || 1) ? seq : 0;
 }
 
 function markConversationRead(snapshot = conversationSnapshot()) {

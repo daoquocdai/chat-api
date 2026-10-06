@@ -475,17 +475,6 @@
       await this._save(next);
       return response;
     }
-    cancelPending(messageID) {
-      return this._task(async () => {
-        assert(this.profile?.pending_send?.message_id === messageID,
-          "invalid_context", "UUID không khớp message đang chờ; chưa hủy pending.");
-        const next = clone(this.profile);
-        next.pending_send = null;
-        // Keep the cached key: cancelling does not prove PostgreSQL never committed.
-        await this._save(next);
-      });
-    }
-
     receive(thread, message) {
       if (!this.canRead() || !this._threadValid(thread)) return Promise.resolve({ status: "pending",
         error: this.status === "other_tab" ? "E2EE đang dùng ở tab khác." : "Đang chờ bộ khóa, WASM hoặc thông tin thread E2EE." });

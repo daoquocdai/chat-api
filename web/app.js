@@ -49,8 +49,6 @@ const e2eeKeyInfo = document.querySelector("#e2ee-key-info");
 const e2eePending = document.querySelector("#e2ee-pending");
 const e2eePendingInfo = document.querySelector("#e2ee-pending-info");
 const e2eeRetry = document.querySelector("#e2ee-retry");
-const e2eeReconcile = document.querySelector("#e2ee-reconcile");
-const e2eeCancel = document.querySelector("#e2ee-cancel");
 const peerFingerprint = document.querySelector("#peer-fingerprint");
 const e2eeDecryptRetry = document.querySelector("#e2ee-decrypt-retry");
 const e2eeLabels = {
@@ -118,10 +116,8 @@ function renderE2EEPanel() {
   e2eeFingerprint.textContent = local.own_fingerprint ? `UUID ${state.currentUserID}\nFingerprint IK: ${local.own_fingerprint}` : "Chưa có fingerprint local.";
   e2eePending.hidden = !local.pending_send;
   e2eePendingInfo.textContent = local.pending_send
-    ? `Tin chưa xác nhận: ${local.pending_send.message_id}\nThread: ${local.pending_send.thread_id}. Hủy pending vẫn giữ khóa để đọc tin nếu server đã lưu.` : "";
+    ? `Tin chưa xác nhận: ${local.pending_send.message_id}\nThread: ${local.pending_send.thread_id}. Bấm Gửi lại pending để tiếp tục với đúng tin đang chờ.` : "";
   e2eeRetry.disabled = !available || !local.registration || !local.pending_send;
-  e2eeReconcile.disabled = !available || !local.pending_send;
-  e2eeCancel.disabled = !available || !local.pending_send;
   renderPeerList();
 }
 async function startE2EE() {
@@ -1110,7 +1106,7 @@ async function sendE2EEFromForm() {
     }
   } catch (error) {
     if (membershipSnapshotMatches(snapshot) && state.currentCache === cache && state.e2ee === client) {
-      showError(client.snapshot().error || "Tin E2EE chưa được xác nhận. Dùng pending để gửi lại hoặc đối chiếu lịch sử.");
+      showError(client.snapshot().error || "Tin E2EE chưa được xác nhận. Bấm Gửi lại pending để gửi lại đúng tin.");
     }
   } finally {
     cache.e2eeSending = false;
@@ -1143,38 +1139,11 @@ async function retryE2EE(client) {
   if (state.currentCache === accepted.cache) renderMessages("new");
 }
 
-async function reconcilePendingE2EE(client) {
-  const pending = client.snapshot().pending_send;
-  if (!pending) return;
-  await loadThreads();
-  if (state.e2ee !== client || !state.token) return;
-  const cache = state.threads.get(pending.thread_id);
-  if (!cache?.summary || cache.summary.encryption_mode !== "e2ee") throw new Error("Chưa đối chiếu được thread của pending.");
-  // A user-triggered bounded history walk uses the existing cursor validation;
-  // stop at the pending UUID rather than fetching all conversation history.
-  await MiniHermesRealtime.fetchThroughBoundary(async (beforeSeq) => {
-    const page = await apiRequest(pageURL(pending.thread_id, beforeSeq));
-    if (state.e2ee !== client || !state.token) throw new Error("Phiên E2EE đã thay đổi.");
-    if ((page.messages || []).some((message) => message.id === pending.message_id)) page.next_cursor = null;
-    return page;
-  }, 0, (messages) => mergeMessages(cache, messages));
-  const jobs = [...cache.decryptJobs.values()];
-  await Promise.all(jobs);
-  if (state.e2ee !== client) return;
-  if (client.snapshot().pending_send) throw new Error("Lịch sử chưa xác nhận tin pending; giữ nguyên payload để gửi lại.");
-  if (state.currentCache === cache) renderMessages("new");
-}
-
 e2eeInitialize.addEventListener("click", () => runE2EEAction((client) => client.initialize()));
 e2eeUpload.addEventListener("click", () => runE2EEAction((client) => client.upload()));
 e2eeRefill.addEventListener("click", () => runE2EEAction((client) => client.refill()));
 e2eeTakeover.addEventListener("click", () => runE2EEAction((client) => client.takeOver()));
 e2eeRetry.addEventListener("click", () => runE2EEAction(retryE2EE));
-e2eeReconcile.addEventListener("click", () => runE2EEAction(reconcilePendingE2EE));
-e2eeCancel.addEventListener("click", () => runE2EEAction((client) => {
-  const pending = client.snapshot().pending_send;
-  if (pending) return client.cancelPending(pending.message_id);
-}));
 e2eeDecryptRetry.addEventListener("click", () => {
   if (state.currentCache) processE2EEMessages(state.currentCache, true);
 });

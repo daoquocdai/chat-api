@@ -6,6 +6,7 @@ type Message struct {
 	ID               int64
 	ExternalID       string
 	ThreadExternalID string
+	ThreadKind       string
 	SenderExternalID string
 	Seq              int64
 	Kind             string

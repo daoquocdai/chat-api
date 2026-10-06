@@ -1,9 +1,12 @@
 DATABASE_URL ?= postgres://chat:chat@localhost:5432/chat_api?sslmode=disable
 
-.PHONY: run test build up migrate migrate-status sqlc migrate-create
+.PHONY: run gateway test build up migrate migrate-status sqlc migrate-create
 
 run:
 	go run ./cmd
+
+gateway:
+	go run ./cmd/ws-gateway
 
 test:
 	go test ./...

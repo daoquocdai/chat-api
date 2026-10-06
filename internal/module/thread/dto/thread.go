@@ -10,6 +10,23 @@ type CreateDirectRequest struct {
 	PeerID string `json:"peer_id"`
 }
 
+type CreateGroupRequest struct {
+	Name      string   `json:"name"`
+	MemberIDs []string `json:"member_ids"`
+}
+
+type AddMemberRequest struct {
+	UserID string `json:"user_id"`
+}
+
+type MemberResponse struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	Role        string `json:"role"`
+	JoinedSeq   int64  `json:"joined_seq"`
+	LastReadSeq int64  `json:"last_read_seq"`
+}
+
 type MarkReadRequest struct {
 	LastReadSeq *int64 `json:"last_read_seq"`
 }
@@ -33,8 +50,12 @@ type LastMessageResponse struct {
 type ThreadResponse struct {
 	ID              string               `json:"id"`
 	Kind            string               `json:"kind"`
-	Peer            PeerResponse         `json:"peer"`
+	Peer            *PeerResponse        `json:"peer"`
+	Name            string               `json:"name,omitempty"`
+	Role            string               `json:"role"`
+	MemberCount     int64                `json:"member_count"`
 	LastSeq         int64                `json:"last_seq"`
+	JoinedSeq       int64                `json:"joined_seq"`
 	LastReadSeq     int64                `json:"last_read_seq"`
 	PeerLastReadSeq int64                `json:"peer_last_read_seq"`
 	UnreadCount     int64                `json:"unread_count"`
@@ -46,12 +67,18 @@ func ToThreadResponse(thread model.Thread) ThreadResponse {
 	response := ThreadResponse{
 		ID:              thread.ExternalID,
 		Kind:            thread.Kind,
-		Peer:            PeerResponse{ID: thread.Peer.ExternalID, Username: thread.Peer.Username},
+		Name:            thread.Name,
+		Role:            thread.Role,
+		MemberCount:     thread.MemberCount,
 		LastSeq:         thread.LastSeq,
+		JoinedSeq:       thread.JoinedSeq,
 		LastReadSeq:     thread.LastReadSeq,
 		PeerLastReadSeq: thread.PeerLastReadSeq,
 		UnreadCount:     thread.UnreadCount,
 		CreatedAt:       thread.CreatedAt,
+	}
+	if thread.Kind == "direct" {
+		response.Peer = &PeerResponse{ID: thread.Peer.ExternalID, Username: thread.Peer.Username}
 	}
 
 	if thread.LastMessage != nil {

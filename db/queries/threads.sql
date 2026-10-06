@@ -30,23 +30,19 @@ VALUES (sqlc.arg(thread_id), sqlc.arg(user_id), 'member', 1, 0);
 
 -- name: GetThreadSummaryForUser :one
 SELECT
-    t.id,
-    t.external_id,
-    t.kind,
-    peer.external_id AS peer_external_id,
-    peer.username AS peer_username,
-    t.last_seq,
-    mine.last_read_seq,
-    other.last_read_seq AS peer_last_read_seq,
-    (
-        SELECT COUNT(*)
-        FROM messages AS unread_message
-        WHERE unread_message.thread_id = t.id
-          AND unread_message.seq >= mine.joined_seq
-          AND unread_message.seq > mine.last_read_seq
-          AND unread_message.sender_id <> mine.user_id
-          AND unread_message.kind <> 'system'
-    ) AS unread_count,
+    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
+    mine.role,
+    COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
+    COALESCE(peer.username, '') AS peer_username,
+    t.last_seq, mine.joined_seq, mine.last_read_seq,
+    COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
+    (SELECT COUNT(*) FROM participants AS member
+     WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,
+    (SELECT COUNT(*) FROM messages AS unread_message
+     WHERE unread_message.thread_id = t.id
+       AND unread_message.seq >= mine.joined_seq
+       AND unread_message.seq > mine.last_read_seq
+       AND unread_message.sender_id <> mine.user_id) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
@@ -57,56 +53,51 @@ JOIN participants AS mine
   ON mine.thread_id = t.id
  AND mine.user_id = sqlc.arg(user_id)
  AND mine.left_seq IS NULL
-JOIN participants AS other
-  ON other.thread_id = t.id
+LEFT JOIN participants AS other
+  ON t.kind = 'direct'
+ AND other.thread_id = t.id
  AND other.user_id <> mine.user_id
  AND other.left_seq IS NULL
-JOIN users AS peer ON peer.id = other.user_id
+LEFT JOIN users AS peer ON peer.id = other.user_id
 LEFT JOIN messages AS last_message
-  ON last_message.thread_id = t.id
- AND last_message.seq = t.last_seq
+  ON last_message.thread_id = t.id AND last_message.seq = t.last_seq
 LEFT JOIN users AS last_sender ON last_sender.id = last_message.sender_id
-WHERE t.external_id = sqlc.arg(thread_external_id)
-  AND t.kind = 'direct';
+WHERE t.external_id = sqlc.arg(thread_external_id);
 
 -- name: ListThreadsForUser :many
 SELECT
-    t.id,
-    t.external_id,
-    t.kind,
-    peer.external_id AS peer_external_id,
-    peer.username AS peer_username,
-    t.last_seq,
-    mine.last_read_seq,
-    other.last_read_seq AS peer_last_read_seq,
-    (
-        SELECT COUNT(*)
-        FROM messages AS unread_message
-        WHERE unread_message.thread_id = t.id
-          AND unread_message.seq >= mine.joined_seq
-          AND unread_message.seq > mine.last_read_seq
-          AND unread_message.sender_id <> mine.user_id
-          AND unread_message.kind <> 'system'
-    ) AS unread_count,
+    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
+    mine.role,
+    COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
+    COALESCE(peer.username, '') AS peer_username,
+    t.last_seq, mine.joined_seq, mine.last_read_seq,
+    COALESCE(other.last_read_seq, 0)::BIGINT AS peer_last_read_seq,
+    (SELECT COUNT(*) FROM participants AS member
+     WHERE member.thread_id = t.id AND member.left_seq IS NULL) AS member_count,
+    (SELECT COUNT(*) FROM messages AS unread_message
+     WHERE unread_message.thread_id = t.id
+       AND unread_message.seq >= mine.joined_seq
+       AND unread_message.seq > mine.last_read_seq
+       AND unread_message.sender_id <> mine.user_id) AS unread_count,
     last_message.seq AS last_message_seq,
     last_sender.external_id AS last_message_sender_external_id,
     last_message.content AS last_message_content,
     last_message.created_at AS last_message_created_at,
     t.created_at
-FROM participants AS mine
-JOIN threads AS t ON t.id = mine.thread_id
-JOIN participants AS other
-  ON other.thread_id = t.id
+FROM threads AS t
+JOIN participants AS mine
+  ON mine.thread_id = t.id
+ AND mine.user_id = sqlc.arg(user_id)
+ AND mine.left_seq IS NULL
+LEFT JOIN participants AS other
+  ON t.kind = 'direct'
+ AND other.thread_id = t.id
  AND other.user_id <> mine.user_id
  AND other.left_seq IS NULL
-JOIN users AS peer ON peer.id = other.user_id
+LEFT JOIN users AS peer ON peer.id = other.user_id
 LEFT JOIN messages AS last_message
-  ON last_message.thread_id = t.id
- AND last_message.seq = t.last_seq
+  ON last_message.thread_id = t.id AND last_message.seq = t.last_seq
 LEFT JOIN users AS last_sender ON last_sender.id = last_message.sender_id
-WHERE mine.user_id = sqlc.arg(user_id)
-  AND mine.left_seq IS NULL
-  AND t.kind = 'direct'
 ORDER BY COALESCE(last_message.created_at, t.created_at) DESC, t.id DESC;
 
 -- name: MarkThreadRead :one
@@ -120,12 +111,3 @@ WHERE participant.thread_id = thread.id
   AND sqlc.arg(last_read_seq) >= participant.joined_seq - 1
   AND sqlc.arg(last_read_seq) <= thread.last_seq
 RETURNING participant.last_read_seq;
-
--- name: GetThreadReadBounds :one
-SELECT participant.joined_seq, thread.last_seq
-FROM threads AS thread
-JOIN participants AS participant
-  ON participant.thread_id = thread.id
- AND participant.user_id = sqlc.arg(user_id)
- AND participant.left_seq IS NULL
-WHERE thread.external_id = sqlc.arg(thread_external_id);

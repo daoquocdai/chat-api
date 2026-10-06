@@ -50,6 +50,15 @@ func (r *PostgresRepository) Send(
 			}
 			return err
 		}
+		// Recheck after obtaining the thread lock: membership may have changed while waiting.
+		if _, err := queries.GetActiveParticipant(ctx, sqlc.GetActiveParticipantParams{
+			ThreadID: threadInternalID, UserID: senderID,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return threadmodel.ErrNotParticipant
+			}
+			return err
+		}
 
 		existing, err := queries.GetMessageByExternalID(ctx, messageExternalID)
 		if err == nil {
@@ -60,7 +69,7 @@ func (r *PostgresRepository) Send(
 			}
 			result = messageFromValues(
 				existing.ID, existing.ExternalID, existing.ThreadExternalID,
-				existing.SenderExternalID, existing.Seq, existing.Kind,
+				existing.SenderExternalID, existing.Seq, existing.ThreadKind, existing.Kind,
 				existing.ContentFormat, existing.Content, existing.CreatedAt,
 			)
 			return nil
@@ -87,7 +96,7 @@ func (r *PostgresRepository) Send(
 		created = true
 		result = messageFromValues(
 			message.ID, message.ExternalID, message.ThreadExternalID,
-			message.SenderExternalID, message.Seq, message.Kind,
+			message.SenderExternalID, message.Seq, message.ThreadKind, message.Kind,
 			message.ContentFormat, message.Content, message.CreatedAt,
 		)
 		return nil
@@ -114,7 +123,7 @@ func (r *PostgresRepository) List(
 		return model.Page{}, err
 	}
 	queries := sqlc.New(r.pool)
-	if _, err := queries.GetActiveThreadAccess(ctx, sqlc.GetActiveThreadAccessParams{
+	if _, err := queries.GetThreadHistoryAccess(ctx, sqlc.GetThreadHistoryAccessParams{
 		UserID:           userID,
 		ThreadExternalID: threadID,
 	}); err != nil {
@@ -146,7 +155,7 @@ func (r *PostgresRepository) List(
 	for i, row := range rows {
 		messages[i] = messageFromValues(
 			row.ID, row.ExternalID, row.ThreadExternalID,
-			row.SenderExternalID, row.Seq, row.Kind,
+			row.SenderExternalID, row.Seq, row.ThreadKind, row.Kind,
 			row.ContentFormat, row.Content, row.CreatedAt,
 		)
 	}
@@ -183,13 +192,14 @@ func messageFromValues(
 	id int64,
 	externalID, threadExternalID, senderExternalID pgtype.UUID,
 	seq int64,
-	kind, contentFormat, content string,
+	threadKind, kind, contentFormat, content string,
 	createdAt pgtype.Timestamptz,
 ) model.Message {
 	return model.Message{
 		ID:               id,
 		ExternalID:       externalID.String(),
 		ThreadExternalID: threadExternalID.String(),
+		ThreadKind:       threadKind,
 		SenderExternalID: senderExternalID.String(),
 		Seq:              seq,
 		Kind:             kind,
@@ -204,4 +214,31 @@ func isExternalIDUniqueViolation(err error) bool {
 	return errors.As(err, &postgresError) &&
 		postgresError.Code == "23505" &&
 		postgresError.ConstraintName == "messages_external_id_key"
+}
+
+// MembershipVersionAtSequence resolves the immutable snapshot key after commit.
+func (r *PostgresRepository) MembershipVersionAtSequence(ctx context.Context, threadExternalID string, seq int64) (int64, error) {
+	id, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
+	if err != nil {
+		return 0, err
+	}
+	return sqlc.New(r.pool).GetMembershipVersion(ctx, sqlc.GetMembershipVersionParams{ThreadExternalID: id, Seq: seq})
+}
+
+// ListMemberIDsAtSequence is only used by the publishing service after commit.
+// Historical intervals make this safe even if membership changes before this query.
+func (r *PostgresRepository) ListMemberIDsAtSequence(ctx context.Context, threadExternalID string, seq int64) ([]string, error) {
+	id, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := sqlc.New(r.pool).ListMemberIDsAtSequence(ctx, sqlc.ListMemberIDsAtSequenceParams{ThreadExternalID: id, Seq: seq})
+	if err != nil {
+		return nil, err
+	}
+	members := make([]string, len(ids))
+	for i, id := range ids {
+		members[i] = id.String()
+	}
+	return members, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	messagemodel "github.com/daoquocdai/chat-api/internal/module/message/model"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 )
@@ -12,19 +13,27 @@ type Repository interface {
 	CreateOrGetDirect(ctx context.Context, creatorID, peerID int64) (model.Thread, bool, error)
 	ListByUser(ctx context.Context, userID int64) ([]model.Thread, error)
 	MarkRead(ctx context.Context, threadExternalID string, userID, lastReadSeq int64) (int64, error)
+	CreateGroup(ctx context.Context, creatorID int64, name string, memberIDs []int64, content string) (model.Thread, messagemodel.Message, error)
+	ChangeMember(ctx context.Context, threadExternalID string, actorID, targetID int64, action model.MembershipAction, content string) (messagemodel.Message, error)
+	ListMembers(ctx context.Context, threadExternalID string, actorID int64) ([]model.Member, error)
 }
 
 type UserFinder interface {
 	GetByExternalID(ctx context.Context, externalID string) (usermodel.User, error)
 }
 
+type MessagePublisher interface {
+	PublishMessage(context.Context, messagemodel.Message) error
+}
+
 type Service struct {
 	repository Repository
 	users      UserFinder
+	publisher  MessagePublisher
 }
 
-func New(repository Repository, users UserFinder) *Service {
-	return &Service{repository: repository, users: users}
+func New(repository Repository, users UserFinder, publisher MessagePublisher) *Service {
+	return &Service{repository: repository, users: users, publisher: publisher}
 }
 
 func (s *Service) CreateOrGetDirect(

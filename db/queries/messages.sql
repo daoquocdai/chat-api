@@ -3,14 +3,14 @@ SELECT EXISTS (
     SELECT 1 FROM threads WHERE external_id = $1
 );
 
--- name: GetActiveThreadAccess :one
+-- name: GetThreadHistoryAccess :one
 SELECT t.id
 FROM threads AS t
 JOIN participants AS p
   ON p.thread_id = t.id
  AND p.user_id = sqlc.arg(user_id)
- AND p.left_seq IS NULL
-WHERE t.external_id = sqlc.arg(thread_external_id);
+WHERE t.external_id = sqlc.arg(thread_external_id)
+LIMIT 1;
 
 -- name: LockThreadForParticipant :one
 SELECT t.id
@@ -22,6 +22,26 @@ JOIN participants AS p
 WHERE t.external_id = sqlc.arg(thread_external_id)
 FOR UPDATE OF t;
 
+-- name: ListMemberIDsAtSequence :many
+SELECT DISTINCT member.external_id
+FROM participants AS participant
+JOIN threads AS thread ON thread.id = participant.thread_id
+JOIN users AS member ON member.id = participant.user_id
+WHERE thread.external_id = sqlc.arg(thread_external_id)
+  AND participant.joined_seq <= sqlc.arg(seq)::BIGINT
+  AND (participant.left_seq IS NULL OR participant.left_seq >= sqlc.arg(seq)::BIGINT)
+ORDER BY member.external_id;
+
+-- name: GetMembershipVersion :one
+-- A removal includes its system message; the snapshot changes at left_seq + 1.
+-- Resolve after commit at the message seq, for both direct and group messages.
+SELECT COALESCE(MAX(boundary.seq), 0)::BIGINT AS version
+FROM participants AS participant
+JOIN threads AS thread ON thread.id = participant.thread_id
+CROSS JOIN LATERAL (VALUES (participant.joined_seq), (participant.left_seq + 1)) AS boundary(seq)
+WHERE thread.external_id = sqlc.arg(thread_external_id)
+  AND boundary.seq <= sqlc.arg(seq)::BIGINT;
+
 -- name: GetMessageByExternalID :one
 SELECT
     m.id,
@@ -29,6 +49,7 @@ SELECT
     m.thread_id,
     m.sender_id,
     t.external_id AS thread_external_id,
+    t.kind AS thread_kind,
     sender.external_id AS sender_external_id,
     m.seq,
     m.kind,
@@ -73,6 +94,7 @@ SELECT
     created.id,
     created.external_id,
     thread.external_id AS thread_external_id,
+    thread.kind AS thread_kind,
     sender.external_id AS sender_external_id,
     created.seq,
     created.kind,
@@ -88,6 +110,7 @@ SELECT
     m.id,
     m.external_id,
     t.external_id AS thread_external_id,
+    t.kind AS thread_kind,
     sender.external_id AS sender_external_id,
     m.seq,
     m.kind,
@@ -97,12 +120,14 @@ SELECT
 FROM messages AS m
 JOIN threads AS t ON t.id = m.thread_id
 JOIN users AS sender ON sender.id = m.sender_id
-JOIN participants AS participant
-  ON participant.thread_id = t.id
- AND participant.user_id = sqlc.arg(user_id)
- AND participant.left_seq IS NULL
 WHERE t.external_id = sqlc.arg(thread_external_id)
-  AND m.seq >= participant.joined_seq
+  AND EXISTS (
+    SELECT 1 FROM participants AS participant
+    WHERE participant.thread_id = t.id
+      AND participant.user_id = sqlc.arg(user_id)
+      AND m.seq >= participant.joined_seq
+      AND (participant.left_seq IS NULL OR m.seq <= participant.left_seq)
+  )
   AND (
     sqlc.narg(before_seq)::BIGINT IS NULL
     OR m.seq < sqlc.narg(before_seq)

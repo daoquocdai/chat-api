@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"strings"
+	"time"
 	"unicode/utf8"
 
+	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 )
@@ -12,6 +14,8 @@ import (
 const maximumContentCharacters = 1000
 
 type Repository interface {
+	MembershipVersionAtSequence(context.Context, string, int64) (int64, error)
+	ListMemberIDsAtSequence(context.Context, string, int64) ([]string, error)
 	Send(
 		ctx context.Context,
 		threadExternalID string,
@@ -31,13 +35,32 @@ type UserFinder interface {
 	GetByExternalID(ctx context.Context, externalID string) (usermodel.User, error)
 }
 
-type Service struct {
-	repository Repository
-	users      UserFinder
+type Publisher interface {
+	Publish(ctx context.Context, event messageevent.MessageCreated) error
 }
 
-func New(repository Repository, users UserFinder) *Service {
-	return &Service{repository: repository, users: users}
+type Service struct {
+	repository     Repository
+	users          UserFinder
+	publisher      Publisher
+	cache          MembershipCache
+	publishTimeout time.Duration
+}
+
+func New(
+	repository Repository,
+	users UserFinder,
+	publisher Publisher,
+	cache MembershipCache,
+	publishTimeout time.Duration,
+) *Service {
+	return &Service{
+		repository:     repository,
+		users:          users,
+		publisher:      publisher,
+		cache:          cache,
+		publishTimeout: publishTimeout,
+	}
 }
 
 func (s *Service) Send(
@@ -63,7 +86,16 @@ func (s *Service) Send(
 		return model.Message{}, false, err
 	}
 
-	return s.repository.Send(ctx, threadExternalID, actor.ID, messageID, content)
+	message, created, err := s.repository.Send(ctx, threadExternalID, actor.ID, messageID, content)
+	if err != nil {
+		return model.Message{}, false, err
+	}
+
+	if err := s.PublishMessage(ctx, message); err != nil {
+		return message, created, err
+	}
+
+	return message, created, nil
 }
 
 func (s *Service) List(

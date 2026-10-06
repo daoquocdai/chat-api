@@ -9,9 +9,11 @@ import (
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
 	authmiddleware "github.com/daoquocdai/chat-api/internal/middleware"
 	messagehandler "github.com/daoquocdai/chat-api/internal/module/message/handler"
+	messagepublisher "github.com/daoquocdai/chat-api/internal/module/message/publisher"
 	messagerepository "github.com/daoquocdai/chat-api/internal/module/message/repository"
 	messageservice "github.com/daoquocdai/chat-api/internal/module/message/service"
 	threadhandler "github.com/daoquocdai/chat-api/internal/module/thread/handler"
+	"github.com/daoquocdai/chat-api/internal/module/thread/membership"
 	threadrepository "github.com/daoquocdai/chat-api/internal/module/thread/repository"
 	threadservice "github.com/daoquocdai/chat-api/internal/module/thread/service"
 	userhandler "github.com/daoquocdai/chat-api/internal/module/user/handler"
@@ -19,7 +21,9 @@ import (
 	userservice "github.com/daoquocdai/chat-api/internal/module/user/service"
 	"github.com/daoquocdai/chat-api/internal/route"
 	"github.com/daoquocdai/chat-api/internal/token"
+	"github.com/daoquocdai/chat-api/internal/wsticket"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -46,6 +50,24 @@ func run() error {
 		return fmt.Errorf("connect to database: %w", err)
 	}
 
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:                  cfg.Redis.Address,
+		Password:              cfg.Redis.Password,
+		DB:                    cfg.Redis.Database,
+		DialTimeout:           cfg.Redis.PublishTimeout,
+		ReadTimeout:           cfg.Redis.PublishTimeout,
+		WriteTimeout:          cfg.Redis.PublishTimeout,
+		ContextTimeoutEnabled: true,
+	})
+	defer redisClient.Close()
+
+	redisContext, cancelRedis := context.WithTimeout(ctx, cfg.Redis.PublishTimeout)
+	redisPingError := redisClient.Ping(redisContext).Err()
+	cancelRedis()
+	if redisPingError != nil {
+		return fmt.Errorf("connect to redis: %w", redisPingError)
+	}
+
 	queries := sqlc.New(pool)
 	jwtManager, err := token.NewJWT(cfg.Auth.JWTSecret, cfg.Auth.JWTTTL)
 	if err != nil {
@@ -57,17 +79,25 @@ func run() error {
 	userHandler := userhandler.New(userService)
 
 	threadRepository := threadrepository.New(pool)
-	threadService := threadservice.New(threadRepository, userService)
-	threadHandler := threadhandler.New(threadService)
-
 	messageRepository := messagerepository.New(pool)
-	messageService := messageservice.New(messageRepository, userService)
+	messageService := messageservice.New(
+		messageRepository,
+		userService,
+		messagepublisher.NewRedis(redisClient, cfg.Redis.Stream),
+		membership.NewRedis(redisClient, cfg.Redis.Stream),
+		cfg.Redis.PublishTimeout,
+	)
 	messageHandler := messagehandler.New(messageService)
+	threadService := threadservice.New(threadRepository, userService, messageService)
+	threadHandler := threadhandler.New(threadService)
+	wsTicketService := wsticket.NewService(wsticket.NewRedisRepository(redisClient), cfg.WSTicketTTL)
+	wsTicketHandler := wsticket.NewHandler(wsTicketService, cfg.WSPublicURL, cfg.Redis.PublishTimeout)
 
 	router := route.New(
 		userHandler,
 		threadHandler,
 		messageHandler,
+		wsTicketHandler,
 		authmiddleware.RequireAuthentication(jwtManager),
 	)
 

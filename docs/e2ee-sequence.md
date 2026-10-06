@@ -12,7 +12,7 @@ sequenceDiagram
     participant API as chat-api
     participant DB as PostgreSQL
     participant B as Client B
-    B->>B: Tạo IK, SPK, 20 OPK; ký SPK
+    B->>B: Tạo IK, SPK, 20 OPK, ký SPK
     B->>B: Commit private keys và pending upload vào IndexedDB
     B->>API: POST /e2ee/prekeys với public bundle
     API->>DB: Khóa user, lưu public keys và chữ ký

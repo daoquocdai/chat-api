@@ -1,551 +1,340 @@
-/* Crypto stays in the Go/WASM bridge. This controller owns durable web state. */
+/* Account vaults and immutable epoch backups are recovered from the API on every login. */
 (() => {
   "use strict";
 
   const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-  const hashPattern = /^[0-9a-f]{64}$/;
-  const batchSize = 20;
-  const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
-  const clone = (value) => structuredClone(value);
-  const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-  const fields = (value, names) => object(value) && Object.keys(value).length === names.length && names.every((name) => own(value, name));
   const uuid = (value) => typeof value === "string" && uuidPattern.test(value) &&
     value !== "00000000-0000-0000-0000-000000000000";
-  const positiveID = (value) => Number.isSafeInteger(value) && value > 0;
-  const watermark = (value) => Number.isSafeInteger(value) && value >= 0;
-  const hash = (value) => typeof value === "string" && hashPattern.test(value);
-
-  function failure(code, message) {
-    const error = new Error(message);
-    error.code = code;
-    return error;
+  const normalizeUsername = (value) => String(value).trim().toLowerCase();
+  const validKey = (value) => {
+    try { return typeof value === "string" && atob(value).length === 32 && btoa(atob(value)) === value; }
+    catch (_) { return false; }
+  };
+  function assert(condition, message) {
+    if (!condition) throw new Error(message);
   }
-  function assert(condition, code = "missing_keys", message = "State E2EE bị thiếu hoặc không hợp lệ; không tự thay bộ khóa.") {
-    if (!condition) throw failure(code, message);
+  async function runtime() {
+    assert(globalThis.isSecureContext && globalThis.crypto?.randomUUID && globalThis.WebAssembly,
+      "Chat mã hóa cần kết nối HTTPS hoặc localhost và trình duyệt hỗ trợ WebAssembly.");
+    return globalThis.MiniHermesWASM.load();
   }
-  function base64(value, length) {
-    if (typeof value !== "string") return false;
-    try {
-      const bytes = atob(value);
-      return bytes.length === length && btoa(bytes) === value;
-    } catch (_) { return false; }
+  async function createAccount(username, password) {
+    username = normalizeUsername(username);
+    const crypto = await runtime();
+    const result = crypto.call("createAccount", { username, password });
+    return { username, auth_credential: result.auth_credential, kdf: result.kdf,
+      public_bundle: result.public_bundle, account_vault: result.encrypted_vault, vault_key: result.vault_key };
   }
-  function sameContext(left, right) {
-    return object(left) && object(right) &&
-      ["thread_id", "message_id", "sender_id", "recipient_id"].every((name) => left[name] === right[name]);
-  }
-  function validContext(context) {
-    return object(context) && Object.keys(context).length === 4 &&
-      ["thread_id", "message_id", "sender_id", "recipient_id"].every((name) => uuid(context[name])) &&
-      context.sender_id !== context.recipient_id;
-  }
-  function safeError(error) {
-    if (error?.code === "stale_session") return "Phiên E2EE đã kết thúc.";
-    if (error?.code && typeof error.message === "string") return error.message;
-    if (error?.status === 409) return "API báo xung đột; giữ bộ khóa và payload đang chờ để đối chiếu.";
-    if (error?.status === 403) return "Không có quyền thực hiện thao tác E2EE trong cuộc trò chuyện này.";
-    if (error?.status === 404) return "Chưa tìm thấy thread hoặc public bundle của người nhận.";
-    if (error?.status === 400 || error?.status === 413) return "API từ chối payload E2EE; giữ payload đang chờ.";
-    return "Thao tác E2EE chưa được xác nhận. State đã lưu được giữ để thử lại.";
-  }
-  function validatedText(value) {
-    assert(typeof value === "string", "invalid_input", "Nội dung tin nhắn không hợp lệ.");
-    const text = value.trim();
-    const runes = [...text];
-    assert(runes.length > 0 && runes.length <= 1000 && !text.includes("\0") &&
-      !runes.some((rune) => rune.length === 1 && rune.charCodeAt(0) >= 0xd800 && rune.charCodeAt(0) <= 0xdfff),
-    "invalid_input", "Tin nhắn cần 1–1000 ký tự Unicode hợp lệ và không chứa NUL.");
-    return text;
+  async function deriveCredentials(username, password, kdf) {
+    const crypto = await runtime();
+    return crypto.call("deriveCredentials", { username: normalizeUsername(username), password, kdf });
   }
 
   class Client {
-    constructor({ apiURL, userID, request, onChange, current }) {
-      this.apiURL = globalThis.MiniHermesE2EEStorage.normalizeAPIURL(apiURL);
-      assert(uuid(userID), "invalid_context", "UUID tài khoản không hợp lệ.");
+    constructor({ apiURL, userID, username, vaultKey, request, onChange, current }) {
+      assert(uuid(userID) && validKey(vaultKey), "Thông tin khôi phục tài khoản không hợp lệ.");
       this.userID = userID;
+      this.username = normalizeUsername(username);
+      this.vaultKey = vaultKey;
       this.request = request;
       this.onChange = onChange || (() => {});
       this.current = current || (() => true);
       this.status = "initializing";
       this.error = "";
-      this.busy = false;
-      this.owner = false;
-      this.profile = null;
-      this.runtime = null;
-      this.store = null;
-      this.queue = Promise.resolve();
-      this.starting = null;
-      this.lockRequest = null;
-      this.releaseLock = null;
       this.closed = false;
-      this.closing = false;
-      this.loadFailed = false;
-      this.profileLoaded = false;
+      this.account = null;
+      this.fingerprint = "";
+      this.crypto = null;
+      this.outbox = globalThis.MiniHermesE2EEStorage.outbox(apiURL, userID);
+      this.epochs = new Map();
+      this.records = new Map();
+      this.listRequests = new Map();
+      this.epochRequests = new Map();
+      this.currentRequests = new Map();
+      this.posts = new Map();
+      this.peerPins = new Map();
     }
-
-    snapshot() {
-      const profile = this.profile;
-      return {
-        status: this.status, error: this.error, owner: this.owner, busy: this.busy,
-        own_fingerprint: profile?.identity_fingerprint || "",
-        registration: Boolean(profile?.registration?.confirmed),
-        last_prekey_id: profile?.last_prekey_id || 0,
-        opk_count: profile?.registration?.one_time_prekey_count ?? null,
-        local_opk_count: profile ? Object.keys(profile.one_time_prekeys).length : 0,
-        pending_upload: Boolean(profile?.pending_upload),
-        pending_send: profile?.pending_send ? {
-          message_id: profile.pending_send.message_id, thread_id: profile.pending_send.thread_id,
-          in_flight: this.busy,
-        } : null,
-        peer_pins: clone(profile?.peer_pins || {}),
-        can_initialize: this.owner && Boolean(this.runtime && this.store) && this.profileLoaded && !profile && !this.loadFailed,
-      };
-    }
-
-    canRead() {
-      return this._live() && this.owner && Boolean(this.runtime && this.store && this.profile?.registration?.confirmed) &&
-        !this.loadFailed && globalThis.MiniHermesWASM.status === "ready";
-    }
-    canSend(thread) {
-      return this.canRead() && this.status === "ready" && !this.busy && !this.profile.pending_send &&
-        !this.profile.pending_upload && this._threadValid(thread);
-    }
-    _threadValid(thread) {
-      return object(thread) && thread.kind === "direct" && thread.encryption_mode === "e2ee" &&
-        uuid(thread.id) && uuid(thread.peer?.id) && thread.peer.id !== this.userID;
-    }
-    _live() { return !this.closing && !this.closed && this.current(); }
-    _assertLive() {
-      assert(this._live(), "stale_session", "Phiên E2EE đã kết thúc.");
-    }
-    _assertOwner() {
-      this._assertLive();
-      assert(this.owner && this.runtime && this.store, "not_ready", "Tab chưa sở hữu state E2EE hoặc WASM chưa sẵn sàng.");
-    }
+    _live() { return !this.closed && this.current(); }
+    _check() { assert(this._live(), "Phiên đăng nhập đã kết thúc."); }
     _notify() { if (this._live()) this.onChange(); }
-    _status() {
-      if (this.loadFailed) this.status = "missing_keys";
-      else if (this.owner && this.profile?.registration?.confirmed) this.status = "ready";
-      else if (this.owner) this.status = "missing_keys";
-    }
-    async _crypto(method, input) {
-      this._assertOwner();
-      const result = await this.runtime.call(method, input);
-      this._assertLive();
-      return result;
-    }
-    _task(work, { message = false } = {}) {
-      const result = this.queue.then(async () => {
-        this._assertOwner();
-        this.busy = true;
-        if (!message) { this.error = ""; this._status(); }
-        this._notify();
-        try { return await work(); }
-        catch (error) {
-          if (!message && this._live()) {
-            this.error = safeError(error);
-            this.status = "error";
-          }
-          throw error;
-        } finally {
-          this.busy = false;
-          this._notify();
-        }
-      });
-      // Failure of one operation must not poison the serial state queue.
-      this.queue = result.catch(() => {});
-      return result;
-    }
-    async _save(next) {
-      this._assertOwner();
-      // All crypto/network work is complete before opening this transaction.
-      await this.store.save(next);
-      this._assertLive();
-      // Update RAM only after transaction.oncomplete; abort keeps the old state.
-      this.profile = next;
-      this._status();
-      this._notify();
-    }
-
-    start() {
-      if (this.starting) return this.starting;
-      this._assertLive();
-      this.status = "initializing";
-      this.error = "";
-      this._notify();
-      let settle;
-      this.starting = new Promise((resolve) => { settle = resolve; });
-      if (!globalThis.isSecureContext || !globalThis.navigator?.locks || !globalThis.indexedDB ||
-          !globalThis.WebAssembly || !globalThis.crypto?.randomUUID) {
-        this.status = "error";
-        this.error = "E2EE cần secure context, Web Locks, IndexedDB, WebAssembly và UUID của browser; không có chế độ thay thế.";
-        settle();
-        this._notify();
-        return this.starting;
-      }
-      const lockName = "mini-hermes:e2ee:" + JSON.stringify([this.apiURL, this.userID]);
-      this.lockRequest = navigator.locks.request(lockName, { mode: "exclusive", ifAvailable: true }, async (lock) => {
-        if (!lock) {
-          this.status = "other_tab";
-          this.error = "E2EE đang dùng ở tab khác. Đóng hoặc đăng xuất tab sở hữu rồi thử tiếp quản.";
-          settle(); this._notify(); return;
-        }
-        this.owner = true;
-        const held = new Promise((resolve) => { this.releaseLock = resolve; });
-        try {
-          this._assertLive();
-          this.runtime = await globalThis.MiniHermesWASM.load();
-          this._assertLive();
-          this.store = await globalThis.MiniHermesE2EEStorage.open();
-          this._assertLive();
-          const profile = await this.store.load(this.apiURL, this.userID);
-          this._assertLive();
-          if (profile !== null) {
-            try { await this._validateProfile(profile); }
-            catch (error) { this.loadFailed = true; throw error; }
-            this.profile = profile;
-          }
-          // Bootstrap must finish before initialize can observe an empty scope.
-          // A loaded profile stays protected throughout async WASM validation.
-          this.profileLoaded = true;
-          this._status();
-          if (!this.profile) this.error = "Không có khóa local. Chỉ khởi tạo nếu đây là tài khoản chưa đăng ký; mất IndexedDB không thể khôi phục khóa cũ.";
-          else if (!this.profile.registration.confirmed) this.error = "Bộ khóa đã lưu; cần xác nhận đăng ký public bundle.";
-        } catch (error) {
-          if (this._live()) {
-            this.status = this.loadFailed ? "missing_keys" : "error";
-            this.error = safeError(error);
-          }
-        } finally { settle(); this._notify(); }
-        if (this.closing || this.closed || !this.current()) this.releaseLock();
-        await held;
-        await this.queue;
-        this.store?.close();
-        this.store = null;
-        this.profile = null;
-        this.runtime = null;
-        this.owner = false;
-        this.releaseLock = null;
-      }).catch((error) => {
-        if (this._live()) { this.status = "error"; this.error = safeError(error); this._notify(); }
-        settle();
-      });
-      return this.starting;
-    }
-    takeOver() {
-      this._assertLive();
-      assert(!this.owner && !this.busy, "not_ready", "Tab đã sở hữu E2EE hoặc đang xử lý state.");
-      this.starting = null;
-      return this.start();
-    }
-    async close() {
-      if (this.closed) return;
-      this.closing = true;
-      // In-flight local transactions settle before the ownership callback exits.
-      await this.starting;
-      await this.queue;
-      this.releaseLock?.();
-      await this.lockRequest;
-      this.profile = null;
-      this.runtime = null;
-      this.closed = true;
-    }
-
-    _publicBundle(profile) {
-      return {
-        user_id: this.userID, identity_public_key: profile.identity.public_key,
-        signed_prekey: { key_id: profile.signed_prekey.key_id,
-          public_key: profile.signed_prekey.key_pair.public_key, signature: profile.signed_prekey.signature },
-        one_time_prekey: null,
-      };
-    }
-    async _validatePair(pair) {
-      assert(object(pair) && base64(pair.private_key, 32) && base64(pair.public_key, 32) && Object.keys(pair).length === 2);
-      const restored = await this._crypto("generateKeyPair", { private_key: pair.private_key });
-      assert(restored.key_pair.public_key === pair.public_key && restored.key_pair.private_key === pair.private_key);
-      return restored.fingerprint;
-    }
-    async _validateProfile(profile) {
-      assert(object(profile) && profile.version === 1 && profile.api_url === this.apiURL && profile.user_id === this.userID);
-      assert(Object.keys(profile).every((key) => ["version", "api_url", "user_id", "identity", "identity_fingerprint",
-        "signed_prekey", "one_time_prekeys", "next_prekey_id", "registration", "last_prekey_id", "pending_upload",
-        "peer_pins", "message_keys", "pending_send"].includes(key)));
-      const fingerprint = await this._validatePair(profile.identity);
-      assert(hash(profile.identity_fingerprint) && fingerprint === profile.identity_fingerprint);
-      assert(fields(profile.signed_prekey, ["key_id", "key_pair", "signature"]) && profile.signed_prekey.key_id === 1 && base64(profile.signed_prekey.signature, 64));
-      await this._validatePair(profile.signed_prekey.key_pair);
-      const verified = await this._crypto("verifyBundle", { bundle: this._publicBundle(profile) });
-      assert(verified.valid === true && verified.fingerprint === fingerprint);
-      assert(object(profile.one_time_prekeys) && positiveID(profile.next_prekey_id) && profile.next_prekey_id >= 2);
-      for (const [id, pair] of Object.entries(profile.one_time_prekeys)) {
-        assert(positiveID(Number(id)) && String(Number(id)) === id && Number(id) > 1 && Number(id) < profile.next_prekey_id);
-        await this._validatePair(pair);
-      }
-      assert(fields(profile.registration, ["confirmed", "one_time_prekey_count"]) && typeof profile.registration.confirmed === "boolean" &&
-        watermark(profile.registration.one_time_prekey_count) && watermark(profile.last_prekey_id) &&
-        profile.last_prekey_id < profile.next_prekey_id && (!profile.registration.confirmed || profile.last_prekey_id >= 1));
-      assert(profile.registration.one_time_prekey_count <= Math.max(0, profile.last_prekey_id - 1));
-      if (!profile.registration.confirmed) {
-        assert(profile.last_prekey_id === 0 && profile.registration.one_time_prekey_count === 0 &&
-          profile.pending_upload !== null && profile.next_prekey_id === batchSize + 2 &&
-          Object.keys(profile.one_time_prekeys).length === batchSize);
-      }
-      assert(object(profile.peer_pins) && object(profile.message_keys));
-      for (const [id, pin] of Object.entries(profile.peer_pins)) {
-        assert(uuid(id) && id !== this.userID && fields(pin, ["identity_public_key", "fingerprint"]) && base64(pin.identity_public_key, 32) && hash(pin.fingerprint));
-      }
-      for (const [id, cached] of Object.entries(profile.message_keys)) {
-        assert(uuid(id) && fields(cached, ["message_key", "context", "content_sha256", "sender_identity_key", "recipient_identity_key"]) && validContext(cached.context) && cached.context.message_id === id &&
-          [cached.context.sender_id, cached.context.recipient_id].includes(this.userID) && base64(cached.message_key, 32) &&
-          base64(cached.sender_identity_key, 32) && base64(cached.recipient_identity_key, 32) && hash(cached.content_sha256));
-        const incoming = cached.context.recipient_id === this.userID;
-        const peerID = incoming ? cached.context.sender_id : cached.context.recipient_id;
-        const peerKey = incoming ? cached.sender_identity_key : cached.recipient_identity_key;
-        assert((incoming ? cached.recipient_identity_key : cached.sender_identity_key) === profile.identity.public_key &&
-          profile.peer_pins[peerID]?.identity_public_key === peerKey);
-      }
-      assert(profile.pending_upload === null || object(profile.pending_upload));
-      if (profile.pending_upload) this._validateUpload(profile);
-      assert(profile.pending_send === null || object(profile.pending_send));
-      if (profile.pending_send) {
-        const pending = profile.pending_send;
-        assert(fields(pending, ["thread_id", "message_id", "context", "content_format", "content", "body"]) &&
-          validContext(pending.context) && pending.context.sender_id === this.userID &&
-          pending.message_id === pending.context.message_id && pending.thread_id === pending.context.thread_id &&
-          pending.content_format === "e2ee_v1" && typeof pending.content === "string" &&
-          pending.body === JSON.stringify({ message_id: pending.message_id, content_format: "e2ee_v1", content: pending.content }));
-        const cached = profile.message_keys[pending.message_id];
-        assert(cached && sameContext(cached.context, pending.context));
-        await this._crypto("decryptWithKey", { context: cached.context,
-          sender_identity_key: cached.sender_identity_key, recipient_identity_key: cached.recipient_identity_key,
-          message_key: cached.message_key, expected_content_sha256: cached.content_sha256, content: pending.content });
-      }
-    }
-    _validateUpload(profile) {
-      const pending = profile.pending_upload;
-      const request = pending.request;
-      assert(fields(pending, ["request", "body"]) && fields(request, ["identity_public_key", "signed_prekey", "one_time_prekeys"]) &&
-        request.identity_public_key === profile.identity.public_key && fields(request.signed_prekey, ["key_id", "public_key", "signature"]) &&
-        request.signed_prekey.key_id === profile.signed_prekey.key_id &&
-        request.signed_prekey.public_key === profile.signed_prekey.key_pair.public_key &&
-        request.signed_prekey.signature === profile.signed_prekey.signature && Array.isArray(request.one_time_prekeys) &&
-        request.one_time_prekeys.length <= 100 && pending.body === JSON.stringify(request));
-      const seen = new Set([1]);
-      for (const prekey of request.one_time_prekeys) {
-        assert(fields(prekey, ["key_id", "public_key"]) && positiveID(prekey.key_id) && !seen.has(prekey.key_id) &&
-          prekey.key_id < profile.next_prekey_id && base64(prekey.public_key, 32));
-        // An already uploaded refill OPK may have been consumed locally while its retry remains pending.
-        if (profile.one_time_prekeys[prekey.key_id]) assert(profile.one_time_prekeys[prekey.key_id].public_key === prekey.public_key);
-        else assert(profile.registration.confirmed);
-        seen.add(prekey.key_id);
-      }
-    }
-    _uploadPayload(profile, ids) {
-      const bundle = this._publicBundle(profile);
-      const request = { identity_public_key: bundle.identity_public_key, signed_prekey: bundle.signed_prekey,
-        one_time_prekeys: ids.map((id) => ({ key_id: id, public_key: profile.one_time_prekeys[id].public_key })) };
-      return { request, body: JSON.stringify(request) };
-    }
-    async _newBatch(next) {
-      const ids = [];
-      assert(positiveID(next.next_prekey_id) && next.next_prekey_id <= Number.MAX_SAFE_INTEGER - batchSize,
-        "invalid_input", "Mốc prekey ID vượt miền số nguyên an toàn của browser.");
-      for (let index = 0; index < batchSize; index += 1) {
-        const id = next.next_prekey_id++;
-        const generated = await this._crypto("generateKeyPair", {});
-        next.one_time_prekeys[id] = generated.key_pair;
-        ids.push(id);
-      }
-      next.pending_upload = this._uploadPayload(next, ids);
-    }
-    initialize() {
-      return this._task(async () => {
-        assert(this.profileLoaded && !this.profile && !this.loadFailed, "missing_keys", "Không được reset hoặc thay bộ khóa đã có, hoặc khởi tạo khi đọc state chưa thành công.");
-        const identity = await this._crypto("generateKeyPair", {});
-        const signed = await this._crypto("generateKeyPair", {});
-        const signature = await this._crypto("signPrekey", {
-          identity_private_key: identity.key_pair.private_key, signed_prekey_public_key: signed.key_pair.public_key,
-        });
-        const next = {
-          version: 1, api_url: this.apiURL, user_id: this.userID,
-          identity: identity.key_pair, identity_fingerprint: identity.fingerprint,
-          signed_prekey: { key_id: 1, key_pair: signed.key_pair, signature: signature.signature },
-          one_time_prekeys: {}, next_prekey_id: 2,
-          registration: { confirmed: false, one_time_prekey_count: 0 }, last_prekey_id: 0,
-          pending_upload: null, peer_pins: {}, message_keys: {}, pending_send: null,
-        };
-        await this._newBatch(next);
-        await this._save(next);
-      });
-    }
-    upload() { return this._task(() => this._upload()); }
-    async _upload() {
-      assert(this.profile?.pending_upload, "not_ready", "Không có public bundle đang chờ đăng ký.");
-      const pending = this.profile.pending_upload;
-      const response = await this.request("/e2ee/prekeys", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: pending.body,
-      });
-      this._assertLive();
-      const highest = Math.max(1, ...pending.request.one_time_prekeys.map((key) => key.key_id));
-      assert(object(response) && response.user_id === this.userID && response.identity_public_key === this.profile.identity.public_key &&
-        response.signed_prekey_id === this.profile.signed_prekey.key_id && watermark(response.last_prekey_id) &&
-        response.last_prekey_id >= Math.max(highest, this.profile.last_prekey_id) && watermark(response.one_time_prekey_count) &&
-        response.one_time_prekey_count <= response.last_prekey_id - 1,
-      "invalid_response", "Response đăng ký không khớp bundle đã lưu; giữ pending upload.");
-      const next = clone(this.profile);
-      next.last_prekey_id = response.last_prekey_id;
-      // A higher server watermark suggests another client: never reuse its IDs.
-      assert(response.last_prekey_id < Number.MAX_SAFE_INTEGER,
-        "invalid_response", "Mốc prekey server vượt miền an toàn; giữ pending upload.");
-      next.next_prekey_id = Math.max(next.next_prekey_id, response.last_prekey_id + 1);
-      next.registration = { confirmed: true, one_time_prekey_count: response.one_time_prekey_count };
-      next.pending_upload = null;
-      await this._save(next);
+    async _request(path, options) {
+      this._check();
+      const response = await this.request(path, options);
+      this._check();
       return response;
     }
-    refill() {
-      return this._task(async () => {
-        assert(this.profile?.registration.confirmed && !this.profile.pending_upload,
-          "not_ready", "Cần xác nhận đăng ký và giải quyết pending upload trước khi bổ sung OPK.");
-        const next = clone(this.profile);
-        await this._newBatch(next);
-        await this._save(next);
-        return this._upload();
-      });
+    _crypto(method, input) {
+      this._check();
+      assert(this.crypto, "Bộ mã hóa chưa sẵn sàng.");
+      return this.crypto.call(method, input);
     }
-
-    _pin(profile, peerID, identityKey, fingerprint) {
-      const previous = profile.peer_pins[peerID];
-      assert(!previous || previous.identity_public_key === identityKey,
-        "identity_changed", "Identity của peer đã thay đổi. Dừng E2EE và đối chiếu fingerprint; không ghi đè pin cũ.");
-      if (fingerprint) assert(hash(fingerprint) && (!previous || previous.fingerprint === fingerprint),
-        "identity_changed", "Fingerprint của peer không khớp pin đã lưu.");
+    snapshot() {
+      return { status: this.status, error: this.error, own_fingerprint: this.fingerprint,
+        peer_pins: Object.fromEntries(this.peerPins),
+        pending: this.outbox.values().map((item) => ({ message_id: item.message_id, thread_id: item.context?.thread_id })) };
     }
-    send(thread, plaintext) {
-      return this._task(async () => {
-        assert(this.canRead() && !this.profile.pending_send && !this.profile.pending_upload && this._threadValid(thread),
-          "not_ready", "E2EE chưa sẵn sàng hoặc còn payload chờ xác nhận.");
-        const text = validatedText(plaintext);
-        const context = { thread_id: thread.id, message_id: crypto.randomUUID(), sender_id: this.userID, recipient_id: thread.peer.id };
-        const bundle = await this.request(`/e2ee/bundles/${thread.peer.id}/claim`, {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ thread_id: thread.id }),
-        });
-        this._assertLive();
-        assert(object(bundle) && bundle.user_id === thread.peer.id && positiveID(bundle.signed_prekey?.key_id) &&
-          (bundle.one_time_prekey === null || positiveID(bundle.one_time_prekey?.key_id)),
-        "invalid_bundle", "Bundle không khớp recipient hoặc ID không biểu diễn chính xác.");
-        const verified = await this._crypto("verifyBundle", { bundle });
-        this._pin(this.profile, thread.peer.id, bundle.identity_public_key, verified.fingerprint);
-        const sealed = await this._crypto("seal", { context, identity: this.profile.identity, bundle, plaintext: text });
-        assert(typeof sealed.content === "string" && base64(sealed.message_key, 32) && hash(sealed.content_sha256),
-          "crypto_failed", "Kết quả crypto không hợp lệ; chưa gửi message.");
-        const next = clone(this.profile);
-        next.peer_pins[thread.peer.id] = { identity_public_key: bundle.identity_public_key, fingerprint: verified.fingerprint };
-        next.message_keys[context.message_id] = { message_key: sealed.message_key, context,
-          content_sha256: sealed.content_sha256, sender_identity_key: next.identity.public_key,
-          recipient_identity_key: bundle.identity_public_key };
-        const body = JSON.stringify({ message_id: context.message_id, content_format: "e2ee_v1", content: sealed.content });
-        next.pending_send = { thread_id: thread.id, message_id: context.message_id, context,
-          content_format: "e2ee_v1", content: sealed.content, body };
-        await this._save(next);
-        return this._postPending();
-      });
+    canRead() { return this._live() && this.status === "ready" && Boolean(this.account); }
+    _threadValid(thread) {
+      return thread?.kind === "direct" && uuid(thread.id) && uuid(thread.peer?.id) && thread.peer.id !== this.userID;
     }
-    retry() {
-      return this._task(async () => {
-        assert(this.canRead() && this.profile.pending_send, "not_ready", "Không có message E2EE đang chờ gửi lại.");
-        return this._postPending();
-      });
+    canSend(thread) { return this.canRead() && this._threadValid(thread); }
+    async start() {
+      try {
+        this.crypto = await runtime();
+        this._check();
+        const account = await this._request("/e2ee/account");
+        assert(account.user_id === this.userID && normalizeUsername(account.username) === this.username,
+          "Bản sao khóa không thuộc tài khoản đang đăng nhập.");
+        const opened = this._crypto("openAccount", { username: account.username, kdf: account.kdf,
+          vault_key: this.vaultKey, public_bundle: account.public_bundle, encrypted_vault: account.account_vault });
+        this.account = opened.account;
+        this.fingerprint = opened.fingerprint;
+        this.status = "ready";
+        this.error = "";
+        this._notify();
+      } catch (error) {
+        if (this._live()) { this.status = "error"; this.error = error.message; this._notify(); }
+        throw error;
+      }
     }
-    _matchesPending(message, pending) {
-      return object(message) && (message.id || message.message_id) === pending.message_id &&
-        message.thread_id === pending.thread_id && message.sender_id === this.userID &&
-        message.kind === "text" && message.content_format === pending.content_format && message.content === pending.content &&
-        positiveID(message.seq);
+    _pin(peerID, publicKey, fingerprint) {
+      const previous = this.peerPins.get(peerID);
+      assert(!previous || (previous.identity_public_key === publicKey && previous.fingerprint === fingerprint),
+        "Khóa của người kia đã thay đổi. Hãy đối chiếu fingerprint trước khi tiếp tục.");
+      this.peerPins.set(peerID, { identity_public_key: publicKey, fingerprint });
     }
-    async _postPending() {
-      const pending = this.profile.pending_send;
-      const response = await this.request(`/threads/${pending.thread_id}/messages`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: pending.body,
-      });
-      this._assertLive();
-      assert(this._matchesPending(response, pending), "invalid_response", "Response message không khớp payload đã lưu; giữ pending để đối chiếu.");
-      const next = clone(this.profile);
-      next.pending_send = null;
-      await this._save(next);
-      return response;
+    _header(thread, record) {
+      assert(this._threadValid(thread) && record?.thread_id === thread.id && uuid(record.epoch_id) &&
+        typeof record.bootstrap === "string", "Thông tin phiên khóa không hợp lệ.");
+      const header = JSON.parse(record.bootstrap);
+      assert(header.version === 2 && header.thread_id === thread.id && header.epoch_id === record.epoch_id &&
+        header.sender_id === record.sender_id && header.recipient_id === record.recipient_id &&
+        ((header.sender_id === this.userID && header.recipient_id === thread.peer.id) ||
+         (header.recipient_id === this.userID && header.sender_id === thread.peer.id)),
+      "Phiên khóa không khớp hai thành viên cuộc trò chuyện.");
+      const ownKey = header.sender_id === this.userID ? header.sender_identity_key : header.recipient_identity_key;
+      assert(ownKey === this.account.identity.public_key, "Identity của phiên khóa không khớp tài khoản đã khôi phục.");
+      return header;
     }
-    receive(thread, message) {
-      if (!this.canRead() || !this._threadValid(thread)) return Promise.resolve({ status: "pending",
-        error: this.status === "other_tab" ? "E2EE đang dùng ở tab khác." : "Đang chờ bộ khóa, WASM hoặc thông tin thread E2EE." });
-      return this._task(async () => {
-        this._assertLive();
-        assert(this.canRead() && this._threadValid(thread), "not_ready", "State E2EE chưa sẵn sàng.");
+    async _list(thread) {
+      if (this.listRequests.has(thread.id)) return this.listRequests.get(thread.id);
+      const request = this._request("/threads/" + thread.id + "/epochs").then((response) => {
+        assert(Array.isArray(response.epochs) &&
+          (response.current_epoch_id === null || uuid(response.current_epoch_id)), "Danh sách phiên khóa không hợp lệ.");
+        for (const record of response.epochs) {
+          this._header(thread, record);
+          const previous = this.records.get(record.epoch_id);
+          assert(!previous || previous.bootstrap === record.bootstrap, "Nội dung phiên khóa đã thay đổi.");
+          this.records.set(record.epoch_id, record);
+        }
+        assert(response.current_epoch_id === null ||
+          response.epochs.some((epoch) => epoch.epoch_id === response.current_epoch_id),
+        "Không tìm thấy phiên khóa hiện tại.");
+        return response;
+      }).finally(() => this.listRequests.delete(thread.id));
+      this.listRequests.set(thread.id, request);
+      return request;
+    }
+    async _restore(thread, record, proposedKey) {
+      const header = this._header(thread, record);
+      const cached = this.epochs.get(record.epoch_id);
+      if (cached) {
+        assert(cached.bootstrap === record.bootstrap, "Phiên khóa đã thay đổi.");
+        return cached;
+      }
+      if (this.epochRequests.has(record.epoch_id)) return this.epochRequests.get(record.epoch_id);
+      const request = (async () => {
+        let opened;
+        if (record.key_backup) {
+          opened = this._crypto("decryptEpochBackup", { vault_key: this.vaultKey, owner_id: this.userID,
+            header: record.bootstrap, backup: record.key_backup });
+        } else {
+          assert(header.recipient_id === this.userID, "Phiên đã gửi chưa có bản sao khóa trên server.");
+          assert(header.signed_prekey_id === this.account.signed_prekey.key_id, "Thiếu signed prekey cho phiên khóa.");
+          const opk = header.one_time_prekey_id === null ? null :
+            this.account.one_time_prekeys.find((item) => item.key_id === header.one_time_prekey_id)?.key_pair;
+          assert(header.one_time_prekey_id === null || opk, "Thiếu private prekey để khôi phục phiên.");
+          const context = { thread_id: thread.id, epoch_id: record.epoch_id,
+            sender_id: header.sender_id, recipient_id: header.recipient_id };
+          const derived = this._crypto("openEpoch", { context, identity: this.account.identity,
+            signed_prekey: this.account.signed_prekey.key_pair, one_time_prekey: opk, header: record.bootstrap });
+          const encrypted = this._crypto("encryptEpochBackup", { vault_key: this.vaultKey,
+            owner_id: this.userID, header: record.bootstrap, session_key: derived.session_key });
+          const saved = await this._request("/threads/" + thread.id + "/epochs/" + record.epoch_id + "/key", {
+            method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key_backup: encrypted.backup }) });
+          assert(saved.key_backup, "Server chưa xác nhận lưu bản sao khóa phiên.");
+          opened = this._crypto("decryptEpochBackup", { vault_key: this.vaultKey, owner_id: this.userID,
+            header: record.bootstrap, backup: saved.key_backup });
+          assert(opened.session_key === derived.session_key, "Bản sao khóa phiên không khớp khóa vừa xác minh.");
+          record = { ...record, key_backup: saved.key_backup };
+          this.records.set(record.epoch_id, record);
+        }
+        assert(validKey(opened.session_key) && (!proposedKey || opened.session_key === proposedKey),
+          "Khóa phiên không khớp bản sao trên server.");
+        const incoming = header.recipient_id === this.userID;
+        this._pin(thread.peer.id, incoming ? header.sender_identity_key : header.recipient_identity_key,
+          incoming ? opened.sender_fingerprint : opened.recipient_fingerprint);
+        const epoch = { epoch_id: record.epoch_id, bootstrap: record.bootstrap, session_key: opened.session_key };
+        this.epochs.set(record.epoch_id, epoch);
+        this._notify();
+        return epoch;
+      })().finally(() => this.epochRequests.delete(record.epoch_id));
+      this.epochRequests.set(record.epoch_id, request);
+      return request;
+    }
+    async _epoch(thread, epochID) {
+      if (!this.records.has(epochID)) await this._list(thread);
+      const record = this.records.get(epochID);
+      assert(record?.thread_id === thread.id, "Không tìm thấy phiên khóa của tin nhắn.");
+      return this._restore(thread, record);
+    }
+    async _createEpoch(thread, previousEpochID) {
+      const epochID = crypto.randomUUID();
+      const context = { thread_id: thread.id, epoch_id: epochID, sender_id: this.userID, recipient_id: thread.peer.id };
+      const bundle = await this._request("/e2ee/bundles/" + thread.peer.id + "/claim", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ thread_id: thread.id }) });
+      assert(bundle.user_id === thread.peer.id, "Public bundle không thuộc người nhận.");
+      const created = this._crypto("createEpoch", { context, identity: this.account.identity, bundle });
+      this._pin(thread.peer.id, bundle.identity_public_key, created.recipient_fingerprint);
+      const backup = this._crypto("encryptEpochBackup", { vault_key: this.vaultKey, owner_id: this.userID,
+        header: created.header, session_key: created.session_key });
+      let record;
+      try {
+        record = await this._request("/threads/" + thread.id + "/epochs", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ epoch_id: epochID, previous_epoch_id: previousEpochID,
+            bootstrap: created.header, key_backup: backup.backup }) });
+        assert(record.epoch_id === epochID && record.bootstrap === created.header && record.key_backup,
+          "Server chưa xác nhận phiên đề xuất và bản sao khóa.");
+        this.records.set(record.epoch_id, record);
+        return this._restore(thread, record, created.session_key);
+      } catch (error) {
+        if (error.status === 409 && error.details?.epoch) {
+          // Never use the losing proposal's SK; restore the server's committed winner.
+          record = error.details.epoch;
+        } else if (error.status === undefined || error.status >= 500) {
+          const current = await this._list(thread);
+          record = current.epochs.find((epoch) => epoch.epoch_id === current.current_epoch_id);
+          if (!record || record.epoch_id === previousEpochID) throw error;
+        } else throw error;
+        this._header(thread, record);
+        this.records.set(record.epoch_id, record);
+        return this._restore(thread, record);
+      }
+    }
+    async _current(thread) {
+      if (this.currentRequests.has(thread.id)) return this.currentRequests.get(thread.id);
+      const request = (async () => {
+        const list = await this._list(thread);
+        if (list.current_epoch_id === null) return this._createEpoch(thread, null);
+        return this._restore(thread, this.records.get(list.current_epoch_id));
+      })().finally(() => this.currentRequests.delete(thread.id));
+      this.currentRequests.set(thread.id, request);
+      return request;
+    }
+    async rekey(thread) {
+      assert(this.canSend(thread), "Chưa thể tạo phiên khóa mới.");
+      const list = await this._list(thread);
+      return this._createEpoch(thread, list.current_epoch_id);
+    }
+    _pending(item) {
+      const context = item?.context;
+      assert(uuid(item?.message_id) && item.message_id === context?.message_id &&
+        uuid(context.thread_id) && uuid(context.epoch_id) && context.sender_id === this.userID &&
+        uuid(context.recipient_id) && context.recipient_id !== this.userID &&
+        typeof item.content === "string" && item.body === JSON.stringify({
+          message_id: item.message_id, content_format: "e2ee_v2", content: item.content }),
+      "Bản gửi lại trong bộ nhớ không hợp lệ.");
+      return item;
+    }
+    async _post(item) {
+      this._pending(item);
+      if (this.posts.has(item.message_id)) return this.posts.get(item.message_id);
+      const request = this._request("/threads/" + item.context.thread_id + "/messages", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: item.body }).then((message) => {
+        assert((message.id || message.message_id) === item.message_id &&
+          message.thread_id === item.context.thread_id && message.sender_id === this.userID &&
+          message.kind === "text" && message.content_format === "e2ee_v2" && message.content === item.content &&
+          Number.isSafeInteger(Number(message.seq)) && Number(message.seq) > 0,
+        "Response không khớp tin đang chờ; giữ bản gửi lại.");
+        this.outbox.remove(item.message_id);
+        this._notify();
+        return message;
+      }).finally(() => this.posts.delete(item.message_id));
+      this.posts.set(item.message_id, request);
+      return request;
+    }
+    async send(thread, plaintext) {
+      assert(this.canSend(thread), "Chat mã hóa chưa sẵn sàng.");
+      const text = String(plaintext).trim();
+      assert([...text].length > 0 && [...text].length <= 1000 && !text.includes("\0"),
+        "Tin nhắn cần 1–1000 ký tự và không chứa NUL.");
+      // Clicking Send again with an unconfirmed draft retries its exact UUID/envelope.
+      for (const pending of this.outbox.values().filter((item) => item.context?.thread_id === thread.id)) {
+        this._pending(pending);
+        const epoch = await this._epoch(thread, pending.context.epoch_id);
+        const opened = this._crypto("openMessage", { context: pending.context,
+          session_key: epoch.session_key, content: pending.content });
+        if (opened.plaintext === text) return this._post(pending);
+      }
+      const epoch = await this._current(thread);
+      const context = { thread_id: thread.id, epoch_id: epoch.epoch_id, message_id: crypto.randomUUID(),
+        sender_id: this.userID, recipient_id: thread.peer.id };
+      const sealed = this._crypto("sealMessage", { context, session_key: epoch.session_key, plaintext: text });
+      const item = { message_id: context.message_id, context, content: sealed.content,
+        body: JSON.stringify({ message_id: context.message_id, content_format: "e2ee_v2", content: sealed.content }) };
+      this.outbox.put(item);
+      this._notify();
+      return this._post(item);
+    }
+    async retry(messageID) {
+      assert(this.canRead(), "Tài khoản chưa được mở khóa.");
+      const item = this.outbox.get(messageID);
+      assert(item, "Không có tin đang chờ gửi lại.");
+      this._pending(item);
+      const thread = { id: item.context.thread_id, kind: "direct", peer: { id: item.context.recipient_id } };
+      const epoch = await this._epoch(thread, item.context.epoch_id);
+      this._crypto("openMessage", { context: item.context, session_key: epoch.session_key, content: item.content });
+      return this._post(item);
+    }
+    async receive(thread, message) {
+      try {
+        assert(this.canRead() && this._threadValid(thread), "Đang khôi phục khóa tài khoản.");
         const id = message.id || message.message_id;
-        assert(uuid(id) && message.thread_id === thread.id && message.content_format === "e2ee_v1" &&
-          message.kind === "text" && positiveID(message.seq) && typeof message.content === "string" &&
-          [this.userID, thread.peer.id].includes(message.sender_id),
-        "invalid_context", "Metadata message không khớp direct thread E2EE.");
-        const context = { thread_id: thread.id, message_id: id, sender_id: message.sender_id,
-          recipient_id: message.sender_id === this.userID ? thread.peer.id : this.userID };
-        assert(message.recipient_id === undefined || message.recipient_id === context.recipient_id,
-          "invalid_context", "Recipient của event không khớp context message.");
-        let header;
-        try { header = JSON.parse(message.content); }
-        catch (_) { throw failure("invalid_input", "Envelope message không hợp lệ."); }
-        assert(object(header) && header.recipient_id === context.recipient_id &&
-          positiveID(header.signed_prekey_id) && (header.one_time_prekey_id === null || positiveID(header.one_time_prekey_id)),
-        "invalid_context", "Header recipient/prekey không khớp context message.");
-        const cached = this.profile.message_keys[id];
-        if (cached) {
-          assert(sameContext(cached.context, context) && cached.sender_identity_key === header.sender_identity_key,
-            "invalid_context", "UUID/context/identity khác message đã cache; không ghi đè key.");
-          const incoming = context.recipient_id === this.userID;
-          assert((incoming ? cached.recipient_identity_key : cached.sender_identity_key) === this.profile.identity.public_key,
-            "invalid_context", "Identity local không khớp cached message.");
-          const peerKey = incoming ? cached.sender_identity_key : cached.recipient_identity_key;
-          this._pin(this.profile, thread.peer.id, peerKey);
-          const opened = await this._crypto("decryptWithKey", { context,
-            sender_identity_key: cached.sender_identity_key, recipient_identity_key: cached.recipient_identity_key,
-            message_key: cached.message_key, expected_content_sha256: cached.content_sha256, content: message.content });
-          if (this.profile.pending_send?.message_id === id) {
-            assert(this._matchesPending(message, this.profile.pending_send), "invalid_context", "Lịch sử khác payload pending; giữ pending.");
-            const next = clone(this.profile);
-            next.pending_send = null;
-            await this._save(next);
-          }
-          return { status: "ready", plaintext: opened.plaintext };
-        }
-        assert(context.recipient_id === this.userID, "missing_keys", "Thiếu message key của tin đã gửi; không thể tái tạo hoặc claim lại bundle.");
-        this._pin(this.profile, thread.peer.id, header.sender_identity_key);
-        assert(header.signed_prekey_id === this.profile.signed_prekey.key_id,
-          "missing_keys", "Không có signed prekey local đúng ID của message.");
-        const opkID = header.one_time_prekey_id;
-        const opk = opkID === null ? null : this.profile.one_time_prekeys[opkID];
-        assert(opkID === null || opk, "missing_keys", "Thiếu private OPK và message key; không thử chuyển sang 3DH.");
-        const opened = await this._crypto("open", { context, identity: this.profile.identity,
-          signed_prekey: this.profile.signed_prekey.key_pair, one_time_prekey: opk, content: message.content });
-        assert(base64(opened.message_key, 32) && hash(opened.content_sha256) && hash(opened.sender_fingerprint),
-          "crypto_failed", "Kết quả giải mã không hợp lệ; giữ private OPK.");
-        this._pin(this.profile, thread.peer.id, header.sender_identity_key, opened.sender_fingerprint);
-        const next = clone(this.profile);
-        next.message_keys[id] = { message_key: opened.message_key, context, content_sha256: opened.content_sha256,
-          sender_identity_key: header.sender_identity_key, recipient_identity_key: next.identity.public_key };
-        next.peer_pins[thread.peer.id] = { identity_public_key: header.sender_identity_key, fingerprint: opened.sender_fingerprint };
-        if (opkID !== null) delete next.one_time_prekeys[opkID];
-        // Cache/pin and private OPK removal are one put in one local transaction.
-        await this._save(next);
-        return { status: "ready", plaintext: opened.plaintext };
-      }, { message: true }).catch((error) => {
-        if (error?.code === "identity_changed" && this._live()) {
-          this.error = safeError(error);
-          this.status = "error";
+        assert(uuid(id) && message.thread_id === thread.id && message.kind === "text" &&
+          message.content_format === "e2ee_v2" && [this.userID, thread.peer.id].includes(message.sender_id),
+        "Tin nhắn không thuộc cuộc trò chuyện mã hóa này.");
+        const envelope = JSON.parse(message.content);
+        assert(envelope.version === 2 && uuid(envelope.epoch_id), "Envelope tin nhắn không hợp lệ.");
+        const context = { thread_id: thread.id, epoch_id: envelope.epoch_id, message_id: id,
+          sender_id: message.sender_id, recipient_id: message.sender_id === this.userID ? thread.peer.id : this.userID };
+        // message.recipient_id is the WS delivery target, not the cryptographic recipient.
+        const epoch = await this._epoch(thread, envelope.epoch_id);
+        const opened = this._crypto("openMessage", { context, session_key: epoch.session_key, content: message.content });
+        const pending = this.outbox.get(id);
+        if (pending) {
+          assert(pending.content === message.content && pending.context.thread_id === thread.id &&
+            message.sender_id === this.userID, "Lịch sử khác bản tin đang chờ; giữ bản gửi lại.");
+          this.outbox.remove(id);
           this._notify();
         }
-        return { status: "error", error: safeError(error) };
-      });
+        return { status: "ready", plaintext: opened.plaintext };
+      } catch (error) {
+        return { status: "error", error: error.message };
+      }
+    }
+    close() {
+      this.closed = true;
+      this.account = null;
+      this.vaultKey = "";
+      this.epochs.clear();
+      this.records.clear();
+      this.outbox.close();
+      return Promise.resolve();
     }
   }
 
-  globalThis.MiniHermesE2EEClient = Object.freeze({ create: (options) => new Client(options) });
+  globalThis.MiniHermesE2EEClient = Object.freeze({
+    create: (options) => new Client(options), createAccount, deriveCredentials, normalizeUsername, validKey,
+  });
 })();

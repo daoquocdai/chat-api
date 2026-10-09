@@ -2,7 +2,6 @@ package repository
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
@@ -81,14 +80,16 @@ func (r *PostgresRepository) Send(
 		}
 
 		expectedFormat := "plaintext"
-		if thread.Kind == "direct" && thread.EncryptionMode == "e2ee" {
-			expectedFormat = "e2ee_v1"
+		if thread.Kind == "direct" {
+			expectedFormat = "e2ee_v2"
 		}
 		if contentFormat != expectedFormat {
 			return model.ErrContentFormatConflict
 		}
-		if contentFormat == "e2ee_v1" {
-			if err := validateEnvelopeHeader(ctx, queries, thread.ID, senderID, content); err != nil {
+		var epochID pgtype.UUID
+		if contentFormat == "e2ee_v2" {
+			epochID, err = validateEnvelopeHeader(ctx, queries, thread.ID, senderID, content)
+			if err != nil {
 				return err
 			}
 		}
@@ -103,6 +104,7 @@ func (r *PostgresRepository) Send(
 			SenderID:          senderID,
 			Seq:               seq,
 			ContentFormat:     contentFormat,
+			EpochID:           epochID,
 			Content:           content,
 		})
 		if err != nil {
@@ -127,40 +129,39 @@ func (r *PostgresRepository) Send(
 	return result, created, nil
 }
 
-// The server checks public metadata only. Claimed OPKs have already been deleted;
-// neither their presence nor successful AEAD decryption is a prerequisite here.
-func validateEnvelopeHeader(ctx context.Context, queries *sqlc.Queries, threadID, senderID int64, content string) error {
-	envelope, err := e2ee.ParseEnvelope(content)
+// The server binds a message to its thread/epoch and peer, without decrypting.
+func validateEnvelopeHeader(ctx context.Context, queries *sqlc.Queries, threadID, senderID int64, content string) (pgtype.UUID, error) {
+	envelope, err := e2ee.ParseMessageEnvelope(content)
 	if err != nil {
-		return model.ErrInvalidEnvelope
+		return pgtype.UUID{}, model.ErrInvalidEnvelope
 	}
 	participants, err := queries.GetE2EEMessageParticipants(ctx, threadID)
 	if err != nil {
-		return err
+		return pgtype.UUID{}, err
 	}
 	if len(participants) != 2 {
-		return model.ErrInvalidEnvelopeHeader
+		return pgtype.UUID{}, model.ErrInvalidEnvelopeHeader
 	}
-	var recipientID int64
-	var senderMatches bool
+	var senderMatches, recipientMatches bool
 	for _, participant := range participants {
 		if participant.ID == senderID {
-			senderMatches = base64.StdEncoding.EncodeToString(participant.IdentityPublicKey) == envelope.SenderIdentityKey
+			senderMatches = true
 		} else if participant.ExternalID.String() == envelope.RecipientID {
-			recipientID = participant.ID
+			recipientMatches = true
 		}
 	}
-	if !senderMatches || recipientID == 0 {
-		return model.ErrInvalidEnvelopeHeader
+	if !senderMatches || !recipientMatches {
+		return pgtype.UUID{}, model.ErrInvalidEnvelopeHeader
 	}
-	prekeys, err := queries.GetE2EESignedPrekeys(ctx, recipientID)
+	epochID, err := parseUUID(envelope.EpochID, model.ErrInvalidEnvelopeHeader)
 	if err != nil {
-		return err
+		return pgtype.UUID{}, err
 	}
-	if len(prekeys) != 1 || prekeys[0].KeyID != envelope.SignedPrekeyID {
-		return model.ErrInvalidEnvelopeHeader
+	_, err = queries.GetEpochIdentity(ctx, sqlc.GetEpochIdentityParams{EpochID: epochID, ThreadID: threadID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pgtype.UUID{}, model.ErrInvalidEnvelopeHeader
 	}
-	return nil
+	return epochID, err
 }
 
 func (r *PostgresRepository) List(

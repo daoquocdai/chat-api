@@ -70,12 +70,7 @@ func (s *Service) messageRecipients(ctx context.Context, message model.Message) 
 			}
 		}
 	}
-	// The shared snapshot includes the sender; only text removes them from delivery.
-	recipients := make([]string, 0, len(members))
-	for _, id := range members {
-		if message.Kind == "system" || id != message.SenderExternalID {
-			recipients = append(recipients, id)
-		}
-	}
-	return recipients, nil
+	// Every device of both parties receives the event, including the sender's
+	// other tabs. Clients merge the HTTP response and event by message UUID.
+	return members, nil
 }

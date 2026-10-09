@@ -10,22 +10,31 @@ import (
 )
 
 type fakeRepository struct {
-	get  func(context.Context, string) (model.User, error)
-	list func(context.Context) ([]model.User, error)
+	get         func(context.Context, string) (model.User, error)
+	list        func(context.Context) ([]model.User, error)
+	create      func(context.Context, model.AccountRegistration) (model.User, error)
+	credentials func(context.Context, string) (model.Credentials, error)
+	params      func(context.Context, string) (model.AuthParams, error)
 }
 
-func (r *fakeRepository) CreateWithPassword(context.Context, string, string) (model.User, error) {
-	panic("unexpected CreateWithPassword call")
+func (r *fakeRepository) CreateAccount(ctx context.Context, registration model.AccountRegistration) (model.User, error) {
+	return r.create(ctx, registration)
 }
 
-func (r *fakeRepository) GetCredentialsByUsername(context.Context, string) (model.Credentials, error) {
-	panic("unexpected GetCredentialsByUsername call")
+func (r *fakeRepository) GetCredentialsByUsername(ctx context.Context, username string) (model.Credentials, error) {
+	return r.credentials(ctx, username)
 }
 
-type fakeTokenCreator struct{}
+func (r *fakeRepository) GetAuthParamsByUsername(ctx context.Context, username string) (model.AuthParams, error) {
+	return r.params(ctx, username)
+}
 
-func (fakeTokenCreator) Create(string) (string, error) {
-	panic("unexpected token creation")
+type fakeTokenCreator struct {
+	create func(string) (string, error)
+}
+
+func (f fakeTokenCreator) Create(userID string) (string, error) {
+	return f.create(userID)
 }
 
 func (r *fakeRepository) List(ctx context.Context) ([]model.User, error) {

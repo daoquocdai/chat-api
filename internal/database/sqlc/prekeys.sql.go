@@ -16,9 +16,7 @@ DELETE FROM prekeys AS consumed
 WHERE consumed.id = (
     SELECT candidate.id FROM prekeys AS candidate
     WHERE candidate.user_id = $1
-      AND candidate.kind = 'one_time' AND candidate.retired_at IS NULL
-    ORDER BY candidate.key_id
-    LIMIT 1
+    ORDER BY candidate.key_id LIMIT 1
 )
 RETURNING consumed.key_id, consumed.public_key
 `
@@ -35,23 +33,9 @@ func (q *Queries) ConsumeE2EEOneTimePrekey(ctx context.Context, userID int64) (C
 	return i, err
 }
 
-const countE2EEOneTimePrekeys = `-- name: CountE2EEOneTimePrekeys :one
-SELECT COUNT(*) FROM prekeys
-WHERE user_id = $1 AND kind = 'one_time' AND retired_at IS NULL
-`
-
-func (q *Queries) CountE2EEOneTimePrekeys(ctx context.Context, userID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countE2EEOneTimePrekeys, userID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
 const getE2EEClaimParticipants = `-- name: GetE2EEClaimParticipants :many
 SELECT user_id FROM participants
-WHERE thread_id = $1 AND left_seq IS NULL
-ORDER BY user_id
-FOR SHARE
+WHERE thread_id = $1 AND left_seq IS NULL ORDER BY user_id FOR SHARE
 `
 
 func (q *Queries) GetE2EEClaimParticipants(ctx context.Context, threadID int64) ([]int64, error) {
@@ -75,147 +59,50 @@ func (q *Queries) GetE2EEClaimParticipants(ctx context.Context, threadID int64) 
 }
 
 const getE2EEClaimThread = `-- name: GetE2EEClaimThread :one
-SELECT id, kind, encryption_mode
-FROM threads
-WHERE external_id = $1
-FOR SHARE
+SELECT id, kind FROM threads WHERE external_id = $1 FOR SHARE
 `
 
 type GetE2EEClaimThreadRow struct {
-	ID             int64
-	Kind           string
-	EncryptionMode string
+	ID   int64
+	Kind string
 }
 
 func (q *Queries) GetE2EEClaimThread(ctx context.Context, externalID pgtype.UUID) (GetE2EEClaimThreadRow, error) {
 	row := q.db.QueryRow(ctx, getE2EEClaimThread, externalID)
 	var i GetE2EEClaimThreadRow
-	err := row.Scan(&i.ID, &i.Kind, &i.EncryptionMode)
+	err := row.Scan(&i.ID, &i.Kind)
 	return i, err
 }
 
-const getE2EEPrekey = `-- name: GetE2EEPrekey :one
-SELECT key_id, kind, public_key
-FROM prekeys
-WHERE user_id = $1 AND key_id = $2
+const insertE2EEOneTimePrekey = `-- name: InsertE2EEOneTimePrekey :exec
+INSERT INTO prekeys (user_id, key_id, public_key)
+VALUES ($1, $2, $3)
 `
 
-type GetE2EEPrekeyParams struct {
-	UserID int64
-	KeyID  int64
-}
-
-type GetE2EEPrekeyRow struct {
-	KeyID     int64
-	Kind      string
-	PublicKey []byte
-}
-
-func (q *Queries) GetE2EEPrekey(ctx context.Context, arg GetE2EEPrekeyParams) (GetE2EEPrekeyRow, error) {
-	row := q.db.QueryRow(ctx, getE2EEPrekey, arg.UserID, arg.KeyID)
-	var i GetE2EEPrekeyRow
-	err := row.Scan(&i.KeyID, &i.Kind, &i.PublicKey)
-	return i, err
-}
-
-const getE2EESignedPrekeys = `-- name: GetE2EESignedPrekeys :many
-SELECT key_id, public_key, signature
-FROM prekeys
-WHERE user_id = $1 AND kind = 'signed' AND retired_at IS NULL
-ORDER BY key_id
-`
-
-type GetE2EESignedPrekeysRow struct {
-	KeyID     int64
-	PublicKey []byte
-	Signature []byte
-}
-
-func (q *Queries) GetE2EESignedPrekeys(ctx context.Context, userID int64) ([]GetE2EESignedPrekeysRow, error) {
-	rows, err := q.db.Query(ctx, getE2EESignedPrekeys, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []GetE2EESignedPrekeysRow
-	for rows.Next() {
-		var i GetE2EESignedPrekeysRow
-		if err := rows.Scan(&i.KeyID, &i.PublicKey, &i.Signature); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const insertE2EEPrekey = `-- name: InsertE2EEPrekey :exec
-INSERT INTO prekeys (user_id, key_id, kind, public_key, signature)
-VALUES ($1, $2, $3,
-        $4, $5)
-`
-
-type InsertE2EEPrekeyParams struct {
+type InsertE2EEOneTimePrekeyParams struct {
 	UserID    int64
 	KeyID     int64
-	Kind      string
 	PublicKey []byte
-	Signature []byte
 }
 
-func (q *Queries) InsertE2EEPrekey(ctx context.Context, arg InsertE2EEPrekeyParams) error {
-	_, err := q.db.Exec(ctx, insertE2EEPrekey,
-		arg.UserID,
-		arg.KeyID,
-		arg.Kind,
-		arg.PublicKey,
-		arg.Signature,
-	)
+func (q *Queries) InsertE2EEOneTimePrekey(ctx context.Context, arg InsertE2EEOneTimePrekeyParams) error {
+	_, err := q.db.Exec(ctx, insertE2EEOneTimePrekey, arg.UserID, arg.KeyID, arg.PublicKey)
 	return err
 }
 
 const lockE2EEUser = `-- name: LockE2EEUser :one
-SELECT id, external_id, identity_public_key, last_prekey_id
-FROM users
-WHERE id = $1
-FOR UPDATE
+SELECT id, external_id, public_bundle FROM users WHERE id = $1 FOR UPDATE
 `
 
 type LockE2EEUserRow struct {
-	ID                int64
-	ExternalID        pgtype.UUID
-	IdentityPublicKey []byte
-	LastPrekeyID      int64
+	ID           int64
+	ExternalID   pgtype.UUID
+	PublicBundle []byte
 }
 
 func (q *Queries) LockE2EEUser(ctx context.Context, id int64) (LockE2EEUserRow, error) {
 	row := q.db.QueryRow(ctx, lockE2EEUser, id)
 	var i LockE2EEUserRow
-	err := row.Scan(
-		&i.ID,
-		&i.ExternalID,
-		&i.IdentityPublicKey,
-		&i.LastPrekeyID,
-	)
+	err := row.Scan(&i.ID, &i.ExternalID, &i.PublicBundle)
 	return i, err
-}
-
-const setE2EEUserKeys = `-- name: SetE2EEUserKeys :exec
-UPDATE users
-SET identity_public_key = $1,
-    last_prekey_id = $2
-WHERE id = $3
-`
-
-type SetE2EEUserKeysParams struct {
-	IdentityPublicKey []byte
-	LastPrekeyID      int64
-	UserID            int64
-}
-
-func (q *Queries) SetE2EEUserKeys(ctx context.Context, arg SetE2EEUserKeysParams) error {
-	_, err := q.db.Exec(ctx, setE2EEUserKeys, arg.IdentityPublicKey, arg.LastPrekeyID, arg.UserID)
-	return err
 }

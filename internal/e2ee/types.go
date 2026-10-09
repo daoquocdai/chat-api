@@ -1,5 +1,6 @@
-// Package e2ee implements the Mini-Hermes v1 per-message X3DH profile.
-// It does not implement Signal sessions, Double Ratchet or client storage.
+// Package e2ee implements account recovery and X3DH key epochs for Mini-Hermes.
+// Messages use a stateless KDF; there is no Double Ratchet. The legacy v1
+// per-message functions remain for profile/vector regression tests only.
 package e2ee
 
 type KeyPair struct {

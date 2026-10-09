@@ -32,6 +32,8 @@ var (
 	ErrInvalidPlaintext = errors.New("invalid plaintext")
 	ErrDecrypt          = errors.New("decryption failed")
 	ErrCrypto           = errors.New("crypto failed")
+	ErrInvalidKDF       = errors.New("invalid password KDF profile")
+	ErrInvalidVault     = errors.New("invalid encrypted vault or backup")
 )
 
 func GenerateKeyPair() (KeyPair, error) {
@@ -71,26 +73,33 @@ func SignPrekey(identityPrivate, signedPublic [32]byte) ([64]byte, error) {
 }
 
 func VerifyBundle(bundle Bundle) error {
-	if _, err := canonicalUUID(bundle.UserID); err != nil || bundle.SignedPrekey.KeyID <= 0 {
+	if _, err := canonicalUUID(bundle.UserID); err != nil {
 		return ErrInvalidBundle
 	}
-	identity, err := publicKey(bundle.IdentityPublicKey)
+	return verifyPrekeyBundle(bundle.IdentityPublicKey, bundle.SignedPrekey, bundle.OneTimePrekey)
+}
+
+func verifyPrekeyBundle(identityPublic string, signedPrekey SignedPrekey, oneTime *PublicPrekey) error {
+	if signedPrekey.KeyID <= 0 {
+		return ErrInvalidBundle
+	}
+	identity, err := publicKey(identityPublic)
 	if err != nil {
 		return ErrInvalidBundle
 	}
-	signed, err := publicKey(bundle.SignedPrekey.PublicKey)
+	signed, err := publicKey(signedPrekey.PublicKey)
 	if err != nil {
 		return ErrInvalidBundle
 	}
-	signature, err := decode64(bundle.SignedPrekey.Signature, 64)
+	signature, err := decode64(signedPrekey.Signature, 64)
 	if err != nil {
 		return ErrInvalidBundle
 	}
 	if !verifySignature(identity, signed, [64]byte(signature)) {
 		return ErrInvalidBundle
 	}
-	if opk := bundle.OneTimePrekey; opk != nil {
-		if opk.KeyID <= 0 || opk.KeyID == bundle.SignedPrekey.KeyID {
+	if opk := oneTime; opk != nil {
+		if opk.KeyID <= 0 || opk.KeyID == signedPrekey.KeyID {
 			return ErrInvalidBundle
 		}
 		if _, err := publicKey(opk.PublicKey); err != nil {
@@ -164,6 +173,8 @@ func EncodeEnvelope(envelope Envelope) (string, error) {
 	return string(content), nil
 }
 
+// Seal retains the v1 profile for regression tests. Application messages use
+// CreateEpoch once, then SealMessage; the WASM bridge does not expose v1.
 func Seal(ctx MessageContext, identity KeyPair, recipient Bundle, plaintext []byte) (Envelope, [32]byte, error) {
 	if err := validateContext(ctx); err != nil || ctx.RecipientID != recipient.UserID {
 		return Envelope{}, [32]byte{}, ErrInvalidContext

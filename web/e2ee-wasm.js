@@ -2,7 +2,8 @@
   "use strict";
 
   const methods = Object.freeze([
-    "generateKeyPair", "signPrekey", "verifyBundle", "seal", "open", "decryptWithKey",
+    "createAccount", "deriveCredentials", "openAccount", "createEpoch", "openEpoch",
+    "encryptEpochBackup", "decryptEpochBackup", "sealMessage", "openMessage",
   ]);
   const errorMessages = Object.freeze({
     invalid_input: "Yêu cầu crypto không hợp lệ.",

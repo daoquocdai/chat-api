@@ -8,6 +8,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type E2eeEpoch struct {
+	ID          pgtype.UUID
+	ThreadID    int64
+	SenderID    int64
+	RecipientID int64
+	Bootstrap   string
+	CreatedAt   pgtype.Timestamptz
+}
+
+type E2eeEpochBackup struct {
+	EpochID   pgtype.UUID
+	UserID    int64
+	KeyBackup []byte
+}
+
 type Message struct {
 	ID            int64
 	ExternalID    pgtype.UUID
@@ -19,6 +34,7 @@ type Message struct {
 	Content       string
 	Metadata      []byte
 	CreatedAt     pgtype.Timestamptz
+	EpochID       pgtype.UUID
 }
 
 type Participant struct {
@@ -37,11 +53,8 @@ type Prekey struct {
 	ID        int64
 	UserID    int64
 	KeyID     int64
-	Kind      string
 	PublicKey []byte
-	Signature []byte
 	CreatedAt pgtype.Timestamptz
-	RetiredAt pgtype.Timestamptz
 }
 
 type Thread struct {
@@ -50,17 +63,18 @@ type Thread struct {
 	Kind           string
 	Name           pgtype.Text
 	CreatedBy      int64
-	EncryptionMode string
 	LastSeq        int64
 	CreatedAt      pgtype.Timestamptz
+	CurrentEpochID pgtype.UUID
 }
 
 type User struct {
-	ID                int64
-	ExternalID        pgtype.UUID
-	Username          string
-	CreatedAt         pgtype.Timestamptz
-	PasswordHash      string
-	IdentityPublicKey []byte
-	LastPrekeyID      int64
+	ID                 int64
+	ExternalID         pgtype.UUID
+	Username           string
+	CreatedAt          pgtype.Timestamptz
+	AuthCredentialHash string
+	Kdf                []byte
+	PublicBundle       []byte
+	AccountVault       []byte
 }

@@ -12,36 +12,20 @@ import (
 )
 
 const createDirectThread = `-- name: CreateDirectThread :one
-INSERT INTO threads (kind, created_by, encryption_mode)
-VALUES ('direct', $1, $2)
-RETURNING id, external_id, kind, encryption_mode, last_seq, created_at
+INSERT INTO threads (kind, created_by)
+VALUES ('direct', $1)
+RETURNING id, external_id
 `
 
-type CreateDirectThreadParams struct {
-	CreatedBy      int64
-	EncryptionMode string
-}
-
 type CreateDirectThreadRow struct {
-	ID             int64
-	ExternalID     pgtype.UUID
-	Kind           string
-	EncryptionMode string
-	LastSeq        int64
-	CreatedAt      pgtype.Timestamptz
+	ID         int64
+	ExternalID pgtype.UUID
 }
 
-func (q *Queries) CreateDirectThread(ctx context.Context, arg CreateDirectThreadParams) (CreateDirectThreadRow, error) {
-	row := q.db.QueryRow(ctx, createDirectThread, arg.CreatedBy, arg.EncryptionMode)
+func (q *Queries) CreateDirectThread(ctx context.Context, createdBy int64) (CreateDirectThreadRow, error) {
+	row := q.db.QueryRow(ctx, createDirectThread, createdBy)
 	var i CreateDirectThreadRow
-	err := row.Scan(
-		&i.ID,
-		&i.ExternalID,
-		&i.Kind,
-		&i.EncryptionMode,
-		&i.LastSeq,
-		&i.CreatedAt,
-	)
+	err := row.Scan(&i.ID, &i.ExternalID)
 	return i, err
 }
 
@@ -61,7 +45,7 @@ func (q *Queries) CreateParticipant(ctx context.Context, arg CreateParticipantPa
 }
 
 const getDirectThreadByParticipants = `-- name: GetDirectThreadByParticipants :one
-SELECT thread.id, thread.external_id, thread.kind, thread.encryption_mode, thread.last_seq, thread.created_at
+SELECT thread.external_id
 FROM threads AS thread
 JOIN participants AS participant
   ON participant.thread_id = thread.id
@@ -80,32 +64,16 @@ type GetDirectThreadByParticipantsParams struct {
 	UserHighID int64
 }
 
-type GetDirectThreadByParticipantsRow struct {
-	ID             int64
-	ExternalID     pgtype.UUID
-	Kind           string
-	EncryptionMode string
-	LastSeq        int64
-	CreatedAt      pgtype.Timestamptz
-}
-
-func (q *Queries) GetDirectThreadByParticipants(ctx context.Context, arg GetDirectThreadByParticipantsParams) (GetDirectThreadByParticipantsRow, error) {
+func (q *Queries) GetDirectThreadByParticipants(ctx context.Context, arg GetDirectThreadByParticipantsParams) (pgtype.UUID, error) {
 	row := q.db.QueryRow(ctx, getDirectThreadByParticipants, arg.UserLowID, arg.UserHighID)
-	var i GetDirectThreadByParticipantsRow
-	err := row.Scan(
-		&i.ID,
-		&i.ExternalID,
-		&i.Kind,
-		&i.EncryptionMode,
-		&i.LastSeq,
-		&i.CreatedAt,
-	)
-	return i, err
+	var external_id pgtype.UUID
+	err := row.Scan(&external_id)
+	return external_id, err
 }
 
 const getThreadSummaryForUser = `-- name: GetThreadSummaryForUser :one
 SELECT
-    t.id, t.external_id, t.kind, t.encryption_mode, COALESCE(t.name, '') AS name,
+    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,
@@ -149,7 +117,6 @@ type GetThreadSummaryForUserRow struct {
 	ID                          int64
 	ExternalID                  pgtype.UUID
 	Kind                        string
-	EncryptionMode              string
 	Name                        string
 	Role                        string
 	PeerExternalID              pgtype.UUID
@@ -174,7 +141,6 @@ func (q *Queries) GetThreadSummaryForUser(ctx context.Context, arg GetThreadSumm
 		&i.ID,
 		&i.ExternalID,
 		&i.Kind,
-		&i.EncryptionMode,
 		&i.Name,
 		&i.Role,
 		&i.PeerExternalID,
@@ -196,7 +162,7 @@ func (q *Queries) GetThreadSummaryForUser(ctx context.Context, arg GetThreadSumm
 
 const listThreadsForUser = `-- name: ListThreadsForUser :many
 SELECT
-    t.id, t.external_id, t.kind, t.encryption_mode, COALESCE(t.name, '') AS name,
+    t.id, t.external_id, t.kind, COALESCE(t.name, '') AS name,
     mine.role,
     COALESCE(peer.external_id, '00000000-0000-0000-0000-000000000000'::UUID) AS peer_external_id,
     COALESCE(peer.username, '') AS peer_username,
@@ -235,7 +201,6 @@ type ListThreadsForUserRow struct {
 	ID                          int64
 	ExternalID                  pgtype.UUID
 	Kind                        string
-	EncryptionMode              string
 	Name                        string
 	Role                        string
 	PeerExternalID              pgtype.UUID
@@ -266,7 +231,6 @@ func (q *Queries) ListThreadsForUser(ctx context.Context, userID int64) ([]ListT
 			&i.ID,
 			&i.ExternalID,
 			&i.Kind,
-			&i.EncryptionMode,
 			&i.Name,
 			&i.Role,
 			&i.PeerExternalID,
@@ -294,7 +258,7 @@ func (q *Queries) ListThreadsForUser(ctx context.Context, userID int64) ([]ListT
 }
 
 const lockUsersForDirectThread = `-- name: LockUsersForDirectThread :many
-SELECT id, external_id, identity_public_key
+SELECT id, external_id, public_bundle
 FROM users
 WHERE id IN ($1, $2)
 ORDER BY id
@@ -307,9 +271,9 @@ type LockUsersForDirectThreadParams struct {
 }
 
 type LockUsersForDirectThreadRow struct {
-	ID                int64
-	ExternalID        pgtype.UUID
-	IdentityPublicKey []byte
+	ID           int64
+	ExternalID   pgtype.UUID
+	PublicBundle []byte
 }
 
 func (q *Queries) LockUsersForDirectThread(ctx context.Context, arg LockUsersForDirectThreadParams) ([]LockUsersForDirectThreadRow, error) {
@@ -321,7 +285,7 @@ func (q *Queries) LockUsersForDirectThread(ctx context.Context, arg LockUsersFor
 	var items []LockUsersForDirectThreadRow
 	for rows.Next() {
 		var i LockUsersForDirectThreadRow
-		if err := rows.Scan(&i.ID, &i.ExternalID, &i.IdentityPublicKey); err != nil {
+		if err := rows.Scan(&i.ID, &i.ExternalID, &i.PublicBundle); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

@@ -6,7 +6,6 @@ import (
 	"log"
 
 	"github.com/daoquocdai/chat-api/config"
-	"github.com/daoquocdai/chat-api/internal/database/sqlc"
 	authmiddleware "github.com/daoquocdai/chat-api/internal/middleware"
 	e2eehandler "github.com/daoquocdai/chat-api/internal/module/e2ee/handler"
 	e2eerepository "github.com/daoquocdai/chat-api/internal/module/e2ee/repository"
@@ -71,19 +70,19 @@ func run() error {
 		return fmt.Errorf("connect to redis: %w", redisPingError)
 	}
 
-	queries := sqlc.New(pool)
 	jwtManager, err := token.NewJWT(cfg.Auth.JWTSecret, cfg.Auth.JWTTTL)
 	if err != nil {
 		return fmt.Errorf("create JWT manager: %w", err)
 	}
 
-	userRepository := userrepository.New(queries)
+	userRepository := userrepository.New(pool)
 	userService := userservice.New(userRepository, jwtManager)
 	userHandler := userhandler.New(userService)
-	e2eeService := e2eeservice.New(e2eerepository.New(pool), userService)
+
+	e2eeRepository := e2eerepository.New(pool)
+	e2eeService := e2eeservice.New(e2eeRepository, userService)
 	e2eeHandler := e2eehandler.New(e2eeService)
 
-	threadRepository := threadrepository.New(pool)
 	messageRepository := messagerepository.New(pool)
 	messageService := messageservice.New(
 		messageRepository,
@@ -93,8 +92,11 @@ func run() error {
 		cfg.Redis.PublishTimeout,
 	)
 	messageHandler := messagehandler.New(messageService)
+
+	threadRepository := threadrepository.New(pool)
 	threadService := threadservice.New(threadRepository, userService, messageService)
 	threadHandler := threadhandler.New(threadService)
+
 	wsTicketService := wsticket.NewService(wsticket.NewRedisRepository(redisClient), cfg.WSTicketTTL)
 	wsTicketHandler := wsticket.NewHandler(wsTicketService, cfg.WSPublicURL, cfg.Redis.PublishTimeout)
 

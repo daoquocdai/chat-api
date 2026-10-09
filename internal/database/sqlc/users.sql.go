@@ -11,32 +11,86 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createUserWithPassword = `-- name: CreateUserWithPassword :one
-INSERT INTO users (username, password_hash)
-VALUES ($1, $2)
+const createUserAccount = `-- name: CreateUserAccount :one
+INSERT INTO users (username, auth_credential_hash, kdf, public_bundle, account_vault)
+VALUES ($1, $2, $3,
+        $4, $5)
 RETURNING id, external_id, username, created_at
 `
 
-type CreateUserWithPasswordParams struct {
-	Username     string
-	PasswordHash string
+type CreateUserAccountParams struct {
+	Username           string
+	AuthCredentialHash string
+	Kdf                []byte
+	PublicBundle       []byte
+	AccountVault       []byte
 }
 
-type CreateUserWithPasswordRow struct {
+type CreateUserAccountRow struct {
 	ID         int64
 	ExternalID pgtype.UUID
 	Username   string
 	CreatedAt  pgtype.Timestamptz
 }
 
-func (q *Queries) CreateUserWithPassword(ctx context.Context, arg CreateUserWithPasswordParams) (CreateUserWithPasswordRow, error) {
-	row := q.db.QueryRow(ctx, createUserWithPassword, arg.Username, arg.PasswordHash)
-	var i CreateUserWithPasswordRow
+func (q *Queries) CreateUserAccount(ctx context.Context, arg CreateUserAccountParams) (CreateUserAccountRow, error) {
+	row := q.db.QueryRow(ctx, createUserAccount,
+		arg.Username,
+		arg.AuthCredentialHash,
+		arg.Kdf,
+		arg.PublicBundle,
+		arg.AccountVault,
+	)
+	var i CreateUserAccountRow
 	err := row.Scan(
 		&i.ID,
 		&i.ExternalID,
 		&i.Username,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getAuthParamsByUsername = `-- name: GetAuthParamsByUsername :one
+SELECT username, kdf FROM users WHERE username = $1
+`
+
+type GetAuthParamsByUsernameRow struct {
+	Username string
+	Kdf      []byte
+}
+
+func (q *Queries) GetAuthParamsByUsername(ctx context.Context, username string) (GetAuthParamsByUsernameRow, error) {
+	row := q.db.QueryRow(ctx, getAuthParamsByUsername, username)
+	var i GetAuthParamsByUsernameRow
+	err := row.Scan(&i.Username, &i.Kdf)
+	return i, err
+}
+
+const getUserAccount = `-- name: GetUserAccount :one
+SELECT id, external_id, username, kdf, public_bundle, account_vault
+FROM users WHERE id = $1
+`
+
+type GetUserAccountRow struct {
+	ID           int64
+	ExternalID   pgtype.UUID
+	Username     string
+	Kdf          []byte
+	PublicBundle []byte
+	AccountVault []byte
+}
+
+func (q *Queries) GetUserAccount(ctx context.Context, id int64) (GetUserAccountRow, error) {
+	row := q.db.QueryRow(ctx, getUserAccount, id)
+	var i GetUserAccountRow
+	err := row.Scan(
+		&i.ID,
+		&i.ExternalID,
+		&i.Username,
+		&i.Kdf,
+		&i.PublicBundle,
+		&i.AccountVault,
 	)
 	return i, err
 }
@@ -67,17 +121,17 @@ func (q *Queries) GetUserByExternalID(ctx context.Context, externalID pgtype.UUI
 }
 
 const getUserCredentialsByUsername = `-- name: GetUserCredentialsByUsername :one
-SELECT id, external_id, username, password_hash, created_at
+SELECT id, external_id, username, auth_credential_hash, created_at
 FROM users
 WHERE username = $1
 `
 
 type GetUserCredentialsByUsernameRow struct {
-	ID           int64
-	ExternalID   pgtype.UUID
-	Username     string
-	PasswordHash string
-	CreatedAt    pgtype.Timestamptz
+	ID                 int64
+	ExternalID         pgtype.UUID
+	Username           string
+	AuthCredentialHash string
+	CreatedAt          pgtype.Timestamptz
 }
 
 func (q *Queries) GetUserCredentialsByUsername(ctx context.Context, username string) (GetUserCredentialsByUsernameRow, error) {
@@ -87,7 +141,7 @@ func (q *Queries) GetUserCredentialsByUsername(ctx context.Context, username str
 		&i.ID,
 		&i.ExternalID,
 		&i.Username,
-		&i.PasswordHash,
+		&i.AuthCredentialHash,
 		&i.CreatedAt,
 	)
 	return i, err

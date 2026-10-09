@@ -13,12 +13,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"strings"
 	"syscall/js"
 	"unicode/utf8"
 
 	"github.com/daoquocdai/chat-api/internal/e2ee"
-	"github.com/google/uuid"
 )
 
 var errInput = errors.New("invalid input")
@@ -46,8 +44,11 @@ func main() {
 	bridge := js.Global().Get("Object").New()
 	methods := map[string]func([]byte) (any, error){
 		"generateKeyPair": generateKeyPair, "signPrekey": signPrekey,
-		"verifyBundle": verifyBundle, "seal": seal,
-		"open": open, "decryptWithKey": decryptWithKey,
+		"verifyBundle":  verifyBundle,
+		"createAccount": createAccount, "deriveCredentials": deriveCredentials,
+		"openAccount": openAccount, "createEpoch": createEpoch, "openEpoch": openEpoch,
+		"encryptEpochBackup": encryptEpochBackup, "decryptEpochBackup": decryptEpochBackup,
+		"sealMessage": sealMessage, "openMessage": openMessage,
 	}
 	for name, method := range methods {
 		callback := js.FuncOf(func(_ js.Value, args []js.Value) (output any) {
@@ -78,7 +79,8 @@ func response(data any, err error) string {
 	if err != nil {
 		code, message := "crypto_failed", "Không thể xử lý crypto."
 		switch {
-		case errors.Is(err, errInput), errors.Is(err, e2ee.ErrInvalidEnvelope), errors.Is(err, e2ee.ErrInvalidPlaintext):
+		case errors.Is(err, errInput), errors.Is(err, e2ee.ErrInvalidEnvelope), errors.Is(err, e2ee.ErrInvalidPlaintext),
+			errors.Is(err, e2ee.ErrInvalidKDF), errors.Is(err, e2ee.ErrInvalidVault):
 			code, message = "invalid_input", "Yêu cầu crypto không hợp lệ."
 		case errors.Is(err, e2ee.ErrInvalidKey):
 			code, message = "invalid_key", "Khóa crypto không hợp lệ hoặc bị thiếu."
@@ -182,24 +184,6 @@ func keyPair(raw json.RawMessage) (e2ee.KeyPair, error) {
 	return e2ee.KeyPair{Private: private, Public: public}, nil
 }
 
-func context(raw json.RawMessage) (e2ee.MessageContext, error) {
-	keys := []string{"thread_id", "message_id", "sender_id", "recipient_id"}
-	fields, err := object(raw, keys, nil)
-	if err != nil {
-		return e2ee.MessageContext{}, err
-	}
-	values := make([]string, len(keys))
-	for i, key := range keys {
-		value, err := text(fields[key])
-		id, parseErr := uuid.Parse(value)
-		if err != nil || parseErr != nil || id == uuid.Nil || id.String() != value {
-			return e2ee.MessageContext{}, e2ee.ErrInvalidContext
-		}
-		values[i] = value
-	}
-	return e2ee.MessageContext{ThreadID: values[0], MessageID: values[1], SenderID: values[2], RecipientID: values[3]}, nil
-}
-
 func bundle(raw json.RawMessage) (e2ee.Bundle, error) {
 	fields, err := object(raw, []string{"user_id", "identity_public_key", "signed_prekey", "one_time_prekey"}, nil)
 	if err != nil {
@@ -292,122 +276,4 @@ func verifyBundle(raw []byte) (any, error) {
 		return nil, err
 	}
 	return map[string]any{"valid": true, "fingerprint": fingerprint(value.IdentityPublicKey)}, nil
-}
-
-func seal(raw []byte) (any, error) {
-	fields, err := object(raw, []string{"context", "identity", "bundle", "plaintext"}, nil)
-	if err != nil {
-		return nil, err
-	}
-	ctx, err := context(fields["context"])
-	if err != nil {
-		return nil, err
-	}
-	identity, err := keyPair(fields["identity"])
-	if err != nil {
-		return nil, err
-	}
-	recipient, err := bundle(fields["bundle"])
-	if err != nil {
-		return nil, err
-	}
-	plaintext, err := text(fields["plaintext"])
-	if err != nil {
-		return nil, err
-	}
-	envelope, key, err := e2ee.Seal(ctx, identity, recipient, []byte(plaintext))
-	if err != nil {
-		return nil, err
-	}
-	content, err := e2ee.EncodeEnvelope(envelope)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"content": content, "message_key": base64.StdEncoding.EncodeToString(key[:]), "content_sha256": digest([]byte(content))}, nil
-}
-
-func open(raw []byte) (any, error) {
-	fields, err := object(raw, []string{"context", "identity", "signed_prekey", "one_time_prekey", "content"}, nil)
-	if err != nil {
-		return nil, err
-	}
-	ctx, err := context(fields["context"])
-	if err != nil {
-		return nil, err
-	}
-	identity, err := keyPair(fields["identity"])
-	if err != nil {
-		return nil, err
-	}
-	signed, err := keyPair(fields["signed_prekey"])
-	if err != nil {
-		return nil, err
-	}
-	var oneTime *e2ee.KeyPair
-	if !isNull(fields["one_time_prekey"]) {
-		pair, err := keyPair(fields["one_time_prekey"])
-		if err != nil {
-			return nil, err
-		}
-		oneTime = &pair
-	}
-	content, err := text(fields["content"])
-	if err != nil {
-		return nil, err
-	}
-	envelope, err := e2ee.ParseEnvelope(content)
-	if err != nil {
-		return nil, err
-	}
-	plaintext, key, err := e2ee.Open(ctx, identity, signed, oneTime, envelope)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"plaintext": string(plaintext), "message_key": base64.StdEncoding.EncodeToString(key[:]), "content_sha256": digest([]byte(content)), "sender_fingerprint": fingerprint(envelope.SenderIdentityKey)}, nil
-}
-
-func decryptWithKey(raw []byte) (any, error) {
-	fields, err := object(raw, []string{"context", "sender_identity_key", "recipient_identity_key", "message_key", "expected_content_sha256", "content"}, nil)
-	if err != nil {
-		return nil, err
-	}
-	ctx, err := context(fields["context"])
-	if err != nil {
-		return nil, err
-	}
-	sender, err := key32(fields["sender_identity_key"])
-	if err != nil {
-		return nil, err
-	}
-	recipient, err := key32(fields["recipient_identity_key"])
-	if err != nil {
-		return nil, err
-	}
-	key, err := key32(fields["message_key"])
-	if err != nil {
-		return nil, err
-	}
-	expected, err := text(fields["expected_content_sha256"])
-	if err != nil {
-		return nil, err
-	}
-	if decoded, err := hex.DecodeString(expected); err != nil || len(decoded) != 32 || strings.ToLower(expected) != expected {
-		return nil, errInput
-	}
-	content, err := text(fields["content"])
-	if err != nil {
-		return nil, err
-	}
-	envelope, err := e2ee.ParseEnvelope(content)
-	if err != nil {
-		return nil, err
-	}
-	if digest([]byte(content)) != expected {
-		return nil, e2ee.ErrInvalidContext
-	}
-	plaintext, err := e2ee.DecryptWithKey(ctx, sender, recipient, key, envelope)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"plaintext": string(plaintext)}, nil
 }

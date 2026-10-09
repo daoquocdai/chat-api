@@ -86,8 +86,8 @@ func (s *Service) Send(
 			length == 0 || length > maximumContentCharacters || strings.ContainsRune(content, '\x00') {
 			return model.Message{}, false, model.ErrInvalidContent
 		}
-	case "e2ee_v1":
-		if _, err := e2ee.ParseEnvelope(content); err != nil {
+	case "e2ee_v2":
+		if _, err := e2ee.ParseMessageEnvelope(content); err != nil {
 			return model.Message{}, false, model.ErrInvalidEnvelope
 		}
 	default:

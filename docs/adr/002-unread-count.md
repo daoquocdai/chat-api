@@ -8,7 +8,7 @@ Client có thể chỉ tải một phần lịch sử; unread phải đúng khi 
 
 - PostgreSQL COUNT tin text/system do người khác tạo, sau `last_read_seq` trong membership đang hoạt động.
 - PUT read giữ khóa thread, dùng `GREATEST` và yêu cầu `joined_seq - 1 <= N <= threads.last_seq`.
-- Tham gia lại tạo marker mới. Client chỉ tăng tới seq đã render sau initial sync, khi thread mở, tab hiển thị và ở cuối chat; không vượt `syncedSeq`. E2EE còn cần owner và giải mã/local commit thành công.
+- Tham gia lại tạo marker mới. Client chỉ tăng tới seq đã render sau initial sync, khi thread mở, tab hiển thị và ở cuối chat; không vượt `syncedSeq`. Với E2EE, tài khoản phải được mở khóa và tin đã giải mã thành công. Mỗi tab có thể đọc độc lập; marker trên server chỉ tăng.
 
 ## Đánh đổi
 

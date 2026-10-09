@@ -9,6 +9,7 @@ import (
 type UserHandler interface {
 	Register(c *gin.Context)
 	Login(c *gin.Context)
+	AuthParams(c *gin.Context)
 	List(c *gin.Context)
 }
 
@@ -33,8 +34,11 @@ type WSTicketHandler interface {
 }
 
 type E2EEHandler interface {
-	Upload(c *gin.Context)
+	Account(c *gin.Context)
 	Claim(c *gin.Context)
+	Epochs(c *gin.Context)
+	CreateEpoch(c *gin.Context)
+	Backup(c *gin.Context)
 }
 
 func New(
@@ -53,7 +57,6 @@ func New(
 
 	router.HandleMethodNotAllowed = true
 	router.NoMethod(noMethodHandler)
-	router.Use(webAssetCachePolicy)
 
 	router.GET("/health", healthHandler)
 	router.GET("/", indexHandler)
@@ -67,13 +70,17 @@ func New(
 	router.StaticFile("/wasm_exec.js", "web/wasm_exec.js")
 	router.POST("/auth/register", userHandler.Register)
 	router.POST("/auth/login", userHandler.Login)
+	router.GET("/auth/params", userHandler.AuthParams)
 
 	authenticated := router.Group("")
 	authenticated.Use(authenticate)
 	authenticated.GET("/users", userHandler.List)
 	authenticated.POST("/auth/ws-ticket", wsTicketHandler.Issue)
-	authenticated.POST("/e2ee/prekeys", e2eeHandler.Upload)
+	authenticated.GET("/e2ee/account", e2eeHandler.Account)
 	authenticated.POST("/e2ee/bundles/:user_id/claim", e2eeHandler.Claim)
+	authenticated.GET("/threads/:id/epochs", e2eeHandler.Epochs)
+	authenticated.POST("/threads/:id/epochs", e2eeHandler.CreateEpoch)
+	authenticated.PUT("/threads/:id/epochs/:epoch_id/key", e2eeHandler.Backup)
 	authenticated.POST("/threads/direct", threadHandler.CreateOrGetDirect)
 	authenticated.POST("/threads/group", threadHandler.CreateGroup)
 	authenticated.GET("/threads/:id/members", threadHandler.Members)
@@ -86,14 +93,6 @@ func New(
 	authenticated.GET("/threads/:id/messages", messageHandler.List)
 
 	return router
-}
-
-func webAssetCachePolicy(c *gin.Context) {
-	switch c.Request.URL.Path {
-	case "/", "/app.js", "/realtime-core.js", "/e2ee-wasm.js", "/e2ee-state.js", "/e2ee.js", "/style.css", "/e2ee.wasm", "/wasm_exec.js":
-		c.Header("Cache-Control", "no-store")
-	}
-	c.Next()
 }
 
 func indexHandler(c *gin.Context) {

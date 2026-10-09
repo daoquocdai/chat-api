@@ -1,5 +1,7 @@
 # ADR 004: X3DH cho mỗi tin, chưa dùng Double Ratchet
 
+**Trạng thái: tài liệu lịch sử, đã được thay thế bởi [ADR 005](005-recoverable-e2ee-sessions.md) ngày 09/10/2026.** Runtime hiện tại dùng X3DH theo epoch, backup mã hóa trên server và hỗ trợ nhiều thiết bị. Nội dung dưới đây ghi lại quyết định cũ; xem [luồng hiện tại](../e2ee-sequence.md).
+
 Ngày: 04/10/2026. Phạm vi: direct E2EE trên web.
 
 ## Bối cảnh

@@ -2,17 +2,23 @@ package service
 
 import (
 	"context"
-	"encoding/base64"
+	"errors"
 
 	"github.com/daoquocdai/chat-api/internal/e2ee"
+	"github.com/daoquocdai/chat-api/internal/module/e2ee/dto"
 	"github.com/daoquocdai/chat-api/internal/module/e2ee/model"
 	usermodel "github.com/daoquocdai/chat-api/internal/module/user/model"
 	"github.com/google/uuid"
 )
 
+const maximumBackupCiphertextBytes = 1024
+
 type Repository interface {
-	Upload(ctx context.Context, userID int64, request e2ee.UploadRequest) (e2ee.UploadResult, error)
+	Account(ctx context.Context, userID int64) (dto.AccountResponse, error)
 	Claim(ctx context.Context, actorID, recipientID int64, threadExternalID string) (e2ee.Bundle, error)
+	Epochs(ctx context.Context, userID int64, threadExternalID string) (dto.EpochPageResponse, error)
+	CreateEpoch(ctx context.Context, actorID int64, actorExternalID, threadExternalID string, request dto.CreateEpochRequest) (dto.EpochResponse, bool, error)
+	Backup(ctx context.Context, userID int64, threadExternalID, epochExternalID string, backup e2ee.EncryptedRecord) (e2ee.EncryptedRecord, error)
 }
 
 type UserFinder interface {
@@ -28,84 +34,122 @@ func New(repository Repository, users UserFinder) *Service {
 	return &Service{repository: repository, users: users}
 }
 
-func (s *Service) Upload(ctx context.Context, actorExternalID string, request e2ee.UploadRequest) (e2ee.UploadResult, error) {
-	if !canonicalUUID(actorExternalID) {
-		return e2ee.UploadResult{}, usermodel.ErrInvalidUserID
+func (s *Service) actor(ctx context.Context, externalID string) (usermodel.User, error) {
+	if !canonicalUUID(externalID) {
+		return usermodel.User{}, usermodel.ErrInvalidUserID
 	}
-	if err := validateUpload(actorExternalID, request); err != nil {
-		return e2ee.UploadResult{}, err
+	user, err := s.users.GetByExternalID(ctx, externalID)
+	if errors.Is(err, usermodel.ErrUserNotFound) {
+		return usermodel.User{}, usermodel.ErrInvalidUserID
 	}
-	actor, err := s.users.GetByExternalID(ctx, actorExternalID)
-	if err != nil {
-		return e2ee.UploadResult{}, err
-	}
-	result, err := s.repository.Upload(ctx, actor.ID, request)
-	if err != nil {
-		return e2ee.UploadResult{}, err
-	}
-	return result, nil
+	return user, err
 }
 
-func (s *Service) Claim(ctx context.Context, actorExternalID, recipientExternalID string, request e2ee.ClaimRequest) (e2ee.Bundle, error) {
+func (s *Service) Account(ctx context.Context, actorExternalID string) (dto.AccountResponse, error) {
+	actor, err := s.actor(ctx, actorExternalID)
+	if err != nil {
+		return dto.AccountResponse{}, err
+	}
+	account, err := s.repository.Account(ctx, actor.ID)
+	if err != nil {
+		return dto.AccountResponse{}, err
+	}
+	return account, nil
+}
+
+func (s *Service) Claim(ctx context.Context, actorExternalID, recipientExternalID string, request dto.ClaimRequest) (dto.Bundle, error) {
 	if !canonicalUUID(actorExternalID) {
-		return e2ee.Bundle{}, usermodel.ErrInvalidUserID
+		return dto.Bundle{}, usermodel.ErrInvalidUserID
 	}
 	if !canonicalUUID(recipientExternalID) || !canonicalUUID(request.ThreadID) {
-		return e2ee.Bundle{}, model.ErrInvalidClaim
+		return dto.Bundle{}, model.ErrInvalidClaim
 	}
 	if actorExternalID == recipientExternalID {
-		return e2ee.Bundle{}, model.ErrForbidden
+		return dto.Bundle{}, model.ErrForbidden
 	}
-	actor, err := s.users.GetByExternalID(ctx, actorExternalID)
+	actor, err := s.actor(ctx, actorExternalID)
 	if err != nil {
-		return e2ee.Bundle{}, err
+		return dto.Bundle{}, err
 	}
 	recipient, err := s.users.GetByExternalID(ctx, recipientExternalID)
 	if err != nil {
-		return e2ee.Bundle{}, err
+		return dto.Bundle{}, err
 	}
 	if actor.ID == recipient.ID {
-		return e2ee.Bundle{}, model.ErrForbidden
+		return dto.Bundle{}, model.ErrForbidden
 	}
 	bundle, err := s.repository.Claim(ctx, actor.ID, recipient.ID, request.ThreadID)
 	if err != nil {
-		return e2ee.Bundle{}, err
+		return dto.Bundle{}, err
 	}
 	return bundle, nil
+}
+
+func (s *Service) Epochs(ctx context.Context, actorExternalID, threadExternalID string) (dto.EpochPageResponse, error) {
+	if !canonicalUUID(actorExternalID) {
+		return dto.EpochPageResponse{}, usermodel.ErrInvalidUserID
+	}
+	if !canonicalUUID(threadExternalID) {
+		return dto.EpochPageResponse{}, model.ErrInvalidEpoch
+	}
+	actor, err := s.actor(ctx, actorExternalID)
+	if err != nil {
+		return dto.EpochPageResponse{}, err
+	}
+	page, err := s.repository.Epochs(ctx, actor.ID, threadExternalID)
+	if err != nil {
+		return dto.EpochPageResponse{}, err
+	}
+	if page.Epochs == nil {
+		page.Epochs = []dto.EpochResponse{}
+	}
+	return page, nil
+}
+
+func (s *Service) CreateEpoch(ctx context.Context, actorExternalID, threadExternalID string, request dto.CreateEpochRequest) (dto.EpochResponse, bool, error) {
+	if !canonicalUUID(actorExternalID) {
+		return dto.EpochResponse{}, false, usermodel.ErrInvalidUserID
+	}
+	if !canonicalUUID(threadExternalID) || !canonicalUUID(request.EpochID) ||
+		(request.PreviousEpochID != nil && (!canonicalUUID(*request.PreviousEpochID) || *request.PreviousEpochID == request.EpochID)) {
+		return dto.EpochResponse{}, false, model.ErrInvalidEpoch
+	}
+	header, err := e2ee.ParseEpochHeader(request.Bootstrap)
+	if err != nil || header.ThreadID != threadExternalID || header.EpochID != request.EpochID ||
+		header.SenderID != actorExternalID || e2ee.ValidateEncryptedRecord(request.KeyBackup, maximumBackupCiphertextBytes) != nil {
+		return dto.EpochResponse{}, false, model.ErrInvalidEpoch
+	}
+	actor, err := s.actor(ctx, actorExternalID)
+	if err != nil {
+		return dto.EpochResponse{}, false, err
+	}
+	epoch, created, err := s.repository.CreateEpoch(ctx, actor.ID, actorExternalID, threadExternalID, request)
+	if err != nil {
+		return dto.EpochResponse{}, false, err
+	}
+	return epoch, created, nil
+}
+
+func (s *Service) Backup(ctx context.Context, actorExternalID, threadExternalID, epochExternalID string, backup e2ee.EncryptedRecord) (e2ee.EncryptedRecord, error) {
+	if !canonicalUUID(actorExternalID) {
+		return e2ee.EncryptedRecord{}, usermodel.ErrInvalidUserID
+	}
+	if !canonicalUUID(threadExternalID) || !canonicalUUID(epochExternalID) ||
+		e2ee.ValidateEncryptedRecord(backup, maximumBackupCiphertextBytes) != nil {
+		return e2ee.EncryptedRecord{}, model.ErrInvalidEpoch
+	}
+	actor, err := s.actor(ctx, actorExternalID)
+	if err != nil {
+		return e2ee.EncryptedRecord{}, err
+	}
+	stored, err := s.repository.Backup(ctx, actor.ID, threadExternalID, epochExternalID, backup)
+	if err != nil {
+		return e2ee.EncryptedRecord{}, err
+	}
+	return stored, nil
 }
 
 func canonicalUUID(value string) bool {
 	id, err := uuid.Parse(value)
 	return err == nil && id != uuid.Nil && id.String() == value
-}
-
-func validateUpload(userID string, request e2ee.UploadRequest) error {
-	if len(request.OneTimePrekeys) > 100 {
-		return model.ErrInvalidPrekeys
-	}
-	// Verify the fixed SPK signature once, using the shared crypto profile.
-	if err := e2ee.VerifyBundle(e2ee.Bundle{
-		UserID: userID, IdentityPublicKey: request.IdentityPublicKey,
-		SignedPrekey: request.SignedPrekey,
-	}); err != nil {
-		return model.ErrInvalidPrekeys
-	}
-	ids := map[int64]bool{request.SignedPrekey.KeyID: true}
-	for _, opk := range request.OneTimePrekeys {
-		if opk.KeyID <= 0 || ids[opk.KeyID] {
-			return model.ErrInvalidPrekeys
-		}
-		ids[opk.KeyID] = true
-		if len(opk.PublicKey) != base64.StdEncoding.EncodedLen(32) {
-			return model.ErrInvalidPrekeys
-		}
-		public, err := base64.StdEncoding.Strict().DecodeString(opk.PublicKey)
-		if err != nil || len(public) != 32 || base64.StdEncoding.EncodeToString(public) != opk.PublicKey {
-			return model.ErrInvalidPrekeys
-		}
-		if err := e2ee.ValidatePublicKey([32]byte(public)); err != nil {
-			return model.ErrInvalidPrekeys
-		}
-	}
-	return nil
 }

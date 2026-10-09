@@ -47,7 +47,6 @@ const e2eeFingerprint = document.querySelector("#e2ee-fingerprint");
 const e2eePending = document.querySelector("#e2ee-pending");
 const e2eePendingInfo = document.querySelector("#e2ee-pending-info");
 const e2eePendingList = document.querySelector("#e2ee-pending-list");
-const e2eeRekey = document.querySelector("#e2ee-rekey");
 const peerFingerprint = document.querySelector("#peer-fingerprint");
 const e2eeDecryptRetry = document.querySelector("#e2ee-decrypt-retry");
 const e2eeLabels = {
@@ -170,8 +169,6 @@ function renderThreadHeading() {
     ? `Peer UUID ${thread.peer?.id || "chưa rõ"}\nFingerprint IK: ${pin?.fingerprint || "chưa biết — đối chiếu qua kênh tin cậy khi đã có pin"}` : "";
   e2eeDecryptRetry.hidden = !cache || ![...cache.decryptedViews.values()].some((view) => view.status === "error");
   e2eeDecryptRetry.disabled = !state.e2ee?.canRead();
-  e2eeRekey.hidden = thread?.kind !== "direct";
-  e2eeRekey.disabled = !canSendE2EE(cache) || Boolean(cache?.e2eeSending);
   updateSendButton();
   if (group && !membersPanel.hidden) renderMembers(cache);
 }
@@ -286,7 +283,6 @@ function clearSession() {
   e2eePending.hidden = true;
   e2eePendingInfo.textContent = "";
   e2eePendingList.replaceChildren();
-  e2eeRekey.hidden = true;
 }
 function showChatView() {
   authView.hidden = true;
@@ -1135,18 +1131,6 @@ async function retryE2EE(client, messageID) {
   if (state.currentCache === accepted.cache) renderMessages("new");
 }
 
-e2eeRekey.addEventListener("click", () => {
-  const cache = state.currentCache;
-  if (!canSendE2EE(cache) || cache.e2eeSending) return;
-  cache.e2eeSending = true;
-  renderThreadHeading();
-  void runE2EEAction(async (client) => {
-    try {
-      await client.rekey(structuredClone(cache.summary));
-      if (state.currentCache === cache) showNotice("Phiên khóa mới sẵn sàng. Các tin cũ vẫn đọc được.");
-    } finally { cache.e2eeSending = false; }
-  });
-});
 e2eeDecryptRetry.addEventListener("click", () => {
   if (state.currentCache) processE2EEMessages(state.currentCache, true);
 });

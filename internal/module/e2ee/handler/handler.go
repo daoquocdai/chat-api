@@ -82,7 +82,7 @@ func (h *Handler) CreateEpoch(c *gin.Context) {
 		return
 	}
 	var request dto.CreateEpochRequest
-	if !readJSON(c, &request, []string{"epoch_id", "bootstrap", "key_backup"}, []string{"previous_epoch_id"}) {
+	if !readJSON(c, &request, []string{"epoch_id", "bootstrap", "key_backup"}, nil) {
 		return
 	}
 	epoch, created, err := h.service.CreateEpoch(c.Request.Context(), actor, c.Param("id"), request)

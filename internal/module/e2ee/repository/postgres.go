@@ -142,13 +142,6 @@ func (r *PostgresRepository) CreateEpoch(ctx context.Context, actorID int64, act
 	if err = e2ee.ValidateEncryptedRecord(request.KeyBackup, 1024); err != nil {
 		return dto.EpochResponse{}, false, model.ErrInvalidEpoch
 	}
-	var previous pgtype.UUID
-	if request.PreviousEpochID != nil {
-		previous, err = parseUUID(*request.PreviousEpochID)
-		if err != nil {
-			return dto.EpochResponse{}, false, err
-		}
-	}
 	var result dto.EpochResponse
 	created := false
 	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
@@ -175,10 +168,9 @@ func (r *PostgresRepository) CreateEpoch(ctx context.Context, actorID int64, act
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		if thread.CurrentEpochID != previous {
-			if !thread.CurrentEpochID.Valid {
-				return model.ErrEpochConflict
-			}
+		// A direct thread initializes its session once. Competing proposals
+		// recover the committed session instead of replacing its key.
+		if thread.CurrentEpochID.Valid {
 			lookup.EpochID = thread.CurrentEpochID
 			winner, err := q.GetEpochForUser(ctx, lookup)
 			if err != nil {

@@ -188,7 +188,7 @@
       assert(record?.thread_id === thread.id, "Không tìm thấy phiên khóa của tin nhắn.");
       return this._restore(thread, record);
     }
-    async _createEpoch(thread, previousEpochID) {
+    async _createEpoch(thread) {
       const epochID = crypto.randomUUID();
       const context = { thread_id: thread.id, epoch_id: epochID, sender_id: this.userID, recipient_id: thread.peer.id };
       const bundle = await this._request("/e2ee/bundles/" + thread.peer.id + "/claim", {
@@ -202,7 +202,7 @@
       try {
         record = await this._request("/threads/" + thread.id + "/epochs", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ epoch_id: epochID, previous_epoch_id: previousEpochID,
+          body: JSON.stringify({ epoch_id: epochID,
             bootstrap: created.header, key_backup: backup.backup }) });
         assert(record.epoch_id === epochID && record.bootstrap === created.header && record.key_backup,
           "Server chưa xác nhận phiên đề xuất và bản sao khóa.");
@@ -215,7 +215,7 @@
         } else if (error.status === undefined || error.status >= 500) {
           const current = await this._list(thread);
           record = current.epochs.find((epoch) => epoch.epoch_id === current.current_epoch_id);
-          if (!record || record.epoch_id === previousEpochID) throw error;
+          if (!record) throw error;
         } else throw error;
         this._header(thread, record);
         this.records.set(record.epoch_id, record);
@@ -226,16 +226,11 @@
       if (this.currentRequests.has(thread.id)) return this.currentRequests.get(thread.id);
       const request = (async () => {
         const list = await this._list(thread);
-        if (list.current_epoch_id === null) return this._createEpoch(thread, null);
+        if (list.current_epoch_id === null) return this._createEpoch(thread);
         return this._restore(thread, this.records.get(list.current_epoch_id));
       })().finally(() => this.currentRequests.delete(thread.id));
       this.currentRequests.set(thread.id, request);
       return request;
-    }
-    async rekey(thread) {
-      assert(this.canSend(thread), "Chưa thể tạo phiên khóa mới.");
-      const list = await this._list(thread);
-      return this._createEpoch(thread, list.current_epoch_id);
     }
     _pending(item) {
       const context = item?.context;

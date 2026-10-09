@@ -2,7 +2,7 @@
 
 Ứng dụng chat dùng Go, Gin, PostgreSQL, sqlc và Redis. Direct luôn E2EE; nhóm dùng plaintext. Go/WASM mã hóa tại client, HTTP API lưu tin và gateway riêng phát WebSocket.
 
-Một mật khẩu tài khoản đủ để khôi phục khóa và lịch sử trên thiết bị hoặc phiên ẩn danh mới. Nhiều tab/thiết bị dùng cùng tài khoản đồng thời. X3DH chạy khi tạo phiên khóa (epoch) của thread; mỗi tin chỉ dẫn xuất khóa bằng HKDF, không dùng Double Ratchet.
+Một mật khẩu tài khoản đủ để khôi phục khóa và lịch sử trên thiết bị hoặc phiên ẩn danh mới. Nhiều tab/thiết bị dùng cùng tài khoản đồng thời. Mỗi direct khởi tạo X3DH một lần rồi dùng lại cùng phiên khóa; mỗi tin chỉ dẫn xuất khóa bằng HKDF, không dùng Double Ratchet.
 
 ## Chạy local
 
@@ -56,9 +56,9 @@ Auth API không nhận mật khẩu gốc. Browser dẫn xuất `auth_credential
 | `POST` | `/threads/:id/members` | Admin thêm `user_id` |
 | `DELETE` | `/threads/:id/members/:user_id` | Admin xóa người khác |
 | `POST` | `/threads/:id/leave` | Rời nhóm |
-| `POST` | `/e2ee/bundles/:user_id/claim` | Bundle peer khi tạo epoch; body `thread_id` |
+| `POST` | `/e2ee/bundles/:user_id/claim` | Bundle peer khi khởi tạo phiên direct; body `thread_id` |
 | `GET` | `/threads/:id/epochs` | Bootstrap, backup của actor và `current_epoch_id` |
-| `POST` | `/threads/:id/epochs` | `epoch_id`, `previous_epoch_id`, `bootstrap`, `key_backup` |
+| `POST` | `/threads/:id/epochs` | Khởi tạo phiên cố định: `epoch_id`, `bootstrap`, `key_backup` |
 | `PUT` | `/threads/:id/epochs/:epoch_id/key` | Lưu `key_backup`; trả bản đã commit |
 | `GET` | `/threads/:id/messages` | Lịch sử với `before_seq`, `limit` |
 | `POST` | `/threads/:id/messages` | `message_id`, `content_format`, `content` |
@@ -70,9 +70,11 @@ Actor lấy từ JWT `sub`. Gateway nhận `GET /ws?ticket=...`; ticket được
 
 - **Một mật khẩu:** Argon2id profile v1 cố định: salt 16 byte, `memory_kib=65536`, `iterations=3`, `parallelism=4`, output 32 byte. HKDF-SHA-256 tách auth credential/vault key theo mục đích và username. Server lưu bcrypt hash của credential, không nhận mật khẩu gốc hoặc vault key.
 - **Vault bất biến:** đăng ký sinh IK, SPK và 20 OPK; hash, KDF, public bundle gốc, encrypted vault và public OPK được commit cùng transaction. Claim xóa public OPK khả dụng, nhưng bundle gốc và private OPK trong encrypted vault vẫn giữ để phục hồi. Không có luồng đổi mật khẩu.
-- **Epoch:** initiator chạy X3DH 3/4 DH, tạo bootstrap có key confirmation và backup SK mã hóa. Epoch, backup sender và con trỏ current commit cùng transaction. `previous_epoch_id` kiểm tra phiên trước; race trả `409` kèm epoch đã thắng, client phục hồi bản đó. Recipient xác minh bootstrap rồi lưu backup riêng và chờ ACK trước khi dùng SK. Hết public OPK, epoch mới dùng 3DH.
+- **Phiên cố định:** mỗi direct khởi tạo X3DH 3/4 DH một lần, tạo bootstrap có key confirmation và backup SK mã hóa. Khóa thread chọn phiên đầu tiên; epoch, backup sender và con trỏ current commit cùng transaction. Đề xuất khác trả `409` kèm phiên canonical để client khôi phục. Recipient xác minh bootstrap rồi lưu backup riêng và chờ ACK trước khi dùng SK. Hết public OPK, direct mới dùng 3DH.
 - **Tin direct:** `content_format=e2ee_v2`; `content` là chuỗi JSON gồm `version`, `epoch_id`, `recipient_id`, `nonce`, `ciphertext`. Mỗi tin dẫn xuất key từ SK và context thread/epoch/message/sender/recipient, rồi AES-256-GCM. Reply dùng cùng epoch, không claim/X3DH lại.
-- **Retry/rekey:** giữ nguyên UUID, epoch và envelope; trả cùng `seq`. UUID cũ khác payload trả `409`. Nút **Đổi phiên khóa** tạo epoch mới có chủ đích, giữ epoch/backup cũ để đọc lịch sử. Đăng nhập, reload và reconnect chỉ phục hồi khóa.
+- **Retry:** giữ nguyên UUID, epoch và envelope; trả cùng `seq`. UUID cũ khác payload trả `409`. Mọi thiết bị và mọi tin của direct dùng lại phiên đã khởi tạo; đăng nhập, reload và reconnect chỉ khôi phục khóa, không đổi phiên.
+
+ID epoch, các bảng epoch/backup và API danh sách vẫn được giữ để đọc lịch sử tương thích đã có. Giao diện và API khởi tạo không hỗ trợ thay phiên đang dùng.
 
 Account keys/SK ở RAM sau khi mở vault. `sessionStorage` giữ JWT, username, user UUID và `vault_key` cho reload cùng phiên; đăng xuất xóa chúng. `localStorage` chỉ giữ outbox theo UUID với context/ciphertext/body gửi lại, không lưu plaintext/private keys/SK. Nếu storage không khả dụng, outbox ở RAM; lịch sử đã commit vẫn phục hồi từ server khi đăng nhập lại.
 
@@ -109,7 +111,7 @@ node --test web/e2ee-client.test.cjs
 Remove-Item Env:CHAT_API_TEST_URL
 ```
 
-Các bài tích hợp tạo fixture trong database phát triển: auth/vault, epoch đồng thời, nhiều thiết bị, recipient offline, lịch sử epoch cũ/mới, retry/ACK, Redis và bản sao sender qua WS. Có thể [reset](#reset-dữ-liệu-local) sau kiểm tra.
+Các bài tích hợp tạo fixture trong database phát triển: auth/vault, khởi tạo phiên đồng thời và dùng lại phiên cố định, từ chối đề xuất thay thế bằng `409`, nhiều thiết bị, recipient offline, khôi phục lịch sử từ client trống, retry/ACK, Redis và bản sao sender qua WS. Có thể [reset](#reset-dữ-liệu-local) sau kiểm tra.
 
 ## Tài liệu
 

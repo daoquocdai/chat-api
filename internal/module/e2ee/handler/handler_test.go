@@ -55,7 +55,7 @@ func perform(router *gin.Engine, body string) *httptest.ResponseRecorder {
 }
 
 func TestEpochHTTPStatusesAndCanonicalWinner(t *testing.T) {
-	const body = `{"epoch_id":"proposal","previous_epoch_id":null,"bootstrap":"opaque","key_backup":{"version":1,"nonce":"opaque","ciphertext":"opaque"}}`
+	const body = `{"epoch_id":"proposal","bootstrap":"opaque","key_backup":{"version":1,"nonce":"opaque","ciphertext":"opaque"}}`
 	winner := dto.EpochResponse{EpochID: "committed", ThreadID: "thread-id", SenderID: actorID, Bootstrap: "committed-bootstrap"}
 	for _, test := range []struct {
 		name    string
@@ -70,7 +70,7 @@ func TestEpochHTTPStatusesAndCanonicalWinner(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			router := epochRouter(fakeService{create: func(_ context.Context, actor, thread string, request dto.CreateEpochRequest) (dto.EpochResponse, bool, error) {
-				if actor != actorID || thread != "thread-id" || request.PreviousEpochID != nil || request.Bootstrap != "opaque" {
+				if actor != actorID || thread != "thread-id" || request.Bootstrap != "opaque" {
 					t.Fatal("HTTP request context changed")
 				}
 				return winner, test.created, test.err
@@ -93,6 +93,7 @@ func TestEpochHTTPStatusesAndCanonicalWinner(t *testing.T) {
 
 func TestEpochHTTPRejectsAmbiguousOrSecretFields(t *testing.T) {
 	for _, body := range []string{
+		`{"epoch_id":"one","previous_epoch_id":null,"bootstrap":"x","key_backup":{"version":1,"nonce":"x","ciphertext":"x"}}`,
 		`{"epoch_id":"one","epoch_id":"two","bootstrap":"x","key_backup":{}}`,
 		`{"epoch_id":"one","bootstrap":"x","key_backup":{"version":1,"nonce":"x","ciphertext":"x","private_key":"SECRET"}}`,
 		`{"epoch_id":"one","bootstrap":"x","key_backup":null}`,

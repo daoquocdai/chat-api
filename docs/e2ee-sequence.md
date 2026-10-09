@@ -1,6 +1,6 @@
 # Luồng E2EE có thể khôi phục
 
-Direct dùng E2EE; nhóm dùng plaintext. Crypto chạy trong Go/WASM, còn JavaScript gọi API và cập nhật giao diện. X3DH chạy khi tạo **phiên khóa (epoch)**, không chạy lại cho từng tin. Không dùng Double Ratchet.
+Direct dùng E2EE; nhóm dùng plaintext. Crypto chạy trong Go/WASM, còn JavaScript gọi API và cập nhật giao diện. Mỗi direct khởi tạo X3DH một lần để có **phiên khóa cố định (epoch)**, dùng lại trên mọi thiết bị và cho mọi tin. Không dùng Double Ratchet.
 
 ## Đăng ký
 
@@ -51,7 +51,7 @@ sequenceDiagram
     A-->>S: Public IK/SPK + một OPK nếu còn
     S->>S: Xác minh SPK; X3DH 3/4 DH tạo SK và bootstrap
     S->>S: Mã hóa backup SK bằng khóa dẫn xuất từ vault_key
-    S->>A: POST /threads/:id/epochs: epoch_id, previous_epoch_id=null, bootstrap, key_backup
+    S->>A: POST /threads/:id/epochs: epoch_id, bootstrap, key_backup
     A->>A: Khóa thread, tạo epoch + backup sender + cập nhật current trong một transaction
     A-->>S: Epoch đã lưu (201); retry đúng trả cùng epoch (200)
     R->>A: GET /threads/:id/epochs
@@ -62,13 +62,13 @@ sequenceDiagram
     R->>R: Mở backup, kiểm tra cùng SK rồi chấp nhận phiên
 ```
 
-Nếu hai client cùng đề xuất epoch, `previous_epoch_id` và khóa thread chọn một phiên. Bên thua nhận `409` kèm epoch thắng, khôi phục phiên đó và bỏ SK đề xuất. Khi public OPK hết, X3DH dùng 3 DH; private OPK cũ vẫn nằm trong vault mã hóa để khôi phục các epoch trước.
+Nếu hai client cùng khởi tạo, transaction khóa thread chọn phiên đầu tiên. Bên thua nhận `409` kèm phiên canonical, khôi phục phiên đó và bỏ SK đề xuất. Khi direct đã có phiên, đề xuất phiên khác bị từ chối cùng cách này. Khi public OPK hết, direct mới dùng X3DH 3 DH; private OPK đã cấp vẫn nằm trong vault mã hóa để khôi phục phiên.
 
 Mỗi user chỉ tải được backup SK của mình. Backup đầu tiên bất biến; gửi lại không ghi đè. Nó được xác thực với owner UUID, thread UUID, epoch UUID và digest của bootstrap. Sender chỉ gửi tin sau khi epoch và backup đã được server xác nhận.
 
 ## Gửi, nhận và đọc lịch sử
 
-1. Client lấy epoch hiện tại hoặc khôi phục epoch đã có; không claim bundle cho mỗi tin.
+1. Client khôi phục phiên cố định của direct; chỉ khởi tạo nếu direct chưa có phiên, không claim bundle cho mỗi tin.
 2. Sinh message UUID. HKDF dẫn xuất khóa tin từ SK với context gồm thread, epoch, message UUID, sender và recipient; hai chiều dùng context khác nhau.
 3. AES-GCM mã hóa nội dung. Gửi `POST /threads/:id/messages` với `message_id`, `content_format: "e2ee_v2"` và `content` là chuỗi JSON:
 
@@ -82,7 +82,7 @@ Mỗi user chỉ tải được backup SK của mình. Backup đầu tiên bất
 
 Retry giữ nguyên UUID, epoch và toàn bộ bản mã; không chạy X3DH hay mã hóa lại. Ciphertext pending được lưu theo UUID trong `localStorage`, hoặc RAM khi storage không dùng được. Outbox này không phải nguồn phục hồi khóa.
 
-Nút **Đổi phiên khóa** tạo epoch mới với `previous_epoch_id` hiện tại. Epoch và backup cũ vẫn được giữ để đọc lịch sử. Đăng nhập/reconnect/đổi máy không tự đổi epoch.
+Đăng nhập, reconnect, mở tab hoặc đổi máy đều khôi phục cùng phiên đã có. Không có nút hay luồng thay phiên. ID epoch, các bảng và API danh sách/backup vẫn giữ để giải mã lịch sử tương thích đã có.
 
 ## Giới hạn
 

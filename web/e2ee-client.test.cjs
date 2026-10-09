@@ -31,7 +31,19 @@ const toB = (id = T) => ({ id, kind: "direct", peer: { id: B, username: "bob" } 
 const toA = (id = T) => ({ id, kind: "direct", peer: { id: A, username: "alice" } });
 const clone = (value) => structuredClone(value);
 
-// This API fixture implements the agreed wire contract and atomic epoch/backup selection.
+async function proposeSession(client, thread) {
+  const context = { thread_id: thread.id, epoch_id: crypto.randomUUID(),
+    sender_id: client.userID, recipient_id: thread.peer.id };
+  const bundle = await client.request("/e2ee/bundles/" + thread.peer.id + "/claim", {
+    method: "POST", body: JSON.stringify({ thread_id: thread.id }) });
+  const bridge = await MiniHermesWASM.load();
+  const created = bridge.call("createEpoch", { context, identity: client.account.identity, bundle });
+  const backup = bridge.call("encryptEpochBackup", { vault_key: client.vaultKey, owner_id: client.userID,
+    header: created.header, session_key: created.session_key });
+  return { epoch_id: context.epoch_id, bootstrap: created.header, key_backup: backup.backup };
+}
+
+// This API fixture selects one fixed session per thread and immutable owner backups.
 // Crypto always runs through the real Go/WASM bridge.
 function server(accounts) {
   const epochs = new Map();
@@ -66,7 +78,15 @@ function server(accounts) {
       const threadID = match[1], active = current.get(threadID) || null;
       if (method === "GET") return clone({ epochs: [...epochs.values()].filter((item) => item.thread_id === threadID)
         .map((item) => response(item, owner)), current_epoch_id: active });
-      if (body.previous_epoch_id !== active) throw error(409, { error: "epoch conflict", epoch: response(epochs.get(active), owner) });
+      assert.deepEqual(Object.keys(body).sort(), ["bootstrap", "epoch_id", "key_backup"]);
+      if (active) {
+        const winner = epochs.get(active);
+        if (body.epoch_id === active && winner.sender_id === owner && winner.bootstrap === body.bootstrap &&
+            JSON.stringify(winner.backups.get(owner)) === JSON.stringify(body.key_backup)) {
+          return clone(response(winner, owner));
+        }
+        throw error(409, { error: "epoch conflict", epoch: response(winner, owner) });
+      }
       const header = JSON.parse(body.bootstrap);
       const record = { ...body, thread_id: threadID, sender_id: header.sender_id, recipient_id: header.recipient_id,
         backups: new Map([[owner, body.key_backup]]) };
@@ -96,7 +116,7 @@ function server(accounts) {
     loseNextMessageReply() { loseMessageReply = true; }, failNextBackup() { failBackup = true; } };
 }
 
-test("recoverable multi-device epochs, concurrent initialization, replies, rekey and exact retries", { timeout: 300000 }, async () => {
+test("fixed multi-device sessions, concurrent initialization, password recovery and exact retries", { timeout: 300000 }, async () => {
   const alice = await MiniHermesE2EEClient.createAccount("alice", "Alice portable password!");
   const bob = await MiniHermesE2EEClient.createAccount("bob", "Bob portable password!");
   const api = server(new Map([[A, alice], [B, bob]]));
@@ -111,6 +131,12 @@ test("recoverable multi-device epochs, concurrent initialization, replies, rekey
   const [first, reply] = await Promise.all([a1.send(toB(), "alice first"), b1.send(toA(), "bob reply")]);
   assert.equal(api.epochs.size, 1, "concurrent proposals must select one committed epoch");
   assert.equal(JSON.parse(first.content).epoch_id, JSON.parse(reply.content).epoch_id);
+  const sessionID = JSON.parse(first.content).epoch_id;
+  const accepted = api.log.find((item) => item.method === "POST" && item.url === "/threads/" + T + "/epochs" &&
+    item.body.epoch_id === sessionID);
+  const repeated = await api.request(accepted.owner)(accepted.url, { method: "POST", body: accepted.raw });
+  assert.equal(repeated.epoch_id, sessionID, "an exact initialization retry must return the same session");
+  assert.equal(api.epochs.size, 1);
   assert.equal((await a2.receive(toB(), { ...first, recipient_id: A })).plaintext, "alice first",
     "sender delivery target must not be mistaken for crypto recipient");
   assert.equal((await a1.receive(toB(), reply)).plaintext, "bob reply");
@@ -133,18 +159,28 @@ test("recoverable multi-device epochs, concurrent initialization, replies, rekey
   assert.equal((await bFresh.receive(toA(OFFLINE), offline)).plaintext, "recipient has not opened this thread");
   assert.equal(offlineEpoch.backups.has(B), true);
 
-  await b1.rekey(toA());
-  assert.equal(api.epochs.size, 3);
-  const afterRekey = await b1.send(toA(), "new epoch message");
-  assert.notEqual(JSON.parse(afterRekey.content).epoch_id, JSON.parse(first.content).epoch_id);
+  const competing = await proposeSession(b1, toA());
+  await assert.rejects(() => api.request(B)("/threads/" + T + "/epochs", {
+    method: "POST", body: JSON.stringify(competing) }),
+  (error) => error.status === 409 && error.details.epoch.epoch_id === sessionID);
+  assert.equal(api.epochs.size, 2, "an initialized direct thread must refuse a different session proposal");
+  const continued = await b1.send(toA(), "same session message");
+  assert.equal(JSON.parse(continued.content).epoch_id, sessionID);
   localStorage.clear();
   const restoredAlice = await MiniHermesE2EEClient.deriveCredentials("alice", "Alice portable password!", alice.kdf);
   const aFresh = await make(A, alice, restoredAlice);
   assert.equal((await aFresh.receive(toB(), first)).plaintext, "alice first", "sent history survives an empty profile");
-  assert.equal((await aFresh.receive(toB(), reply)).plaintext, "bob reply", "received old epoch survives rekey");
-  assert.equal((await aFresh.receive(toB(), afterRekey)).plaintext, "new epoch message");
+  assert.equal((await aFresh.receive(toB(), reply)).plaintext, "bob reply", "received history survives an empty profile");
+  assert.equal((await aFresh.receive(toB(), continued)).plaintext, "same session message");
   assert.equal((await aFresh.receive(toB(OFFLINE), offline)).plaintext, "recipient has not opened this thread");
   assert.equal(bFresh.account.one_time_prekeys.length, 20, "immutable archived private OPKs must remain recoverable");
+  const claimsAfterRestore = api.log.filter((item) => item.url.endsWith("/claim")).length;
+  const resumed = await aFresh.send(toB(), "fresh device keeps the session");
+  assert.equal(JSON.parse(resumed.content).epoch_id, sessionID);
+  assert.equal((await bFresh.receive(toA(), resumed)).plaintext, "fresh device keeps the session");
+  assert.equal(api.log.filter((item) => item.url.endsWith("/claim")).length, claimsAfterRestore,
+    "fresh devices must restore the fixed session without another prekey claim");
+  assert.equal(api.current.get(T), sessionID);
 
   api.loseNextMessageReply();
   await assert.rejects(() => a2.send(toB(), "retry unchanged"), /response lost/);
@@ -376,17 +412,25 @@ test("real HTTP/Redis/WebSocket round trip and password-only history recovery", 
     assert.equal((await cFresh.client.receive(ca, cHistory.messages.find((message) => message.id === offlineMessage.id))).plaintext,
       "real offline recipient");
 
-    await b1.client.rekey(ba);
-    const newest = await b1.client.send(ba, "real new epoch");
+    const competing = await proposeSession(b1.client, ba);
+    await assert.rejects(() => b1.request("/threads/" + thread.id + "/epochs", {
+      method: "POST", body: JSON.stringify(competing) }),
+    (error) => error.status === 409 && error.details.epoch.epoch_id === epochs.current_epoch_id);
+    const newest = await b1.client.send(ba, "real same session");
+    assert.equal(JSON.parse(newest.content).epoch_id, epochs.current_epoch_id);
     localStorage.clear();
     const aFresh = await login(aliceName);
     const history = await aFresh.request("/threads/" + thread.id + "/messages?limit=100");
     for (const message of history.messages) {
       const view = await aFresh.client.receive(ab, message);
-      assert.ok(view.status === "ready", "fresh browser must read both directions and every retained epoch");
+      assert.ok(view.status === "ready", "fresh browser must read both directions using the restored session");
     }
     assert.ok(history.messages.some((message) => message.id === newest.id));
-    assert.equal((await aFresh.request("/threads/" + thread.id + "/epochs")).epochs.length, 2);
+    assert.equal((await aFresh.request("/threads/" + thread.id + "/epochs")).epochs.length, 1);
+    const claimsBeforeResume = calls.filter((item) => item.url.endsWith("/claim")).length;
+    const resumed = await aFresh.client.send(ab, "real fresh device same session");
+    assert.equal(JSON.parse(resumed.content).epoch_id, epochs.current_epoch_id);
+    assert.equal(calls.filter((item) => item.url.endsWith("/claim")).length, claimsBeforeResume);
 
     const group = await a1.request("/threads/group", { method: "POST",
       body: JSON.stringify({ name: "fetest group", member_ids: [b1.id] }) });

@@ -91,7 +91,6 @@ func TestEpochValidationRejectsMismatchedContextBeforePersistence(t *testing.T) 
 	}
 	for _, mutate := range []func(*dto.CreateEpochRequest){
 		func(r *dto.CreateEpochRequest) { r.EpochID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
-		func(r *dto.CreateEpochRequest) { r.PreviousEpochID = &r.EpochID },
 		func(r *dto.CreateEpochRequest) { r.KeyBackup = e2ee.EncryptedRecord{} },
 		func(r *dto.CreateEpochRequest) { r.Bootstrap = "not a bootstrap" },
 	} {

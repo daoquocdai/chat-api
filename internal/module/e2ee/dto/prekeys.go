@@ -32,10 +32,9 @@ type EpochPageResponse struct {
 }
 
 type CreateEpochRequest struct {
-	EpochID         string               `json:"epoch_id"`
-	PreviousEpochID *string              `json:"previous_epoch_id"`
-	Bootstrap       string               `json:"bootstrap"`
-	KeyBackup       e2ee.EncryptedRecord `json:"key_backup"`
+	EpochID   string               `json:"epoch_id"`
+	Bootstrap string               `json:"bootstrap"`
+	KeyBackup e2ee.EncryptedRecord `json:"key_backup"`
 }
 
 type BackupRequest struct {

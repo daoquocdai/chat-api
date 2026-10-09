@@ -40,6 +40,7 @@ import (
 	"github.com/daoquocdai/chat-api/internal/wsticket"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
@@ -69,6 +70,8 @@ func TestRecoverableE2EEIntegration(t *testing.T) {
 	if pool.Ping(ctx) != nil {
 		t.Fatal("integration PostgreSQL unavailable")
 	}
+	ownedAccounts := []string{}
+	defer cleanupRecoveryAccounts(t, pool, &ownedAccounts)
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Address, Password: cfg.Redis.Password, DB: cfg.Redis.Database})
 	defer rdb.Close()
 	if rdb.Ping(ctx).Err() != nil {
@@ -96,7 +99,7 @@ func TestRecoverableE2EEIntegration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	server := httptest.NewServer(route.New(userhandler.New(users), threadhandler.New(threads), messagehandler.New(messages), wsticket.NewHandler(tickets, cfg.WSPublicURL, time.Second), e2eehandler.New(cryptoService), middleware.RequireAuthentication(jwt)))
 	defer server.Close()
-	api := recoveryAPI{t: t, base: server.URL, client: &http.Client{Timeout: 10 * time.Second}}
+	api := recoveryAPI{t: t, base: server.URL, client: &http.Client{Timeout: 10 * time.Second}, ownedAccounts: &ownedAccounts}
 	alice := api.register("it_alice_" + uuid.NewString()[:8])
 	bob := api.register("it_bob_" + uuid.NewString()[:8])
 	charlie := api.register("it_charlie_" + uuid.NewString()[:8])
@@ -129,7 +132,7 @@ func TestRecoverableE2EEIntegration(t *testing.T) {
 
 	// Two devices race initial proposals. Each stores a sender backup atomically;
 	// the losing device must recover the committed epoch, never use its own SK.
-	proposals := []recoveryProposal{api.proposal(alice, bob.id, direct.ID, nil), api.proposal(alice, bob.id, direct.ID, nil)}
+	proposals := []recoveryProposal{api.proposal(alice, bob.id, direct.ID), api.proposal(alice, bob.id, direct.ID)}
 	type raceReply struct {
 		index, status int
 		body          []byte
@@ -218,16 +221,24 @@ func TestRecoverableE2EEIntegration(t *testing.T) {
 	changed.Content += " "
 	api.require(http.MethodPost, "/threads/"+direct.ID+"/messages", alice.token, changed, http.StatusConflict, nil)
 
-	rotated := api.proposal(alice, bob.id, direct.ID, &winner.EpochID)
-	api.require(http.MethodPost, "/threads/"+direct.ID+"/epochs", alice.token, rotated.request, http.StatusCreated, nil)
-	_, latest := api.send(alice, bob.id, direct.ID, rotated, "sent after rotation")
+	// An initialized direct keeps its original key. Retrying a losing device's
+	// distinct key proposal returns the original winner instead of replacing it.
+	losing := proposals[1-winnerIndex]
+	var rejected struct {
+		Epoch e2eedto.EpochResponse `json:"epoch"`
+	}
+	api.require(http.MethodPost, "/threads/"+direct.ID+"/epochs", alice.token, losing.request, http.StatusConflict, &rejected)
+	if !reflect.DeepEqual(rejected.Epoch, winner) {
+		t.Fatal("a later key proposal replaced the fixed direct session")
+	}
+	_, latest := api.send(alice, bob.id, direct.ID, selected, "sent with the fixed session")
 	for _, account := range []recoveryAccount{alice, bob} {
 		account.vault, account.keys = e2ee.AccountVault{}, e2ee.PasswordKeys{}
 		account = api.restore(account)
 		var epochs e2eedto.EpochPageResponse
 		api.require(http.MethodGet, "/threads/"+direct.ID+"/epochs", account.token, nil, http.StatusOK, &epochs)
-		if len(epochs.Epochs) != 2 || epochs.CurrentEpochID == nil || *epochs.CurrentEpochID != rotated.request.EpochID {
-			t.Fatal("fresh device did not receive both old and current epochs")
+		if len(epochs.Epochs) != 1 || epochs.CurrentEpochID == nil || *epochs.CurrentEpochID != winner.EpochID {
+			t.Fatal("fresh device did not recover the original fixed session")
 		}
 		keys := map[string][32]byte{}
 		for _, epoch := range epochs.Epochs {
@@ -243,7 +254,7 @@ func TestRecoverableE2EEIntegration(t *testing.T) {
 		if len(history.Messages) != 3 {
 			t.Fatal("history lost messages or included a retry duplicate")
 		}
-		expected := map[string]string{first.ID: "sent from Alice", reply.ID: "reply from Bob", latest.ID: "sent after rotation"}
+		expected := map[string]string{first.ID: "sent from Alice", reply.ID: "reply from Bob", latest.ID: "sent with the fixed session"}
 		for _, message := range history.Messages {
 			envelope := cryptoValue[e2ee.MessageEnvelope](t)(e2ee.ParseMessageEnvelope(message.Content))
 			plaintext := cryptoValue[[]byte](t)(e2ee.OpenMessage(e2ee.EpochMessageContext{ThreadID: direct.ID, EpochID: envelope.EpochID, MessageID: message.ID, SenderID: message.SenderID, RecipientID: envelope.RecipientID}, keys[envelope.EpochID], envelope))
@@ -299,9 +310,10 @@ func TestRecoverableE2EEIntegration(t *testing.T) {
 }
 
 type recoveryAPI struct {
-	t      *testing.T
-	base   string
-	client *http.Client
+	t             *testing.T
+	base          string
+	client        *http.Client
+	ownedAccounts *[]string
 }
 
 type recoveryAccount struct {
@@ -373,6 +385,11 @@ func (api recoveryAPI) register(username string) recoveryAccount {
 	var response userdto.UserResponse
 	api.require(http.MethodPost, "/auth/register", "", userdto.RegisterRequest{Username: username, AuthCredential: account.keys.AuthCredential, KDF: account.kdf, PublicBundle: account.public, AccountVault: account.encrypted}, http.StatusCreated, &response)
 	account.id = response.ID
+	parsed, err := uuid.Parse(account.id)
+	if err != nil || parsed == uuid.Nil || parsed.String() != account.id {
+		api.t.Fatal("registration did not return a canonical account UUID")
+	}
+	*api.ownedAccounts = append(*api.ownedAccounts, account.id)
 	var login userdto.TokenResponse
 	api.require(http.MethodPost, "/auth/login", "", userdto.LoginRequest{Username: username, AuthCredential: account.keys.AuthCredential}, http.StatusOK, &login)
 	if login.UserID != account.id || login.TokenType != "Bearer" {
@@ -400,7 +417,7 @@ func (api recoveryAPI) restore(account recoveryAccount) recoveryAccount {
 	return account
 }
 
-func (api recoveryAPI) proposal(sender recoveryAccount, recipientID, threadID string, previous *string) recoveryProposal {
+func (api recoveryAPI) proposal(sender recoveryAccount, recipientID, threadID string) recoveryProposal {
 	api.t.Helper()
 	var bundle e2ee.Bundle
 	api.require(http.MethodPost, "/e2ee/bundles/"+recipientID+"/claim", sender.token, e2ee.ClaimRequest{ThreadID: threadID}, http.StatusOK, &bundle)
@@ -410,7 +427,7 @@ func (api recoveryAPI) proposal(sender recoveryAccount, recipientID, threadID st
 		api.t.Fatal("integration X3DH epoch generation failed")
 	}
 	backup := cryptoValue[e2ee.EncryptedRecord](api.t)(e2ee.EncryptEpochBackup(sender.keys.VaultKey, sender.id, header, key))
-	return recoveryProposal{request: e2eedto.CreateEpochRequest{EpochID: header.EpochID, PreviousEpochID: previous, Bootstrap: cryptoValue[string](api.t)(e2ee.EncodeEpochHeader(header)), KeyBackup: backup}, header: header, key: key}
+	return recoveryProposal{request: e2eedto.CreateEpochRequest{EpochID: header.EpochID, Bootstrap: cryptoValue[string](api.t)(e2ee.EncodeEpochHeader(header)), KeyBackup: backup}, header: header, key: key}
 }
 
 func (api recoveryAPI) recoverBootstrap(account recoveryAccount, header e2ee.EpochHeader) [32]byte {
@@ -460,4 +477,31 @@ func cryptoValue[T any](t *testing.T) func(T, error) T {
 
 func containsAccount(ids []string, wanted string) bool {
 	return strings.Contains("|"+strings.Join(ids, "|")+"|", "|"+wanted+"|")
+}
+
+func cleanupRecoveryAccounts(t *testing.T, pool *pgxpool.Pool, ownedAccounts *[]string) {
+	t.Helper()
+	if len(*ownedAccounts) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Resolve only the exact UUIDs returned by this test's registration requests.
+	// A thread with any other account's membership is excluded from cleanup.
+	owned := `WITH owned AS (SELECT id FROM users WHERE external_id::text = ANY($1::text[])) `
+	threadScope := ` WHERE created_by IN (SELECT id FROM owned)
+		AND NOT EXISTS (SELECT 1 FROM participants AS p WHERE p.thread_id = threads.id AND p.user_id NOT IN (SELECT id FROM owned))`
+	err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, owned+`UPDATE threads SET current_epoch_id = NULL`+threadScope, *ownedAccounts); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, owned+`DELETE FROM threads`+threadScope, *ownedAccounts); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM users WHERE external_id::text = ANY($1::text[])`, *ownedAccounts)
+		return err
+	})
+	if err != nil {
+		t.Error("integration fixture cleanup failed; no unrelated records were deleted")
+	}
 }

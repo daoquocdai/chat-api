@@ -96,7 +96,7 @@ erDiagram
 | `participants` | Role, khoảng quyền xem `joined_seq..left_seq` và read marker của từng lần tham gia |
 | `messages` | Tin text/system theo seq; E2EE lưu JSON envelope trong `content` và tham chiếu epoch |
 | `prekeys` | Hàng đợi public OPK còn khả dụng; claim xóa một dòng |
-| `e2ee_epochs` | Bootstrap bất biến của mỗi phiên X3DH; sender/recipient là vai trò khởi tạo phiên |
+| `e2ee_epochs` | Bootstrap bất biến của phiên X3DH; direct mới chỉ khởi tạo một phiên cố định, các bản đã có vẫn giữ cho lịch sử |
 | `e2ee_epoch_backups` | Backup SK mã hóa riêng của mỗi user trong epoch; PK ghép `(epoch_id, user_id)` |
 
 ## Ràng buộc chính
@@ -109,6 +109,6 @@ erDiagram
 - Prekey có unique `(user_id, key_id)` với ID dương và bị xóa khi claim. Public IK/SPK và chữ ký SPK nằm trong bundle gốc; private IK/SPK/20 OPK nằm trong account vault mã hóa. Bundle/vault không thay đổi khi public OPK bị tiêu thụ.
 - Epoch có unique `(thread_id, id)`. FK ghép `(thread_id, epoch_id)` của message và `(id, current_epoch_id)` của thread bảo đảm không tham chiếu epoch thuộc thread khác.
 - Message plaintext có `epoch_id=NULL`; `e2ee_v2` bắt buộc có epoch. Backend còn kiểm tra recipient là peer và hai bên đúng membership direct.
-- Tạo epoch/current pointer/backup sender cùng transaction. Backup riêng được ghi một lần; giữ epoch cũ để giải mã lịch sử. Server lưu private keys và SK dưới dạng ciphertext, không nhận khóa dạng rõ.
+- Transaction khóa thread chọn phiên khởi tạo đầu tiên và lưu epoch/current pointer/backup sender cùng lúc; đề xuất thay thế phiên đã có trả `409` kèm phiên canonical. Backup riêng được ghi một lần. Schema, ID epoch và API danh sách/backup vẫn giữ các bản đã có để giải mã lịch sử tương thích. Server lưu private keys và SK dưới dạng ciphertext, không nhận khóa dạng rõ.
 
 Transaction và quyền truy cập: [luồng xử lý](request-flow.md). Envelope: [X3DH](e2ee-sequence.md).

@@ -28,7 +28,7 @@ flowchart LR
 ## Luồng chính
 
 1. **Auth:** client dẫn xuất credential và vault key từ mật khẩu bằng Argon2id/HKDF. Đăng ký lưu bcrypt credential, KDF, public bundle gốc, vault mã hóa và public OPK trong một transaction. Đăng nhập lấy KDF qua `/auth/params`, gửi credential và nhận JWT HS256 chứa user UUID trong `sub`; dùng JWT tải `/e2ee/account` rồi mở vault tại client. Mật khẩu gốc và vault key không gửi backend. Browser đổi JWT lấy vé WebSocket một lần; gateway dùng Redis `GETDEL` trước upgrade.
-2. **Direct/epoch:** request chứa `peer_id`; khóa hai user theo ID tăng dần, tìm thread của cặp hoặc tạo mới trong transaction. Direct luôn dùng E2EE và cần public bundle hợp lệ ở cả hai bên. Client khôi phục epoch đã có; nếu chưa có, claim bundle rồi X3DH tạo SK. Tạo epoch lưu bootstrap, backup SK mã hóa của sender và current pointer cùng transaction, đối chiếu `previous_epoch_id` để chọn một phiên khi tạo đồng thời. Recipient khôi phục private prekeys từ vault và lưu backup riêng. Đổi máy không tạo epoch mới.
+2. **Direct/phiên cố định:** request chứa `peer_id`; khóa hai user theo ID tăng dần, tìm thread của cặp hoặc tạo mới trong transaction. Direct luôn dùng E2EE và cần public bundle hợp lệ ở cả hai bên. Client khôi phục phiên đã có; nếu chưa có, claim bundle rồi chạy X3DH một lần tạo SK. Transaction khóa thread chọn phiên đầu tiên, lưu bootstrap, backup SK mã hóa của sender và current pointer; đề xuất khác nhận `409` kèm phiên canonical. Recipient khôi phục private prekeys từ vault và lưu backup riêng. Mọi thiết bị dùng lại phiên này.
 3. **Nhóm:** tạo thread, participants và system message đầu tiên cùng transaction. Thêm/xóa/rời và gửi tin cùng khóa thread; mỗi lần tham gia giữ một khoảng `joined_seq..left_seq`.
 4. **Gửi:** client direct dẫn xuất khóa từng tin từ SK và context, mã hóa rồi gửi UUID/envelope. Backend khóa thread, kiểm tra lại membership, tra message UUID. Retry đúng payload trả tin cũ; UUID khác dữ liệu trả `409`. Tin direct phải dùng `e2ee_v2`, recipient là peer và epoch thuộc thread; tin nhóm dùng `plaintext`. Format khác trả `409`. Tin mới tăng `last_seq` và insert trong cùng transaction; response chứa message đầy đủ.
 5. **Publish:** sau commit, lấy snapshot membership tại `message.seq`, tạo `recipient_ids` rồi `XADD`. Giữ toàn bộ snapshot cho cả text/system, gồm sender để các thiết bị khác của người gửi nhận được tin.
@@ -57,6 +57,6 @@ API kiểm tra format/header/context E2EE; chỉ lưu khóa dạng mã hóa và 
 
 - Private keys/SK đã mở nằm trong RAM. `sessionStorage` của tab giữ JWT, username và vault key gắn với user UUID để reload rồi tải account lại từ server; không lưu mật khẩu gốc.
 - `localStorage` chỉ giữ ciphertext pending theo UUID, có RAM fallback. Không cần IndexedDB hay Web Lock độc quyền để đọc lịch sử trên máy mới.
-- Nút đổi phiên tạo epoch mới; giữ mọi epoch và backup cũ. Login/reconnect chỉ khôi phục. Chưa có đổi mật khẩu.
+- Login/reconnect/mở tab chỉ khôi phục phiên cố định; không có luồng đổi phiên. ID epoch, các bảng và API danh sách/backup vẫn giữ để đọc lịch sử tương thích đã có. Chưa có đổi mật khẩu.
 
 Schema: [ERD](chat-api-erd.md). Quyết định: [gateway](adr/001-gateway-and-stream.md), [unread](adr/002-unread-count.md), [sequence](adr/003-message-order.md).

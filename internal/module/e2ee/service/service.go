@@ -110,8 +110,7 @@ func (s *Service) CreateEpoch(ctx context.Context, actorExternalID, threadExtern
 	if !canonicalUUID(actorExternalID) {
 		return dto.EpochResponse{}, false, usermodel.ErrInvalidUserID
 	}
-	if !canonicalUUID(threadExternalID) || !canonicalUUID(request.EpochID) ||
-		(request.PreviousEpochID != nil && (!canonicalUUID(*request.PreviousEpochID) || *request.PreviousEpochID == request.EpochID)) {
+	if !canonicalUUID(threadExternalID) || !canonicalUUID(request.EpochID) {
 		return dto.EpochResponse{}, false, model.ErrInvalidEpoch
 	}
 	header, err := e2ee.ParseEpochHeader(request.Bootstrap)

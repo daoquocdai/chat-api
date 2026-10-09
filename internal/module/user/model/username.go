@@ -1,14 +1,10 @@
 package model
 
-import (
-	"strings"
-	"unicode/utf8"
-)
+import "github.com/daoquocdai/chat-api/internal/e2ee"
 
 func NormalizeUsername(username string) (string, error) {
-	username = strings.ToLower(strings.TrimSpace(username))
-
-	if length := utf8.RuneCountInString(username); length == 0 || length > 50 || strings.ContainsRune(username, '\x00') {
+	username, err := e2ee.NormalizeAccountUsername(username)
+	if err != nil {
 		return "", ErrInvalidUsername
 	}
 

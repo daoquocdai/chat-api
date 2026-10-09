@@ -3,6 +3,7 @@ package model
 import "errors"
 
 var (
+	ErrE2EEBundleRequired   = errors.New("both users require a valid registered identity and signed prekey")
 	ErrPeerIDRequired       = errors.New("peer ID is required")
 	ErrSameUser             = errors.New("cannot create a direct thread with yourself")
 	ErrThreadIDRequired     = errors.New("thread ID is required")

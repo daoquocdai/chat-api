@@ -2,10 +2,12 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
+	"github.com/daoquocdai/chat-api/internal/e2ee"
 	"github.com/daoquocdai/chat-api/internal/module/thread/model"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -44,23 +46,21 @@ func (r *PostgresRepository) CreateOrGetDirect(
 			return fmt.Errorf("lock direct thread users: expected 2 users, got %d", len(lockedUsers))
 		}
 
-		var thread sqlc.CreateDirectThreadRow
-		existing, err := queries.GetDirectThreadByParticipants(
+		threadID, err := queries.GetDirectThreadByParticipants(
 			ctx,
 			sqlc.GetDirectThreadByParticipantsParams{UserLowID: lowID, UserHighID: highID},
 		)
-		if err == nil {
-			thread = sqlc.CreateDirectThreadRow{
-				ID:         existing.ID,
-				ExternalID: existing.ExternalID,
-				Kind:       existing.Kind,
-				LastSeq:    existing.LastSeq,
-				CreatedAt:  existing.CreatedAt,
+		if errors.Is(err, pgx.ErrNoRows) {
+			for _, user := range lockedUsers {
+				var public e2ee.UploadRequest
+				if err := json.Unmarshal(user.PublicBundle, &public); err != nil {
+					return model.ErrE2EEBundleRequired
+				}
+				if err := e2ee.ValidatePublicBundle(public); err != nil {
+					return model.ErrE2EEBundleRequired
+				}
 			}
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		} else {
-			thread, err = queries.CreateDirectThread(ctx, creatorID)
+			thread, err := queries.CreateDirectThread(ctx, creatorID)
 			if err != nil {
 				return err
 			}
@@ -77,11 +77,14 @@ func (r *PostgresRepository) CreateOrGetDirect(
 				return err
 			}
 			created = true
+			threadID = thread.ExternalID
+		} else if err != nil {
+			return err
 		}
 
 		summary, err := queries.GetThreadSummaryForUser(ctx, sqlc.GetThreadSummaryForUserParams{
 			UserID:           creatorID,
-			ThreadExternalID: thread.ExternalID,
+			ThreadExternalID: threadID,
 		})
 		if err != nil {
 			return err

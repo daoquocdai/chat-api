@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/daoquocdai/chat-api/internal/database/sqlc"
+	"github.com/daoquocdai/chat-api/internal/e2ee"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	threadmodel "github.com/daoquocdai/chat-api/internal/module/thread/model"
 	"github.com/jackc/pgx/v5"
@@ -25,7 +26,7 @@ func (r *PostgresRepository) Send(
 	ctx context.Context,
 	threadExternalID string,
 	senderID int64,
-	messageID, content string,
+	messageID, contentFormat, content string,
 ) (model.Message, bool, error) {
 	threadID, err := parseUUID(threadExternalID, model.ErrInvalidThreadID)
 	if err != nil {
@@ -40,7 +41,7 @@ func (r *PostgresRepository) Send(
 	created := false
 	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		queries := sqlc.New(tx)
-		threadInternalID, err := queries.LockThreadForParticipant(ctx, sqlc.LockThreadForParticipantParams{
+		thread, err := queries.LockThreadForParticipant(ctx, sqlc.LockThreadForParticipantParams{
 			UserID:           senderID,
 			ThreadExternalID: threadID,
 		})
@@ -52,7 +53,7 @@ func (r *PostgresRepository) Send(
 		}
 		// Recheck after obtaining the thread lock: membership may have changed while waiting.
 		if _, err := queries.GetActiveParticipant(ctx, sqlc.GetActiveParticipantParams{
-			ThreadID: threadInternalID, UserID: senderID,
+			ThreadID: thread.ID, UserID: senderID,
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return threadmodel.ErrNotParticipant
@@ -62,8 +63,8 @@ func (r *PostgresRepository) Send(
 
 		existing, err := queries.GetMessageByExternalID(ctx, messageExternalID)
 		if err == nil {
-			if existing.ThreadID != threadInternalID || existing.SenderID != senderID ||
-				existing.Kind != "text" || existing.ContentFormat != "plaintext" ||
+			if existing.ThreadID != thread.ID || existing.SenderID != senderID ||
+				existing.Kind != "text" || existing.ContentFormat != contentFormat ||
 				existing.Content != content {
 				return model.ErrMessageIDConflict
 			}
@@ -78,15 +79,32 @@ func (r *PostgresRepository) Send(
 			return err
 		}
 
-		seq, err := queries.IncrementThreadSequence(ctx, threadInternalID)
+		expectedFormat := "plaintext"
+		if thread.Kind == "direct" {
+			expectedFormat = "e2ee_v2"
+		}
+		if contentFormat != expectedFormat {
+			return model.ErrContentFormatConflict
+		}
+		var epochID pgtype.UUID
+		if contentFormat == "e2ee_v2" {
+			epochID, err = validateEnvelopeHeader(ctx, queries, thread.ID, senderID, content)
+			if err != nil {
+				return err
+			}
+		}
+
+		seq, err := queries.IncrementThreadSequence(ctx, thread.ID)
 		if err != nil {
 			return err
 		}
 		message, err := queries.CreateThreadMessage(ctx, sqlc.CreateThreadMessageParams{
 			MessageExternalID: messageExternalID,
-			ThreadID:          threadInternalID,
+			ThreadID:          thread.ID,
 			SenderID:          senderID,
 			Seq:               seq,
+			ContentFormat:     contentFormat,
+			EpochID:           epochID,
 			Content:           content,
 		})
 		if err != nil {
@@ -109,6 +127,41 @@ func (r *PostgresRepository) Send(
 	}
 
 	return result, created, nil
+}
+
+// The server binds a message to its thread/epoch and peer, without decrypting.
+func validateEnvelopeHeader(ctx context.Context, queries *sqlc.Queries, threadID, senderID int64, content string) (pgtype.UUID, error) {
+	envelope, err := e2ee.ParseMessageEnvelope(content)
+	if err != nil {
+		return pgtype.UUID{}, model.ErrInvalidEnvelope
+	}
+	participants, err := queries.GetE2EEMessageParticipants(ctx, threadID)
+	if err != nil {
+		return pgtype.UUID{}, err
+	}
+	if len(participants) != 2 {
+		return pgtype.UUID{}, model.ErrInvalidEnvelopeHeader
+	}
+	var senderMatches, recipientMatches bool
+	for _, participant := range participants {
+		if participant.ID == senderID {
+			senderMatches = true
+		} else if participant.ExternalID.String() == envelope.RecipientID {
+			recipientMatches = true
+		}
+	}
+	if !senderMatches || !recipientMatches {
+		return pgtype.UUID{}, model.ErrInvalidEnvelopeHeader
+	}
+	epochID, err := parseUUID(envelope.EpochID, model.ErrInvalidEnvelopeHeader)
+	if err != nil {
+		return pgtype.UUID{}, err
+	}
+	_, err = queries.GetEpochIdentity(ctx, sqlc.GetEpochIdentityParams{EpochID: epochID, ThreadID: threadID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pgtype.UUID{}, model.ErrInvalidEnvelopeHeader
+	}
+	return epochID, err
 }
 
 func (r *PostgresRepository) List(

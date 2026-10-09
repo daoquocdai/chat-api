@@ -1,17 +1,17 @@
 -- name: CreateDirectThread :one
-INSERT INTO threads (kind, created_by, encryption_mode)
-VALUES ('direct', sqlc.arg(created_by), 'plaintext')
-RETURNING id, external_id, kind, last_seq, created_at;
+INSERT INTO threads (kind, created_by)
+VALUES ('direct', sqlc.arg(created_by))
+RETURNING id, external_id;
 
 -- name: LockUsersForDirectThread :many
-SELECT id
+SELECT id, external_id, public_bundle
 FROM users
 WHERE id IN (sqlc.arg(user_low_id), sqlc.arg(user_high_id))
 ORDER BY id
 FOR UPDATE;
 
 -- name: GetDirectThreadByParticipants :one
-SELECT thread.id, thread.external_id, thread.kind, thread.last_seq, thread.created_at
+SELECT thread.external_id
 FROM threads AS thread
 JOIN participants AS participant
   ON participant.thread_id = thread.id

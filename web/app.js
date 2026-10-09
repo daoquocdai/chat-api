@@ -1,5 +1,7 @@
 const sessionTokenKey = "mini-hermes.access-token";
 const sessionUsernameKey = "mini-hermes.username";
+const sessionVaultKey = "mini-hermes.vault-key.v2";
+const sessionVaultUserKey = "mini-hermes.vault-user.v2";
 const messagePageLimit = 30;
 const threadSummaryDebounceMs = 750;
 const websocketConnectTimeoutMs = 10000;
@@ -12,6 +14,8 @@ const authView = document.querySelector("#auth-view");
 const chatView = document.querySelector("#chat-view");
 const registerForm = document.querySelector("#register-form");
 const loginForm = document.querySelector("#login-form");
+const registerButton = document.querySelector("#register-button");
+const loginButton = document.querySelector("#login-button");
 const logoutButton = document.querySelector("#logout-button");
 const currentUsername = document.querySelector("#current-username");
 const peerList = document.querySelector("#peer-list");
@@ -38,6 +42,18 @@ const addMemberForm = document.querySelector("#add-member-form");
 const addMemberUser = document.querySelector("#add-member-user");
 const addMemberButton = document.querySelector("#add-member-button");
 const leaveButton = document.querySelector("#leave-button");
+const e2eeStatus = document.querySelector("#e2ee-status");
+const e2eeFingerprint = document.querySelector("#e2ee-fingerprint");
+const e2eePending = document.querySelector("#e2ee-pending");
+const e2eePendingInfo = document.querySelector("#e2ee-pending-info");
+const e2eePendingList = document.querySelector("#e2ee-pending-list");
+const e2eeRekey = document.querySelector("#e2ee-rekey");
+const peerFingerprint = document.querySelector("#peer-fingerprint");
+const e2eeDecryptRetry = document.querySelector("#e2ee-decrypt-retry");
+const e2eeLabels = {
+  initializing: "Đang khôi phục khóa.", ready: "Chat mã hóa sẵn sàng.",
+  error: "Không thể khôi phục khóa. Vui lòng đăng nhập lại.",
+};
 
 const state = {
   token: "", sessionVersion: 0, sessionAbort: new AbortController(),
@@ -51,6 +67,7 @@ const state = {
   socket: null, socketConnecting: false, socketGeneration: 0,
   socketTicketAbort: null, socketHealthTimer: null, socketLastActivityAt: 0,
   socketSummaryStale: false, reconnectTimer: null, reconnectDelay: 1000,
+  e2ee: null, vaultKey: "", authBusy: false,
 };
 
 function showNotice(message) {
@@ -64,12 +81,73 @@ function showError(message) {
 function canUseThread(cache) {
   return Boolean(cache?.summary && cache.active && !cache.permissionsPending);
 }
+function hasEncryptedMessages(cache) {
+  if (!cache) return false;
+  for (const messages of [cache.messages, cache.eventMessages]) {
+    for (const message of messages.values()) {
+      if (message.content_format === "e2ee_v2") return true;
+    }
+  }
+  return false;
+}
+function canSendPlaintext(cache) {
+  return canUseThread(cache) && cache.summary.kind === "group" && !hasEncryptedMessages(cache);
+}
+function canSendE2EE(cache) {
+  return canUseThread(cache) && !cache.payloadConflict && cache.summary.kind === "direct" && Boolean(state.e2ee?.canSend(cache.summary));
+}
+function renderE2EEPanel() {
+  const local = state.e2ee?.snapshot() || { status: "initializing", pending: [] };
+  e2eeStatus.dataset.status = local.status;
+  e2eeStatus.textContent = `${e2eeLabels[local.status] || e2eeLabels.error}${local.error ? " " + local.error : ""}`;
+  e2eeFingerprint.textContent = local.own_fingerprint ? `Fingerprint: ${local.own_fingerprint}` : "";
+  e2eePending.hidden = local.pending.length === 0;
+  e2eePendingInfo.textContent = `${local.pending.length} tin chưa được xác nhận.`;
+  e2eePendingList.replaceChildren();
+  for (const item of local.pending) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    const thread = state.threads.get(item.thread_id)?.summary;
+    button.textContent = `Gửi lại · ${thread ? threadTitle(thread) : "Chat 1-1"}`;
+    button.disabled = !state.e2ee?.canRead();
+    button.addEventListener("click", () => runE2EEAction((client) => retryE2EE(client, item.message_id)));
+    e2eePendingList.append(button);
+  }
+  renderPeerList();
+}
+async function startE2EE() {
+  const sessionVersion = state.sessionVersion, token = state.token, userID = state.currentUserID;
+  if (!currentSessionMatches(sessionVersion, token) || !state.users.some((user) => user.id === userID) || state.e2ee) return;
+  const current = () => currentSessionMatches(sessionVersion, token) && state.currentUserID === userID;
+  const client = MiniHermesE2EEClient.create({ apiURL: location.origin, userID, current,
+    username: state.currentUsername, vaultKey: state.vaultKey,
+    request: async (path, options) => {
+      if (!current()) throw new Error("Phiên E2EE đã thay đổi.");
+      const response = await apiRequest(path, options);
+      if (!current()) throw new Error("Phiên E2EE đã thay đổi.");
+      return response;
+    },
+    onChange: () => {
+      if (!current() || state.e2ee !== client) return;
+      renderE2EEPanel();
+      renderThreadHeading();
+      if (client.canRead()) for (const cache of state.threads.values()) processE2EEMessages(cache);
+    },
+  });
+  state.e2ee = client;
+  renderE2EEPanel();
+  await client.start();
+}
 function updateSendButton() {
   const cache = state.currentCache;
   const pending = cache?.pendingSend;
-  sendButton.textContent = pending ? "Gửi lại" : "Gửi";
-  sendButton.disabled = !canUseThread(cache) || Boolean(pending?.inFlight);
-  contentInput.disabled = !canUseThread(cache);
+  const encrypted = cache?.summary?.kind === "direct";
+  const allowed = encrypted ? canSendE2EE(cache) : canSendPlaintext(cache);
+  sendButton.textContent = !encrypted && pending ? "Gửi lại" : "Gửi";
+  sendButton.disabled = !allowed || Boolean(pending?.inFlight) || Boolean(cache?.e2eeSending);
+  contentInput.disabled = !allowed || Boolean(cache?.e2eeSending);
+  contentInput.maxLength = encrypted ? 2000 : 1000;
 }
 function renderThreadHeading() {
   const cache = state.currentCache;
@@ -80,9 +158,20 @@ function renderThreadHeading() {
     ? !cache.active ? "Bạn đã rời hoặc bị xóa khỏi nhóm; chỉ xem lịch sử đã được cấp quyền."
       : cache.permissionsPending ? "Đang đối chiếu thành viên và quyền..."
       : `${thread.member_count} thành viên · ${thread.role === "admin" ? "Quản trị viên" : "Thành viên"}`
-    : "";
+    : thread?.kind === "direct" || hasEncryptedMessages(cache)
+      ? `E2EE · ${e2eeLabels[state.e2ee?.snapshot().status] || e2eeLabels.initializing}`
+      : "";
   membersButton.hidden = !group || !cache.active;
   if (!group || !cache.active) membersPanel.hidden = true;
+  const local = state.e2ee?.snapshot();
+  const pin = local?.peer_pins?.[thread?.peer?.id];
+  peerFingerprint.hidden = thread?.kind !== "direct";
+  peerFingerprint.textContent = thread?.kind === "direct"
+    ? `Peer UUID ${thread.peer?.id || "chưa rõ"}\nFingerprint IK: ${pin?.fingerprint || "chưa biết — đối chiếu qua kênh tin cậy khi đã có pin"}` : "";
+  e2eeDecryptRetry.hidden = !cache || ![...cache.decryptedViews.values()].some((view) => view.status === "error");
+  e2eeDecryptRetry.disabled = !state.e2ee?.canRead();
+  e2eeRekey.hidden = thread?.kind !== "direct";
+  e2eeRekey.disabled = !canSendE2EE(cache) || Boolean(cache?.e2eeSending);
   updateSendButton();
   if (group && !membersPanel.hidden) renderMembers(cache);
 }
@@ -122,10 +211,14 @@ async function sendMessageWithRetry(snapshot, messageID, content) {
   const request = { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message_id: messageID, content }) };
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!canSendPlaintext(snapshot.cache)) {
+      if (!snapshot.cache?.summary) scheduleThreadSummaryRefresh();
+      throw new Error("Chưa thể gửi vào cuộc trò chuyện này.");
+    }
     try { return await apiRequest(`/threads/${snapshot.threadID}/messages`, request); }
     catch (error) {
       if (attempt === 1 || (error.status !== undefined && error.status < 500) ||
-          !cacheSnapshotMatches(snapshot) || !canUseThread(snapshot.cache)) throw error;
+          !cacheSnapshotMatches(snapshot) || !canSendPlaintext(snapshot.cache)) throw error;
     }
   }
 }
@@ -147,13 +240,18 @@ function resetConversation() {
   loadOlderButton.hidden = true;
 }
 function clearSession() {
+  const previousE2EE = state.e2ee;
+  state.e2ee = null;
+  if (previousE2EE) void previousE2EE.close();
   stopWebSocket();
   state.sessionAbort.abort();
   state.sessionAbort = new AbortController();
-  sessionStorage.removeItem(sessionTokenKey);
-  sessionStorage.removeItem(sessionUsernameKey);
+  try {
+    for (const key of [sessionTokenKey, sessionUsernameKey, sessionVaultKey, sessionVaultUserKey]) sessionStorage.removeItem(key);
+  } catch (_) { /* Browser storage is an optional session cache. */ }
   state.sessionVersion += 1;
   state.token = "";
+  state.vaultKey = "";
   state.currentUserID = "";
   state.currentUsername = "";
   state.users = [];
@@ -182,6 +280,13 @@ function clearSession() {
   groupThreadList.replaceChildren();
   newDirectSection.hidden = true;
   groupUsers.replaceChildren();
+  peerFingerprint.textContent = "";
+  peerFingerprint.hidden = true;
+  e2eeFingerprint.textContent = "";
+  e2eePending.hidden = true;
+  e2eePendingInfo.textContent = "";
+  e2eePendingList.replaceChildren();
+  e2eeRekey.hidden = true;
 }
 function showChatView() {
   authView.hidden = true;
@@ -203,7 +308,8 @@ function newThreadCache(threadID) {
     syncedSeq: 0, nextCursor: null, lastReadSeq: 0, peerLastReadSeq: 0,
     initialHistoryRequest: null, catchupRequest: null, catchupTargetSeq: 0,
     olderRequest: null, readRequest: null, pendingReadSeq: 0,
-    pendingSend: null, draftContent: "" };
+    pendingSend: null, draftContent: "", decryptedViews: new Map(), decryptJobs: new Map(),
+    payloadConflict: false, e2eeSending: false };
 }
 function cacheForThread(threadID) {
   if (!state.threads.has(threadID)) state.threads.set(threadID, newThreadCache(threadID));
@@ -270,6 +376,7 @@ function renderPeerList() {
     button.type = "button";
     button.className = "peer";
     button.textContent = user.username;
+    button.disabled = !state.e2ee?.canRead();
     button.addEventListener("click", () => openDirect(user.id));
     peerList.append(button);
   }
@@ -282,7 +389,6 @@ async function loadUsers() {
   if (!me) { clearSession(); throw new Error("Tài khoản không còn tồn tại."); }
   state.users = users;
   state.currentUsername = me.username;
-  sessionStorage.setItem(sessionUsernameKey, me.username);
   currentUsername.textContent = me.username;
   groupUsers.replaceChildren();
   for (const user of users.filter((user) => user.id !== state.currentUserID)) {
@@ -331,6 +437,7 @@ function reconcileThreadSummary(thread) {
   cache.summary = thread;
   cache.active = true;
   cache.permissionsPending = false;
+  processE2EEMessages(cache);
   return cache;
 }
 function deactivateGroup(cache) {
@@ -343,6 +450,9 @@ function deactivateGroup(cache) {
 }
 function updateThreadFromMessage(message) {
   const cache = cacheForThread(message.thread_id);
+  if (!cache.summary || (message.content_format === "e2ee_v2" && cache.summary.kind !== "direct")) {
+    scheduleThreadSummaryRefresh();
+  }
   const seq = Number(message.seq);
   if (!Number.isSafeInteger(seq) || seq <= 0 || seq <= cache.summaryBaseSeq || cache.eventMessages.has(seq)) return;
   cache.eventMessages.set(seq, message);
@@ -364,7 +474,9 @@ function updateThreadFromMessage(message) {
 }
 function acceptMessage(message) {
   const cache = cacheForThread(message.thread_id);
-  const changed = mergeMessages(cache, [message]);
+  let changed;
+  try { changed = mergeMessages(cache, [message]); }
+  catch { return { cache, changed: false, conflict: true }; }
   if (cache.messagesLoaded && changed) {
     const seq = Number(message.seq);
     if (seq > cache.syncedSeq + 1) void catchUpConversation(cache, seq);
@@ -446,7 +558,57 @@ function displayName(userID) {
 }
 
 function mergeMessages(cache, messages) {
-  return MiniHermesRealtime.merge(cache.messages, cache.messageIDs, messages);
+  try {
+    for (const message of messages) {
+      const id = message.id || message.message_id;
+      if (message.thread_id !== cache.threadID || [...state.threads.values()].some((other) =>
+        other !== cache && other.messageIDs.has(id))) {
+        throw new Error("UUID message xuất hiện với thread khác; giữ nguyên nội dung và khóa đã lưu.");
+      }
+    }
+    const changed = MiniHermesRealtime.merge(cache.messages, cache.messageIDs, messages);
+    processE2EEMessages(cache);
+    return changed;
+  } catch (error) {
+    cache.payloadConflict = true;
+    if (state.currentCache === cache) {
+      showError(error.message);
+      renderMessages("preserve");
+    }
+    throw error;
+  }
+}
+
+function processE2EEMessages(cache, retryErrors = false) {
+  const client = state.e2ee;
+  for (const message of cache.messages.values()) {
+    if (message.content_format !== "e2ee_v2" && cache.summary?.kind !== "direct") continue;
+    if (!cache.summary?.peer?.id) {
+      cache.decryptedViews.set(message.id, { status: "pending" });
+      scheduleThreadSummaryRefresh();
+      continue;
+    }
+    if (!client?.canRead()) {
+      cache.decryptedViews.set(message.id, { status: "pending" });
+      continue;
+    }
+    if (cache.payloadConflict || cache.decryptJobs.has(message.id)) continue;
+    const previous = cache.decryptedViews.get(message.id);
+    if (previous?.status === "ready" || (previous?.status === "error" && !retryErrors)) continue;
+    const snapshot = cacheSnapshot(cache);
+    cache.decryptedViews.set(message.id, { status: "pending" });
+    const job = client.receive(cache.summary, message).then((view) => {
+      if (!membershipSnapshotMatches(snapshot) || state.e2ee !== client || cache.payloadConflict) return;
+      cache.decryptedViews.set(message.id, view);
+      if (state.currentCache === cache && cache.messagesLoaded) renderMessages("new");
+    }).catch(() => {
+      if (membershipSnapshotMatches(snapshot) && state.e2ee === client) {
+        cache.decryptedViews.set(message.id, { status: "error", error: "Không thể khôi phục khóa hoặc giải mã tin nhắn. Hãy thử lại." });
+        if (state.currentCache === cache && cache.messagesLoaded) renderMessages("preserve");
+      }
+    }).finally(() => { if (cache.decryptJobs.get(message.id) === job) cache.decryptJobs.delete(message.id); });
+    cache.decryptJobs.set(message.id, job);
+  }
 }
 
 function sortedMessages(cache) {
@@ -488,7 +650,15 @@ function renderMessages(scrollMode = "preserve") {
       item.dataset.kind = message.kind;
 
       const content = document.createElement("p");
-      content.textContent = message.content;
+      const encrypted = message.content_format === "e2ee_v2" || cache.summary?.kind === "direct";
+      const view = cache.decryptedViews.get(message.id);
+      const cryptoState = !encrypted ? "plaintext" : cache.payloadConflict ? "error"
+        : state.e2ee?.canRead() ? view?.status || "pending" : "pending";
+      item.dataset.cryptoState = cryptoState;
+      if (encrypted) item.classList.add(cryptoState === "error" ? "crypto-error" : cryptoState === "ready" ? "crypto-ready" : "crypto-pending");
+      content.textContent = !encrypted ? message.content : cryptoState === "ready" ? view.plaintext
+        : cryptoState === "error" ? `Không thể giải mã: ${cache.payloadConflict ? "UUID hoặc payload bị xung đột." : view?.error || "Thiếu khóa hoặc state chưa lưu thành công."}`
+        : `Tin nhắn E2EE đang chờ giải mã. ${e2eeLabels[state.e2ee?.snapshot().status] || "Đang khởi tạo."}`;
 
       const meta = document.createElement("small");
       const time = new Date(message.created_at).toLocaleString("vi-VN", {
@@ -501,6 +671,7 @@ function renderMessages(scrollMode = "preserve") {
       meta.textContent = `${displayName(message.sender_id)} · ${time}${readStatus}`;
       item.append(content, meta);
       historyElement.append(item);
+      if (encrypted && cryptoState === "ready") view.rendered = true;
     }
   }
 
@@ -512,7 +683,8 @@ function renderMessages(scrollMode = "preserve") {
     historyElement.scrollTop = previousTop;
   }
   loadOlderButton.hidden = cache.nextCursor === null;
-  loadOlderButton.disabled = cache.nextCursor === null || Boolean(cache.olderRequest);
+  loadOlderButton.disabled = !cache.messagesLoaded || cache.nextCursor === null || Boolean(cache.olderRequest);
+  renderThreadHeading();
   scheduleReadMarker();
 }
 
@@ -528,21 +700,31 @@ async function loadInitialHistory(cache = state.currentCache) {
   if (!cache || !state.token || cache.messagesLoaded) return;
   if (cache.initialHistoryRequest) return cache.initialHistoryRequest.promise;
   const snapshot = cacheSnapshot(cache);
+  // A read marker is a conservative boundary, not proof of a synced cache.
+  const baseline = Math.max(0, Number(cache.summary?.last_read_seq || 0));
   const request = {};
   cache.initialHistoryRequest = request;
   request.promise = (async () => {
     try {
-      const page = await apiRequest(pageURL(snapshot.threadID));
-      if (!cacheSnapshotMatches(snapshot)) return;
-      mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
-      cache.nextCursor = page.next_cursor ?? null;
-      cache.syncedSeq = Math.max(0, ...(page.messages || []).map((message) => Number(message.seq) || 0));
+      const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
+        async (beforeSeq) => {
+          const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
+          if (!membershipSnapshotMatches(snapshot)) throw new Error("session or membership changed");
+          return page;
+        }, baseline,
+        (messages, page) => {
+          mergeMessages(cache, messages);
+          cache.nextCursor = page.next_cursor ?? null;
+        },
+      );
+      if (!membershipSnapshotMatches(snapshot)) return;
+      cache.syncedSeq = maxSeq;
       cache.messagesLoaded = true;
       if (state.currentCache === cache) renderMessages("initial");
       const target = Math.max(highestMessageSeq(cache), Number(cache.summary?.last_seq || 0));
       if (target > cache.syncedSeq) await catchUpConversation(cache, target);
     } catch (error) {
-      if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
     } finally {
       if (cache.initialHistoryRequest === request) cache.initialHistoryRequest = null;
     }
@@ -566,17 +748,17 @@ async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
       const maxSeq = await MiniHermesRealtime.fetchThroughBoundary(
         async (beforeSeq) => {
           const page = await apiRequest(pageURL(snapshot.threadID, beforeSeq));
-          if (!cacheSnapshotMatches(snapshot)) throw new Error("session changed");
+          if (!membershipSnapshotMatches(snapshot)) throw new Error("session or membership changed");
           return page;
         }, baseline,
         (messages) => mergeMessages(cache, messages),
       );
-      if (!cacheSnapshotMatches(snapshot)) return;
+      if (!membershipSnapshotMatches(snapshot)) return;
       cache.syncedSeq = Math.max(cache.syncedSeq, maxSeq);
       completed = true;
       if (state.currentCache === cache) renderMessages("new");
     } catch (error) {
-      if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
     } finally {
       if (cache.catchupRequest !== request) return;
       cache.catchupRequest = null;
@@ -584,7 +766,7 @@ async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
       cache.catchupTargetSeq = 0;
       // Only a newer event received during this fetch can cause one more pass.
       // The same inaccessible target must never keep a group in a sync loop.
-      if (completed && nextTarget > cache.syncedSeq && nextTarget > targetSeq && cacheSnapshotMatches(snapshot)) {
+      if (completed && nextTarget > cache.syncedSeq && nextTarget > targetSeq && membershipSnapshotMatches(snapshot)) {
         void catchUpConversation(cache, nextTarget);
       }
     }
@@ -718,8 +900,9 @@ function handleSocketMessage(data) {
       !Number.isSafeInteger(seq) || seq <= 0) {
     return;
   }
-  updateThreadFromMessage(event);
-  const { cache, changed } = acceptMessage(event);
+  const { cache, changed, conflict } = acceptMessage(event);
+  if (!conflict) updateThreadFromMessage(event);
+  if (state.currentCache === cache) renderThreadHeading();
   if (state.currentCache === cache && cache.messagesLoaded && changed) {
     renderMessages("new");
   }
@@ -815,7 +998,7 @@ async function connectWebSocket() {
 
 async function loadOlderMessages() {
   const cache = state.currentCache;
-  if (!cache || cache.nextCursor === null || cache.olderRequest) {
+  if (!cache?.messagesLoaded || cache.nextCursor === null || cache.olderRequest) {
     return;
   }
   const snapshot = cacheSnapshot(cache);
@@ -825,7 +1008,7 @@ async function loadOlderMessages() {
 
   try {
     const page = await apiRequest(pageURL(snapshot.threadID, request.beforeSeq));
-    if (!cacheSnapshotMatches(snapshot)) {
+    if (!membershipSnapshotMatches(snapshot)) {
       return;
     }
     mergeMessages(cache, Array.isArray(page.messages) ? page.messages : []);
@@ -835,7 +1018,7 @@ async function loadOlderMessages() {
       showError("");
     }
   } catch (error) {
-    if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
+    if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) {
       showError(error.message);
     }
   } finally {
@@ -856,10 +1039,19 @@ function renderedReadSequence(snapshot) {
     !membershipSnapshotMatches(snapshot) ||
     document.visibilityState !== "visible" ||
     chatView.hidden ||
-    !cache.messagesLoaded || !canUseThread(cache) || !atConversationBottom()
+    !cache.messagesLoaded || !canUseThread(cache) || cache.payloadConflict || !atConversationBottom()
   ) {
     return 0;
   }
+  if (cache.summary.kind === "direct") {
+    if (!state.e2ee?.canRead()) return 0;
+    // Every loaded ciphertext before this marker must have decrypted, committed
+    // and rendered. A placeholder/error is never evidence for read progress.
+    for (const message of cache.messages.values()) {
+      const view = cache.decryptedViews.get(message.id);
+      if (message.content_format !== "e2ee_v2" || view?.status !== "ready" || !view.rendered) return 0;
+    }
+  } else if (!canSendPlaintext(cache)) return 0;
   const latest = historyElement.querySelector(".message:last-child");
   if (!latest) return 0;
   const historyRect = historyElement.getBoundingClientRect();
@@ -870,7 +1062,7 @@ function renderedReadSequence(snapshot) {
       messageRect.bottom > visibleBottom + historyBottomTolerance ||
       messageRect.right <= 0 || messageRect.left >= window.innerWidth) return 0;
   const seq = Number(latest.dataset.seq);
-  return Number.isSafeInteger(seq) && seq >= Number(cache.summary.joined_seq || 1) ? seq : 0;
+  return Number.isSafeInteger(seq) && seq <= cache.syncedSeq && seq >= Number(cache.summary.joined_seq || 1) ? seq : 0;
 }
 
 function markConversationRead(snapshot = conversationSnapshot()) {
@@ -888,6 +1080,76 @@ function scheduleReadMarker() {
     markConversationRead(snapshot);
   });
 }
+
+async function sendE2EEFromForm() {
+  const cache = state.currentCache, client = state.e2ee;
+  if (!canSendE2EE(cache) || cache.e2eeSending) return;
+  const snapshot = conversationSnapshot();
+  const content = contentInput.value;
+  cache.draftContent = content;
+  cache.e2eeSending = true;
+  updateSendButton();
+  showError("");
+  try {
+    const message = await client.send(structuredClone(cache.summary), content);
+    if (!membershipSnapshotMatches(snapshot) || state.e2ee !== client) return;
+    const accepted = acceptMessage(message);
+    if (!accepted.conflict) updateThreadFromMessage(message);
+    if (cache.draftContent === content) cache.draftContent = "";
+    if (state.currentCache === cache) {
+      if (contentInput.value === content) contentInput.value = "";
+      renderMessages(currentConversationMatches(snapshot) ? "bottom" : "new");
+    }
+  } catch (error) {
+    if (membershipSnapshotMatches(snapshot) && state.currentCache === cache && state.e2ee === client) {
+      showError(`${error.message} Nếu tin đã được mã hóa, dùng Gửi lại trong danh sách tin chưa xác nhận.`);
+    }
+  } finally {
+    cache.e2eeSending = false;
+    if (state.e2ee === client) renderE2EEPanel();
+    if (state.currentCache === cache) updateSendButton();
+  }
+}
+
+async function runE2EEAction(work) {
+  const client = state.e2ee;
+  if (!client) return;
+  const sessionVersion = state.sessionVersion, token = state.token;
+  showError("");
+  try { await work(client); }
+  catch (error) { if (currentSessionMatches(sessionVersion, token)) showError(error.message); }
+  finally {
+    if (currentSessionMatches(sessionVersion, token) && state.e2ee === client) {
+      renderE2EEPanel();
+      renderThreadHeading();
+      for (const cache of state.threads.values()) processE2EEMessages(cache);
+    }
+  }
+}
+
+async function retryE2EE(client, messageID) {
+  const message = await client.retry(messageID);
+  if (state.e2ee !== client || !state.token) return;
+  const accepted = acceptMessage(message);
+  if (!accepted.conflict) updateThreadFromMessage(message);
+  if (state.currentCache === accepted.cache) renderMessages("new");
+}
+
+e2eeRekey.addEventListener("click", () => {
+  const cache = state.currentCache;
+  if (!canSendE2EE(cache) || cache.e2eeSending) return;
+  cache.e2eeSending = true;
+  renderThreadHeading();
+  void runE2EEAction(async (client) => {
+    try {
+      await client.rekey(structuredClone(cache.summary));
+      if (state.currentCache === cache) showNotice("Phiên khóa mới sẵn sàng. Các tin cũ vẫn đọc được.");
+    } finally { cache.e2eeSending = false; }
+  });
+});
+e2eeDecryptRetry.addEventListener("click", () => {
+  if (state.currentCache) processE2EEMessages(state.currentCache, true);
+});
 
 async function flushReadMarker(snapshot = conversationSnapshot()) {
   const cache = snapshot.cache;
@@ -974,6 +1236,10 @@ async function openThread(threadID) {
 async function openDirect(peerID) {
   const cached = directThreadForPeer(peerID);
   if (cached) return openThread(cached.threadID);
+  if (!state.e2ee?.canRead()) {
+    showError("Vui lòng đợi khôi phục khóa tài khoản trước khi mở chat.");
+    return;
+  }
   if (state.currentCache) state.currentCache.draftContent = contentInput.value;
   const version = ++state.conversationVersion;
   const sessionVersion = state.sessionVersion, token = state.token;
@@ -1072,8 +1338,8 @@ async function changeMembership(cache, action, userID = "") {
       headers: { "Content-Type": "application/json" },
       ...(action === "add" ? { body: JSON.stringify({ user_id: userID }) } : {}) });
     if (!cacheSnapshotMatches(snapshot)) return;
-    updateThreadFromMessage(message);
-    acceptMessage(message);
+    const accepted = acceptMessage(message);
+    if (!accepted.conflict) updateThreadFromMessage(message);
     if (state.currentCache === cache) renderMessages("new");
   } catch (error) {
     if (!cacheSnapshotMatches(snapshot)) return;
@@ -1171,74 +1437,122 @@ leaveButton.addEventListener("click", () => {
   if (state.currentCache) void changeMembership(state.currentCache, "leave");
 });
 
+function setAuthBusy(busy) {
+  state.authBusy = busy;
+  registerButton.disabled = busy;
+  loginButton.disabled = busy;
+}
+function readSessionValue(key) {
+  try { return sessionStorage.getItem(key) || ""; } catch (_) { return ""; }
+}
+function cacheSession() {
+  try {
+    sessionStorage.setItem(sessionTokenKey, state.token);
+    sessionStorage.setItem(sessionUsernameKey, state.currentUsername);
+    sessionStorage.setItem(sessionVaultKey, state.vaultKey);
+    sessionStorage.setItem(sessionVaultUserKey, state.currentUserID);
+  } catch (_) { /* A fresh login can always restore account and epoch keys from the server. */ }
+}
+async function restoreAuthenticatedSession() {
+  const version = state.sessionVersion, token = state.token;
+  await loadUsers();
+  if (!currentSessionMatches(version, token)) return;
+  await startE2EE();
+  if (!currentSessionMatches(version, token)) return;
+  cacheSession();
+  showChatView();
+  showNotice("");
+  await loadThreads();
+  if (currentSessionMatches(version, token)) void connectWebSocket();
+}
+async function finishLogin(username, credential, expectedVersion) {
+  const response = await apiRequest("/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, auth_credential: credential.auth_credential }),
+  }, false);
+  if (expectedVersion !== state.sessionVersion) return;
+  const userID = decodeSubject(response.access_token);
+  if (!userID || response.user_id !== userID || !MiniHermesE2EEClient.validKey(credential.vault_key)) {
+    throw new Error("Thông tin đăng nhập không hợp lệ.");
+  }
+  clearSession();
+  state.token = response.access_token;
+  state.currentUserID = userID;
+  state.currentUsername = username;
+  state.vaultKey = credential.vault_key;
+  const version = state.sessionVersion, token = state.token;
+  try { await restoreAuthenticatedSession(); }
+  catch (error) {
+    if (currentSessionMatches(version, token)) {
+      clearSession();
+      showError(error.message);
+    }
+  }
+}
+
 registerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  showError("");
-  showNotice("");
-  const username = registerForm.elements.username.value;
+  if (state.authBusy) return;
+  const version = state.sessionVersion;
+  const username = MiniHermesE2EEClient.normalizeUsername(registerForm.elements.username.value);
   const password = registerForm.elements.password.value;
-  const sessionVersion = state.sessionVersion;
-
+  setAuthBusy(true);
+  showError(""); showNotice("Đang tạo tài khoản...");
   try {
+    const account = await MiniHermesE2EEClient.createAccount(username, password);
+    if (version !== state.sessionVersion) return;
     await apiRequest("/auth/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, auth_credential: account.auth_credential, kdf: account.kdf,
+        public_bundle: account.public_bundle, account_vault: account.account_vault }),
     }, false);
-    if (sessionVersion !== state.sessionVersion) return;
-    loginForm.elements.username.value = username;
-    loginForm.elements.password.focus();
+    if (version !== state.sessionVersion) return;
     registerForm.reset();
-    showNotice("Đăng ký thành công. Hãy đăng nhập bằng tài khoản vừa tạo.");
+    loginForm.elements.username.value = username;
+    showNotice("Tài khoản đã được tạo. Đang đăng nhập...");
+    await finishLogin(username, account, version);
   } catch (error) {
-    if (sessionVersion === state.sessionVersion) showError(error.message);
+    if (version === state.sessionVersion) showError(error.message);
+  } finally {
+    registerForm.elements.password.value = "";
+    setAuthBusy(false);
   }
 });
 
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  showError("");
-  showNotice("");
-  const loginVersion = state.sessionVersion;
-  let activeLoginVersion = loginVersion;
-  const username = loginForm.elements.username.value;
+  if (state.authBusy) return;
+  const version = state.sessionVersion;
+  const username = MiniHermesE2EEClient.normalizeUsername(loginForm.elements.username.value);
   const password = loginForm.elements.password.value;
-
+  setAuthBusy(true);
+  showError(""); showNotice("Đang đăng nhập và khôi phục khóa...");
   try {
-    const response = await apiRequest("/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
-    }, false);
-    if (loginVersion !== state.sessionVersion) return;
-    const userID = decodeSubject(response.access_token);
-    if (!userID) {
-      throw new Error("Token đăng nhập không hợp lệ.");
-    }
-
-    clearSession();
-    activeLoginVersion = state.sessionVersion;
-    state.token = response.access_token;
-    state.currentUserID = userID;
-    state.currentUsername = username.trim().toLowerCase();
-    sessionStorage.setItem(sessionTokenKey, state.token);
-    sessionStorage.setItem(sessionUsernameKey, state.currentUsername);
-    loginForm.reset();
-    resetConversation();
-    showChatView();
-    await loadUsers();
-    if (state.token !== response.access_token) return;
-    await loadThreads();
-    if (state.token !== response.access_token) return;
-    void connectWebSocket();
+    const params = await apiRequest("/auth/params?username=" + encodeURIComponent(username), {}, false);
+    if (version !== state.sessionVersion) return;
+    if (params.username !== username) throw new Error("Hồ sơ đăng nhập không khớp tài khoản.");
+    const credential = await MiniHermesE2EEClient.deriveCredentials(username, password, params.kdf);
+    if (version !== state.sessionVersion) return;
+    await finishLogin(username, credential, version);
+    if (state.currentUsername === username && state.e2ee?.canRead()) loginForm.reset();
   } catch (error) {
-    if (activeLoginVersion === state.sessionVersion) showError(error.message);
+    if (version === state.sessionVersion) showError(error.message);
+  } finally {
+    loginForm.elements.password.value = "";
+    setAuthBusy(false);
   }
 });
 
 messageForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!canUseThread(state.currentCache)) return;
+  if (state.currentCache?.summary?.kind === "direct") {
+    await sendE2EEFromForm();
+    return;
+  }
+  if (!canSendPlaintext(state.currentCache)) {
+    if (!state.currentCache?.summary) scheduleThreadSummaryRefresh();
+    return;
+  }
   const snapshot = conversationSnapshot();
   const cache = snapshot.cache;
   if (cache.pendingSend?.inFlight) {
@@ -1269,8 +1583,8 @@ messageForm.addEventListener("submit", async (event) => {
     if (cache.draftContent === pending.content) {
       cache.draftContent = "";
     }
-    updateThreadFromMessage(message);
-    acceptMessage(message);
+    const accepted = acceptMessage(message);
+    if (!accepted.conflict) updateThreadFromMessage(message);
     if (state.currentCache === cache) {
       if (contentInput.value === pending.content) {
         contentInput.value = "";
@@ -1341,16 +1655,19 @@ window.addEventListener("online", () => {
   ensureWebSocket();
 });
 
-state.token = sessionStorage.getItem(sessionTokenKey) || "";
+state.token = readSessionValue(sessionTokenKey);
 state.currentUserID = decodeSubject(state.token);
-state.currentUsername = sessionStorage.getItem(sessionUsernameKey) || "";
-if (state.token && state.currentUserID) {
+state.currentUsername = readSessionValue(sessionUsernameKey);
+state.vaultKey = readSessionValue(sessionVaultKey);
+if (state.token && state.currentUserID === readSessionValue(sessionVaultUserKey) &&
+    MiniHermesE2EEClient.validKey(state.vaultKey)) {
   state.sessionVersion += 1;
-  const sessionVersion = state.sessionVersion, token = state.token;
-  showChatView();
-  Promise.all([loadUsers(), loadThreads()])
-    .then(() => { if (currentSessionMatches(sessionVersion, token)) return connectWebSocket(); })
-    .catch((error) => { if (currentSessionMatches(sessionVersion, token)) showError(error.message); });
+  const version = state.sessionVersion, token = state.token;
+  setAuthBusy(true);
+  showNotice("Đang khôi phục phiên đăng nhập...");
+  void restoreAuthenticatedSession().catch((error) => {
+    if (currentSessionMatches(version, token)) { clearSession(); showError(error.message); }
+  }).finally(() => setAuthBusy(false));
 } else {
   clearSession();
 }

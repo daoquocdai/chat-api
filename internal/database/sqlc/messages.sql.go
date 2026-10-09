@@ -20,6 +20,7 @@ WITH created AS (
         seq,
         kind,
         content_format,
+        epoch_id,
         content
     )
     VALUES (
@@ -28,8 +29,9 @@ WITH created AS (
         $3,
         $4,
         'text',
-        'plaintext',
-        $5
+        $5,
+        $6,
+        $7
     )
     RETURNING id, external_id, thread_id, sender_id, seq,
               kind, content_format, content, created_at
@@ -55,6 +57,8 @@ type CreateThreadMessageParams struct {
 	ThreadID          int64
 	SenderID          int64
 	Seq               int64
+	ContentFormat     string
+	EpochID           pgtype.UUID
 	Content           string
 }
 
@@ -77,6 +81,8 @@ func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessa
 		arg.ThreadID,
 		arg.SenderID,
 		arg.Seq,
+		arg.ContentFormat,
+		arg.EpochID,
 		arg.Content,
 	)
 	var i CreateThreadMessageRow
@@ -93,6 +99,39 @@ func (q *Queries) CreateThreadMessage(ctx context.Context, arg CreateThreadMessa
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const getE2EEMessageParticipants = `-- name: GetE2EEMessageParticipants :many
+SELECT member.id, member.external_id
+FROM participants AS participant
+JOIN users AS member ON member.id = participant.user_id
+WHERE participant.thread_id = $1 AND participant.left_seq IS NULL
+ORDER BY member.id
+`
+
+type GetE2EEMessageParticipantsRow struct {
+	ID         int64
+	ExternalID pgtype.UUID
+}
+
+func (q *Queries) GetE2EEMessageParticipants(ctx context.Context, threadID int64) ([]GetE2EEMessageParticipantsRow, error) {
+	rows, err := q.db.Query(ctx, getE2EEMessageParticipants, threadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []GetE2EEMessageParticipantsRow
+	for rows.Next() {
+		var i GetE2EEMessageParticipantsRow
+		if err := rows.Scan(&i.ID, &i.ExternalID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getMembershipVersion = `-- name: GetMembershipVersion :one
@@ -333,7 +372,7 @@ func (q *Queries) ListThreadMessagesPage(ctx context.Context, arg ListThreadMess
 }
 
 const lockThreadForParticipant = `-- name: LockThreadForParticipant :one
-SELECT t.id
+SELECT t.id, t.kind
 FROM threads AS t
 JOIN participants AS p
   ON p.thread_id = t.id
@@ -348,11 +387,16 @@ type LockThreadForParticipantParams struct {
 	ThreadExternalID pgtype.UUID
 }
 
-func (q *Queries) LockThreadForParticipant(ctx context.Context, arg LockThreadForParticipantParams) (int64, error) {
+type LockThreadForParticipantRow struct {
+	ID   int64
+	Kind string
+}
+
+func (q *Queries) LockThreadForParticipant(ctx context.Context, arg LockThreadForParticipantParams) (LockThreadForParticipantRow, error) {
 	row := q.db.QueryRow(ctx, lockThreadForParticipant, arg.UserID, arg.ThreadExternalID)
-	var id int64
-	err := row.Scan(&id)
-	return id, err
+	var i LockThreadForParticipantRow
+	err := row.Scan(&i.ID, &i.Kind)
+	return i, err
 }
 
 const threadExistsByExternalID = `-- name: ThreadExistsByExternalID :one

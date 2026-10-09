@@ -2,19 +2,14 @@
 
 ## Bối cảnh
 
-Direct/group cần badge unread đúng khi nhận event lặp, đọc ở tab khác, rời nhóm hoặc được thêm lại. Client có thể chỉ tải một phần lịch sử.
+Client có thể chỉ tải một phần lịch sử; unread phải đúng khi event trùng hoặc user tham gia lại nhóm.
 
 ## Quyết định
 
-- PostgreSQL tính unread bằng `COUNT(*)`, không lưu bộ đếm riêng. Summary chỉ dùng membership đang active: message có `seq >= joined_seq`, `seq > last_read_seq` và sender khác người gọi. Cả text lẫn system đều được tính; thao tác do chính mình tạo không tăng unread.
-- Read marker thuộc participant và chỉ tăng bằng `GREATEST`. PUT cần membership active, mốc không trước `joined_seq - 1` và không vượt `threads.last_seq`; transaction giữ khóa thread.
-- Thêm lại nhóm tạo khoảng membership/read marker mới, bắt đầu trước system message thêm người. Thông báo thêm tính unread nếu do người khác tạo. Lịch sử vẫn xem được trong hợp các khoảng từng tham gia; không được xem khoảng vắng mặt, không mang unread cũ sang lần tham gia mới.
-- Web cập nhật badge từ event/response, khử event trùng và đối chiếu summary khi còn unread cần đếm lại, thiếu thông tin, server trả marker cao hơn mốc gửi, membership thay đổi hoặc reconnect. Nếu PUT đã phủ last seq đang biết và xác định unread bằng 0, không GET chỉ vì trước PUT có unread. Các lần đối chiếu đang chạy được gộp; response cũ bị bỏ theo phiên, membership và thay đổi read marker.
-- Chỉ đánh dấu tới **tin cuối đã render và hiển thị** của thread active khi tab visible và người dùng ở cuối chat. Không dùng seq chưa render từ summary. Với 45 unread, trang đầu 30 tin mới nhất có thể đưa marker tới tin cuối và unread về 0, dù 15 tin trước chưa tải.
-- `XACK` chỉ thuộc xử lý Redis Stream, độc lập với read marker và unread.
+- PostgreSQL COUNT tin text/system do người khác tạo, sau `last_read_seq` trong membership đang hoạt động.
+- PUT read giữ khóa thread, dùng `GREATEST` và yêu cầu `joined_seq - 1 <= N <= threads.last_seq`.
+- Tham gia lại tạo marker mới. Client chỉ tăng tới seq đã render sau initial sync, khi thread mở, tab hiển thị và ở cuối chat; không vượt `syncedSeq`. Với E2EE, tài khoản phải được mở khóa và tin đã giải mã thành công. Mỗi tab có thể đọc độc lập; marker trên server chỉ tăng.
 
 ## Đánh đổi
 
-COUNT trong PostgreSQL là nguồn đối chiếu rõ ràng, không cần đồng bộ một counter riêng, nhưng query summary có chi phí theo dữ liệu. Badge local có thể tạm chưa chính xác khi đang lấy bù/PUT/đối chiếu; summary sửa lại khi cần, không polling hoặc GET sau mỗi tin.
-
-Quy ước “đã đọc tới seq” đơn giản cho demo, không chứng minh người dùng đã xem từng tin. Unread còn lại không thể suy ra từ `last_seq - last_read_seq` vì có tin tự gửi, system và khoảng membership; web không đếm chỉ trên trang đã tải.
+Không cần counter riêng nhưng COUNT có chi phí truy vấn. Client đối chiếu summary khi cần; unread không bằng hiệu hai seq và marker không chứng minh đã xem từng tin. Chi tiết: [luồng xử lý](../request-flow.md).

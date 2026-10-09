@@ -85,6 +85,7 @@ func TestCreateOrGetDirect(t *testing.T) {
 		{name: "peer lookup fails", peerID: peerExternalID, peerLookupError: usermodel.ErrUserNotFound, wantError: usermodel.ErrUserNotFound, wantUserCalls: 2},
 		{name: "same internal user", peerID: peerExternalID, peerInternalID: 11, wantError: threadmodel.ErrSameUser, wantUserCalls: 2},
 		{name: "repository error", peerID: peerExternalID, peerInternalID: 22, repositoryError: databaseError, wantError: databaseError, wantUserCalls: 2, wantRepoCalls: 1},
+		{name: "E2EE bundle required", peerID: peerExternalID, peerInternalID: 22, repositoryError: threadmodel.ErrE2EEBundleRequired, wantError: threadmodel.ErrE2EEBundleRequired, wantUserCalls: 2, wantRepoCalls: 1},
 	}
 
 	for _, tt := range tests {

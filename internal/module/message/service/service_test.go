@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daoquocdai/chat-api/internal/e2ee"
 	messageevent "github.com/daoquocdai/chat-api/internal/module/message/event"
 	"github.com/daoquocdai/chat-api/internal/module/message/model"
 	"github.com/daoquocdai/chat-api/internal/module/message/service"
@@ -25,7 +26,7 @@ type fakeMessageRepository struct {
 	version                   func(context.Context, string, int64) (int64, error)
 	load                      func(context.Context, string, int64) ([]string, error)
 	versionCalls, memberCalls int
-	send                      func(context.Context, string, int64, string, string) (model.Message, bool, error)
+	send                      func(context.Context, string, int64, string, string, string) (model.Message, bool, error)
 	list                      func(context.Context, string, int64, *int64, int) (model.Page, error)
 	sendCalls                 int
 	listCalls                 int
@@ -51,10 +52,10 @@ func (r *fakeMessageRepository) Send(
 	ctx context.Context,
 	threadID string,
 	senderID int64,
-	messageID, content string,
+	messageID, contentFormat, content string,
 ) (model.Message, bool, error) {
 	r.sendCalls++
-	return r.send(ctx, threadID, senderID, messageID, content)
+	return r.send(ctx, threadID, senderID, messageID, contentFormat, content)
 }
 
 func (r *fakeMessageRepository) List(
@@ -93,7 +94,7 @@ func (f *fakeUserFinder) GetByExternalID(ctx context.Context, externalID string)
 	return f.get(ctx, externalID)
 }
 
-func TestSend(t *testing.T) {
+func TestSendGroupPlaintext(t *testing.T) {
 	databaseError := errors.New("database unavailable")
 
 	tests := []struct {
@@ -137,7 +138,7 @@ func TestSend(t *testing.T) {
 				ID:               9,
 				ExternalID:       messageExternalID,
 				ThreadExternalID: threadExternalID,
-				ThreadKind:       "direct",
+				ThreadKind:       "group",
 				SenderExternalID: actorExternalID,
 				Seq:              1,
 				Kind:             "text",
@@ -149,9 +150,9 @@ func TestSend(t *testing.T) {
 				gotCtx context.Context,
 				threadID string,
 				senderID int64,
-				messageID, content string,
+				messageID, contentFormat, content string,
 			) (model.Message, bool, error) {
-				if gotCtx != ctx || threadID != threadExternalID || senderID != 11 || messageID != messageExternalID || content != tt.wantContent {
+				if gotCtx != ctx || threadID != threadExternalID || senderID != 11 || messageID != messageExternalID || contentFormat != "plaintext" || content != tt.wantContent {
 					t.Fatalf("unexpected Send arguments: %q %d %q %q", threadID, senderID, messageID, content)
 				}
 				return wantMessage, true, tt.repositoryError
@@ -163,6 +164,7 @@ func TestSend(t *testing.T) {
 				actorExternalID,
 				tt.threadID,
 				tt.messageID,
+				"",
 				tt.content,
 			)
 			if !errors.Is(err, tt.wantError) {
@@ -288,6 +290,7 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 					int64,
 					string,
 					string,
+					string,
 				) (model.Message, bool, error) {
 					order = append(order, "repository")
 					if tt.repositoryError != nil {
@@ -306,7 +309,7 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 					ThreadID:      wantMessage.ThreadExternalID,
 					ThreadKind:    wantMessage.ThreadKind,
 					SenderID:      wantMessage.SenderExternalID,
-					RecipientIDs:  []string{"22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"},
+					RecipientIDs:  []string{actorExternalID, "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"},
 					Seq:           wantMessage.Seq,
 					Kind:          wantMessage.Kind,
 					ContentFormat: wantMessage.ContentFormat,
@@ -324,6 +327,7 @@ func TestSendPersistenceAndPublishing(t *testing.T) {
 				actorExternalID,
 				threadExternalID,
 				messageExternalID,
+				"plaintext",
 				"hello",
 			)
 			if !errors.Is(err, tt.wantError) {
@@ -351,6 +355,7 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 	message := model.Message{
 		ExternalID:       messageExternalID,
 		ThreadExternalID: threadExternalID,
+		ThreadKind:       "group",
 		SenderExternalID: actorExternalID,
 		Seq:              4,
 		Kind:             "text",
@@ -363,6 +368,7 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 		context.Context,
 		string,
 		int64,
+		string,
 		string,
 		string,
 	) (model.Message, bool, error) {
@@ -382,10 +388,10 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 	messageService := service.New(repository, users, publisher, nil, time.Second)
 
 	first, firstCreated, firstError := messageService.Send(
-		ctx, actorExternalID, threadExternalID, messageExternalID, "retry me",
+		ctx, actorExternalID, threadExternalID, messageExternalID, "", "retry me",
 	)
 	second, secondCreated, secondError := messageService.Send(
-		ctx, actorExternalID, threadExternalID, messageExternalID, "retry me",
+		ctx, actorExternalID, threadExternalID, messageExternalID, "plaintext", "retry me",
 	)
 
 	if !errors.Is(firstError, model.ErrEventPublishFailed) || secondError != nil {
@@ -399,6 +405,108 @@ func TestRetryAfterPublishFailurePublishesAgainWithoutIncrementingSequence(t *te
 	}
 	if publisher.calls != 2 {
 		t.Fatalf("publisher calls = %d, want 2", publisher.calls)
+	}
+}
+
+func e2eeContent(t *testing.T) string {
+	t.Helper()
+	sessionKey := [32]byte{1, 2, 3, 4, 5}
+	envelope, err := e2ee.SealMessage(e2ee.EpochMessageContext{
+		ThreadID: threadExternalID, EpochID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		MessageID: messageExternalID, SenderID: actorExternalID,
+		RecipientID: "22222222-2222-4222-8222-222222222222",
+	}, sessionKey, []byte("encrypted test message"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := e2ee.EncodeMessageEnvelope(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Server must preserve opaque bytes, including valid surrounding whitespace.
+	return "\n" + content + strings.Repeat(" ", 1200) + "\n"
+}
+
+func TestSendE2EEValidationAndOpaquePublishing(t *testing.T) {
+	content := e2eeContent(t)
+	tests := []struct {
+		name, format, content string
+		repoErr, wantErr      error
+	}{
+		{name: "opaque bytes exceed plaintext rune limit", format: "e2ee_v2", content: content},
+		{name: "legacy v1 format rejected", format: "e2ee_v1", content: content, wantErr: model.ErrInvalidContentFormat},
+		{name: "unknown format", format: "E2EE_V2", content: content, wantErr: model.ErrInvalidContentFormat},
+		{name: "plaintext in e2ee format", format: "e2ee_v2", content: "hello", wantErr: model.ErrInvalidEnvelope},
+		{name: "missing fields", format: "e2ee_v2", content: "{}", wantErr: model.ErrInvalidEnvelope},
+		{name: "extra field", format: "e2ee_v2", content: strings.Replace(content, "{", `{"extra":true,`, 1), wantErr: model.ErrInvalidEnvelope},
+		{name: "duplicate field", format: "e2ee_v2", content: strings.Replace(content, "{", `{"version":2,`, 1), wantErr: model.ErrInvalidEnvelope},
+		{name: "oversized envelope", format: "e2ee_v2", content: content + strings.Repeat(" ", 8192), wantErr: model.ErrInvalidEnvelope},
+		{name: "invalid UTF8", format: "e2ee_v2", content: content + "\xff", wantErr: model.ErrInvalidEnvelope},
+		{name: "trailing JSON", format: "e2ee_v2", content: content + "{}", wantErr: model.ErrInvalidEnvelope},
+		{name: "wrong thread kind preserved", format: "e2ee_v2", content: content, repoErr: model.ErrContentFormatConflict, wantErr: model.ErrContentFormatConflict},
+		{name: "wrong header preserved", format: "e2ee_v2", content: content, repoErr: model.ErrInvalidEnvelopeHeader, wantErr: model.ErrInvalidEnvelopeHeader},
+		{name: "inactive membership preserved", format: "e2ee_v2", content: content, repoErr: threadmodel.ErrNotParticipant, wantErr: threadmodel.ErrNotParticipant},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &fakeUserFinder{get: func(context.Context, string) (usermodel.User, error) { return usermodel.User{ID: 11}, nil }}
+			repo := &fakeMessageRepository{send: func(_ context.Context, thread string, actor int64, id, format, raw string) (model.Message, bool, error) {
+				if thread != threadExternalID || actor != 11 || id != messageExternalID || format != tt.format || raw != tt.content {
+					t.Fatal("envelope bytes/format/context changed")
+				}
+				return model.Message{ExternalID: id, ThreadExternalID: thread, ThreadKind: "direct", SenderExternalID: actorExternalID, Seq: 1, Kind: "text", ContentFormat: format, Content: raw}, true, tt.repoErr
+			}}
+			publisher := &fakePublisher{}
+			got, _, err := service.New(repo, users, publisher, nil, time.Second).Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, tt.format, tt.content)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil && tt.repoErr == nil && (repo.sendCalls != 0 || users.calls != 0) {
+				t.Fatal("invalid request reached repository/user lookup")
+			}
+			if tt.wantErr != nil && publisher.calls != 0 {
+				t.Fatal("rejected message was published")
+			}
+			if err == nil && (got.Content != content || got.ContentFormat != "e2ee_v2" || publisher.calls != 1 || publisher.events[0].Content != content || publisher.events[0].ContentFormat != "e2ee_v2") {
+				t.Fatal("response/event did not preserve opaque content/format")
+			}
+		})
+	}
+}
+
+func TestE2EERetryAfterPublishFailureKeepsExactPayload(t *testing.T) {
+	content := e2eeContent(t)
+	var saved *model.Message
+	repo := &fakeMessageRepository{send: func(_ context.Context, thread string, actor int64, id, format, raw string) (model.Message, bool, error) {
+		if saved != nil {
+			if saved.Content != raw || saved.ContentFormat != format {
+				return model.Message{}, false, model.ErrMessageIDConflict
+			}
+			return *saved, false, nil
+		}
+		saved = &model.Message{ID: 9, ExternalID: id, ThreadExternalID: thread, ThreadKind: "direct", SenderExternalID: actorExternalID, Seq: 1, Kind: "text", ContentFormat: format, Content: raw}
+		return *saved, true, nil
+	}}
+	users := &fakeUserFinder{get: func(context.Context, string) (usermodel.User, error) { return usermodel.User{ID: 11}, nil }}
+	publisher := &fakePublisher{}
+	publisher.publish = func(context.Context, messageevent.MessageCreated) error {
+		if publisher.calls == 1 {
+			return errors.New("publish unavailable")
+		}
+		return nil
+	}
+	svc := service.New(repo, users, publisher, nil, time.Second)
+	first, created, err := svc.Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, "e2ee_v2", content)
+	if !created || !errors.Is(err, model.ErrEventPublishFailed) {
+		t.Fatal("expected committed message with publish failure")
+	}
+	second, created, err := svc.Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, "e2ee_v2", content)
+	if created || err != nil || !reflect.DeepEqual(first, second) {
+		t.Fatal("retry did not return saved message")
+	}
+	_, _, err = svc.Send(context.Background(), actorExternalID, threadExternalID, messageExternalID, "e2ee_v2", content+" ")
+	if !errors.Is(err, model.ErrMessageIDConflict) || publisher.calls != 2 || publisher.events[0].Content != publisher.events[1].Content {
+		t.Fatal("changed bytes were not rejected or retry changed event")
 	}
 }
 
@@ -429,17 +537,17 @@ func TestPublishMessageSnapshots(t *testing.T) {
 		wantRecipients                       []string
 		wantError                            bool
 	}{
-		{name: "miss loads and fills", loaded: []string{actorExternalID, peer}, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{peer}},
-		{name: "hit avoids UUID query", cached: []string{actorExternalID, peer}, kind: "text", version: 1, wantPublish: 1, wantRecipients: []string{peer}},
-		{name: "read error ignores cache", cached: []string{actorExternalID}, loaded: []string{actorExternalID, peer}, readErr: cacheErr, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{peer}},
-		{name: "write error still publishes", loaded: []string{actorExternalID, peer}, writeErr: cacheErr, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{peer}},
+		{name: "miss loads and fills", loaded: []string{actorExternalID, peer}, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{actorExternalID, peer}},
+		{name: "hit avoids UUID query", cached: []string{actorExternalID, peer}, kind: "text", version: 1, wantPublish: 1, wantRecipients: []string{actorExternalID, peer}},
+		{name: "read error ignores cache", cached: []string{actorExternalID}, loaded: []string{actorExternalID, peer}, readErr: cacheErr, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{actorExternalID, peer}},
+		{name: "write error still publishes", loaded: []string{actorExternalID, peer}, writeErr: cacheErr, kind: "text", version: 1, wantDB: 1, wantPut: 1, wantPublish: 1, wantRecipients: []string{actorExternalID, peer}},
 		{name: "snapshot error does not publish", dbErr: dbErr, kind: "text", version: 1, wantDB: 1, wantError: true},
 		{name: "version error does not publish", versionErr: dbErr, kind: "text", wantError: true},
 		{name: "empty snapshot does not publish", loaded: []string{}, kind: "text", version: 1, wantDB: 1, wantError: true},
 		{name: "invalid version does not publish", kind: "text", version: 0, wantError: true},
 		{name: "future version does not publish", kind: "text", version: 4, wantError: true},
 		{name: "system includes actor", cached: []string{actorExternalID, peer}, kind: "system", version: 1, wantPublish: 1, wantRecipients: []string{actorExternalID, peer}},
-		{name: "solo text has empty recipient array", cached: []string{actorExternalID}, kind: "text", version: 1, wantPublish: 1, wantRecipients: []string{}},
+		{name: "solo text includes actor devices", cached: []string{actorExternalID}, kind: "text", version: 1, wantPublish: 1, wantRecipients: []string{actorExternalID}},
 	}
 	for _, threadKind := range []string{"direct", "group"} {
 		for _, tc := range cases {
@@ -475,7 +583,7 @@ func TestPublishMessageSnapshots(t *testing.T) {
 					t.Fatalf("recipients=%v want=%v", out.events[0].RecipientIDs, tc.wantRecipients)
 				}
 				if tc.readErr == nil && tc.cached != nil && !reflect.DeepEqual(cache.snapshots[1], tc.cached) {
-					t.Fatal("sender filtering changed shared cache")
+					t.Fatal("publishing changed the shared membership snapshot")
 				}
 			})
 		}
@@ -506,11 +614,11 @@ func TestPublishMessageMembershipChangeAndOldRetry(t *testing.T) {
 		sender, kind string
 		want         []string
 	}{
-		{2, actorExternalID, "text", []string{bob}},
-		{3, bob, "text", []string{actorExternalID}},
+		{2, actorExternalID, "text", []string{actorExternalID, bob}},
+		{3, bob, "text", []string{actorExternalID, bob}},
 		{5, actorExternalID, "system", []string{actorExternalID, bob}},
-		{7, actorExternalID, "text", []string{charlie}},
-		{2, actorExternalID, "text", []string{bob}},
+		{7, actorExternalID, "text", []string{actorExternalID, charlie}},
+		{2, actorExternalID, "text", []string{actorExternalID, bob}},
 	}
 	for _, step := range steps {
 		err := svc.PublishMessage(context.Background(), model.Message{ThreadExternalID: threadExternalID, ThreadKind: "group", Seq: step.seq, SenderExternalID: step.sender, Kind: step.kind})
@@ -528,7 +636,7 @@ func TestPublishMessageMembershipChangeAndOldRetry(t *testing.T) {
 	if err := svc.PublishMessage(context.Background(), model.Message{ThreadExternalID: threadExternalID, ThreadKind: "group", Seq: 2, SenderExternalID: actorExternalID, Kind: "text"}); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(out.events[len(out.events)-1].RecipientIDs, []string{bob}) || repo.memberCalls != 3 {
+	if !reflect.DeepEqual(out.events[len(out.events)-1].RecipientIDs, []string{actorExternalID, bob}) || repo.memberCalls != 3 {
 		t.Fatal("expired old snapshot used current membership")
 	}
 }

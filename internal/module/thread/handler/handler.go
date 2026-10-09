@@ -139,6 +139,8 @@ func writeError(c *gin.Context, err error) {
 
 	case errors.Is(err, model.ErrNotParticipant):
 		c.JSON(http.StatusForbidden, gin.H{"error": model.ErrNotParticipant.Error()})
+	case errors.Is(err, model.ErrE2EEBundleRequired):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 	case errors.Is(err, model.ErrAdminRequired):
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 	case errors.Is(err, model.ErrMemberNotFound):

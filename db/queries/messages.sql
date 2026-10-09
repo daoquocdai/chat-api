@@ -13,7 +13,7 @@ WHERE t.external_id = sqlc.arg(thread_external_id)
 LIMIT 1;
 
 -- name: LockThreadForParticipant :one
-SELECT t.id
+SELECT t.id, t.kind
 FROM threads AS t
 JOIN participants AS p
   ON p.thread_id = t.id
@@ -76,6 +76,7 @@ WITH created AS (
         seq,
         kind,
         content_format,
+        epoch_id,
         content
     )
     VALUES (
@@ -84,7 +85,8 @@ WITH created AS (
         sqlc.arg(sender_id),
         sqlc.arg(seq),
         'text',
-        'plaintext',
+        sqlc.arg(content_format),
+        sqlc.narg(epoch_id),
         sqlc.arg(content)
     )
     RETURNING id, external_id, thread_id, sender_id, seq,
@@ -134,3 +136,10 @@ WHERE t.external_id = sqlc.arg(thread_external_id)
   )
 ORDER BY m.seq DESC
 LIMIT sqlc.arg(page_size)::INTEGER + 1;
+
+-- name: GetE2EEMessageParticipants :many
+SELECT member.id, member.external_id
+FROM participants AS participant
+JOIN users AS member ON member.id = participant.user_id
+WHERE participant.thread_id = $1 AND participant.left_seq IS NULL
+ORDER BY member.id;

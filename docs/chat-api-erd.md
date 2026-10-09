@@ -1,8 +1,6 @@
-# ERD Mini-Hermes — 5 bảng
+# ERD Mini-Hermes
 
-Bản nháp để review trước khi viết migration.
-
-## Sơ đồ ERD
+Schema hiện tại có bảy bảng nghiệp vụ, sau migration `20261009100000`. Direct luôn dùng E2EE; group dùng plaintext, nên cách mã hóa được xác định từ `threads.kind`. API dùng external UUID; `BIGINT` dùng nội bộ. PK: khóa chính; FK: khóa ngoại; UK: duy nhất.
 
 ```mermaid
 erDiagram
@@ -12,14 +10,19 @@ erDiagram
     THREADS ||--o{ MESSAGES : "chứa"
     USERS ||--o{ MESSAGES : "gửi hoặc thực hiện"
     USERS ||--o{ PREKEYS : "sở hữu"
+    THREADS ||--o{ E2EE_EPOCHS : "các phiên khóa"
+    E2EE_EPOCHS o|--o{ MESSAGES : "phiên của tin mã hóa"
+    E2EE_EPOCHS ||--o{ E2EE_EPOCH_BACKUPS : "backup từng bên"
+    USERS ||--o{ E2EE_EPOCH_BACKUPS : "sở hữu backup"
 
     USERS {
         bigint id PK
         uuid external_id UK
         text username UK
-        text password_hash
-        bytea identity_public_key "nullable"
-        bigint last_prekey_id
+        text auth_credential_hash
+        jsonb kdf "tham số công khai"
+        jsonb public_bundle "bundle gốc bất biến"
+        jsonb account_vault "private keys đã mã hóa"
         timestamptz created_at
     }
 
@@ -29,8 +32,8 @@ erDiagram
         text kind "direct hoặc group"
         text name "nullable"
         bigint created_by FK
-        text encryption_mode "plaintext hoặc e2ee"
         bigint last_seq
+        uuid current_epoch_id FK "nullable"
         timestamptz created_at
     }
 
@@ -53,7 +56,8 @@ erDiagram
         bigint sender_id FK
         bigint seq
         text kind "text hoặc system"
-        text content_format "plaintext hoặc e2ee_v1"
+        text content_format "plaintext hoặc e2ee_v2"
+        uuid epoch_id FK "nullable với plaintext"
         text content
         jsonb metadata
         timestamptz created_at
@@ -63,91 +67,48 @@ erDiagram
         bigint id PK
         bigint user_id FK
         bigint key_id
-        text kind "signed hoặc one_time"
         bytea public_key
-        bytea signature "nullable với one_time"
         timestamptz created_at
-        timestamptz retired_at "nullable"
+    }
+
+    E2EE_EPOCHS {
+        uuid id PK
+        bigint thread_id FK
+        bigint sender_id FK "người khởi tạo"
+        bigint recipient_id FK
+        text bootstrap "X3DH header và confirmation"
+        timestamptz created_at
+    }
+
+    E2EE_EPOCH_BACKUPS {
+        uuid epoch_id PK,FK
+        bigint user_id PK,FK
+        jsonb key_backup "SK đã mã hóa"
     }
 ```
 
-Mermaid đặt **kiểu dữ liệu trước tên cột** theo cú pháp của nó. Trong các bảng giải thích bên dưới, **tên cột đứng trước kiểu dữ liệu**. PK: khóa chính; FK: khóa ngoại; UK: duy nhất; nullable: được phép để trống.
+## Vai trò các bảng
 
-## Giải thích 5 bảng
+| Bảng | Nội dung |
+| --- | --- |
+| `users` | Tài khoản, bcrypt credential dẫn xuất, KDF công khai, public bundle gốc và vault mã hóa |
+| `threads` | Metadata, loại direct/group, `last_seq` và epoch hiện tại |
+| `participants` | Role, khoảng quyền xem `joined_seq..left_seq` và read marker của từng lần tham gia |
+| `messages` | Tin text/system theo seq; E2EE lưu JSON envelope trong `content` và tham chiếu epoch |
+| `prekeys` | Hàng đợi public OPK còn khả dụng; claim xóa một dòng |
+| `e2ee_epochs` | Bootstrap bất biến của mỗi phiên X3DH; sender/recipient là vai trò khởi tạo phiên |
+| `e2ee_epoch_backups` | Backup SK mã hóa riêng của mỗi user trong epoch; PK ghép `(epoch_id, user_id)` |
 
-### `users` — Tài khoản
+## Ràng buộc chính
 
-Lưu thông tin mỗi tài khoản một lần. Bài không làm nhiều thiết bị nên identity public key gắn với user; các prekey nhiều chiếc được tách sang bảng riêng.
+- `external_id` duy nhất; message còn có unique `(thread_id, seq)`. Client sinh message UUID cho retry; system message dùng UUID PostgreSQL.
+- Participant có unique `(thread_id, user_id, joined_seq)` và tối đa một membership đang hoạt động cho mỗi cặp thread/user.
+- Khoảng membership gồm cả mốc thêm/rời. Read marker bắt đầu ở `joined_seq - 1`, chỉ tăng và không vượt `threads.last_seq` qua API.
+- Direct có tên NULL và chỉ dùng E2EE; group có tên không rỗng và chỉ dùng plaintext. Chống trùng cặp direct bằng khóa user trong repository, không có unique index cặp user trên `threads`. Repository kiểm tra `content_format` theo loại thread trước khi lưu tin mới.
+- `metadata` mặc định `{}` trong các đường ghi hiện tại; envelope `epoch_id`/`recipient_id`/`nonce`/`ciphertext` nằm trong `content`. Bootstrap X3DH được lưu riêng trong `e2ee_epochs`.
+- Prekey có unique `(user_id, key_id)` với ID dương và bị xóa khi claim. Public IK/SPK và chữ ký SPK nằm trong bundle gốc; private IK/SPK/20 OPK nằm trong account vault mã hóa. Bundle/vault không thay đổi khi public OPK bị tiêu thụ.
+- Epoch có unique `(thread_id, id)`. FK ghép `(thread_id, epoch_id)` của message và `(id, current_epoch_id)` của thread bảo đảm không tham chiếu epoch thuộc thread khác.
+- Message plaintext có `epoch_id=NULL`; `e2ee_v2` bắt buộc có epoch. Backend còn kiểm tra recipient là peer và hai bên đúng membership direct.
+- Tạo epoch/current pointer/backup sender cùng transaction. Backup riêng được ghi một lần; giữ epoch cũ để giải mã lịch sử. Server lưu private keys và SK dưới dạng ciphertext, không nhận khóa dạng rõ.
 
-| Tên cột | Kiểu dữ liệu | Giải thích |
-|---|---|---|
-| `id` (PK) | `BIGINT` | ID nội bộ của tài khoản, dùng để liên kết với các bảng khác. |
-| `external_id` (UK) | `UUID` | ID công khai dùng qua API; không đưa ID số tự tăng ra ngoài. |
-| `username` (UK) | `TEXT` | Tên đăng nhập; phải duy nhất sau khi chuẩn hóa. |
-| `password_hash` | `TEXT` | Mật khẩu đã băm bằng bcrypt. Không lưu mật khẩu gốc và không trả trường này qua API. |
-| `identity_public_key` (NULL) | `BYTEA` | Khóa định danh công khai phục vụ E2EE; chưa đăng ký E2EE thì để NULL. Khóa riêng chỉ ở client. |
-| `last_prekey_id` | `BIGINT` | Key ID lớn nhất đã được chấp nhận, mặc định 0. Dùng với quy tắc upload để chặn cấp lại khóa cũ đã bị xóa. |
-| `created_at` | `TIMESTAMPTZ` | Thời điểm tạo tài khoản. |
-
-### `threads` — Cuộc trò chuyện
-
-Tập hợp metadata và lịch sử của một cuộc trò chuyện. Thành viên direct thread chỉ được lưu ở `participants`, không lặp lại cặp user trong `threads`.
-
-| Tên cột | Kiểu dữ liệu | Giải thích |
-|---|---|---|
-| `id` (PK) | `BIGINT` | ID nội bộ của cuộc trò chuyện. |
-| `external_id` (UK) | `UUID` | ID cuộc trò chuyện dùng qua API. |
-| `kind` | `TEXT` | Loại cuộc trò chuyện: direct (1-1) hoặc group (nhóm). |
-| `name` (NULL) | `TEXT` | Tên nhóm, bắt buộc không rỗng với group. Thread direct để NULL. |
-| `created_by` (FK) | `BIGINT` | Tham chiếu users.id: người tạo thread. Quyền hiện tại được xác định bằng participants.role. |
-| `encryption_mode` | `TEXT` | plaintext hoặc e2ee. Trong phạm vi đề, group chỉ dùng plaintext. |
-| `last_seq` | `BIGINT` | Thứ tự tin cuối đã lưu trong thread, mặc định 0. Việc tăng mốc và ghi tin phải nằm trong cùng transaction. |
-| `created_at` | `TIMESTAMPTZ` | Thời điểm tạo cuộc trò chuyện. |
-
-### `participants` — Thành viên và mốc đọc
-
-Một user tham gia nhiều thread; mỗi người có quyền và mốc đọc riêng. Lưu từng đợt để không mất ranh giới quyền xem khi rời rồi được thêm lại nhóm.
-
-| Tên cột | Kiểu dữ liệu | Giải thích |
-|---|---|---|
-| `id` (PK) | `BIGINT` | ID một đợt tham gia. Nếu rời rồi vào lại nhóm, tạo dòng mới để giữ lịch sử quyền truy cập. |
-| `thread_id` (FK) | `BIGINT` | Tham chiếu threads.id: cuộc trò chuyện được tham gia. |
-| `user_id` (FK) | `BIGINT` | Tham chiếu users.id: người tham gia. |
-| `role` | `TEXT` | Vai trò admin hoặc member. Direct dùng member; người tạo nhóm ban đầu là admin. |
-| `joined_seq` | `BIGINT` | Sequence đầu tiên được phép xem, tính cả mốc này. Direct bắt đầu ở 1; đây là ranh giới, không phải FK tới message. |
-| `left_seq` (NULL) | `BIGINT` | Sequence cuối cùng được phép xem, tính cả mốc này. NULL nếu vẫn đang tham gia. |
-| `last_read_seq` | `BIGINT` | Đã đọc đến đâu trong đợt tham gia này. Ban đầu bằng joined_seq - 1; cập nhật chỉ tiến lên. |
-| `joined_at` | `TIMESTAMPTZ` | Thời điểm tham gia. |
-| `left_at` (NULL) | `TIMESTAMPTZ` | Thời điểm rời hoặc bị xóa khỏi nhóm. Cùng NULL hoặc cùng có giá trị với left_seq. |
-
-### `messages` — Tin nhắn
-
-Tin người dùng và tin hệ thống dùng chung lịch sử, cùng thứ tự seq. Người nhận được xác định qua participants, nên không cần một receiver_id cố định.
-
-| Tên cột | Kiểu dữ liệu | Giải thích |
-|---|---|---|
-| `id` (PK) | `BIGINT` | ID nội bộ của tin nhắn. |
-| `external_id` (UK) | `UUID` | ID công khai và khóa retry toàn cục. Client sinh trước mỗi lần gửi logic, dùng lại khi retry; tin hệ thống về sau có thể dùng UUID mặc định do server/PostgreSQL sinh. |
-| `thread_id` (FK) | `BIGINT` | Tham chiếu threads.id: cuộc trò chuyện chứa tin. |
-| `sender_id` (FK) | `BIGINT` | Tham chiếu users.id: người gửi; với tin hệ thống là người thực hiện hành động. |
-| `seq` | `BIGINT` | Thứ tự trong thread, bắt đầu từ 1; dùng sắp lịch sử, cursor và mốc đọc. |
-| `kind` | `TEXT` | text: tin người dùng. system: thông báo do backend tạo, ví dụ thêm hoặc xóa thành viên. |
-| `content_format` | `TEXT` | plaintext hoặc e2ee_v1. Phải phù hợp chế độ thread; tin system dùng plaintext. |
-| `content` | `TEXT` | Văn bản hoặc ciphertext biểu diễn dưới dạng Base64. Với E2EE, không lưu bản rõ trong trường này. |
-| `metadata` | `JSONB` | JSON object, mặc định {}. Chứa dữ liệu sự kiện hoặc header công khai như nonce, mã phiên, ID prekey; không chứa bí mật. |
-| `created_at` | `TIMESTAMPTZ` | Thời điểm lưu tin, phục vụ hiển thị. Thứ tự trong thread được quyết định bởi seq. |
-
-### `prekeys` — Khóa công khai đăng trước
-
-Một user có nhiều khóa với vòng đời khác nhau. Client khác lấy public keys đã đăng trước để thiết lập phiên E2EE ngay cả khi người nhận offline.
-
-| Tên cột | Kiểu dữ liệu | Giải thích |
-|---|---|---|
-| `id` (PK) | `BIGINT` | ID dòng dữ liệu do server cấp. |
-| `user_id` (FK) | `BIGINT` | Tham chiếu users.id: chủ sở hữu khóa. |
-| `key_id` | `BIGINT` | Mã khóa dương do client cấp; giúp client người nhận tìm đúng khóa riêng tương ứng. |
-| `kind` | `TEXT` | signed: prekey có chữ ký. one_time: prekey chỉ được server cấp tối đa một lần. |
-| `public_key` | `BYTEA` | Phần khóa công khai thực tế; không lưu khóa riêng. |
-| `signature` (NULL) | `BYTEA` | Chữ ký của signed prekey, bắt buộc với kind=signed; one_time để NULL. |
-| `created_at` | `TIMESTAMPTZ` | Thời điểm upload khóa. |
-| `retired_at` (NULL) | `TIMESTAMPTZ` | Signed prekey đã nghỉ: không cấp cho bundle mới. NULL nếu chưa nghỉ; one_time luôn NULL và bị xóa khi cấp. |
+Transaction và quyền truy cập: [luồng xử lý](request-flow.md). Envelope: [X3DH](e2ee-sequence.md).

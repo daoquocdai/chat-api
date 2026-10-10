@@ -275,7 +275,6 @@ select { min-width: 0; flex: 1; }
 .e2ee-actions { display: flex; flex-direction: column; gap: 7px; }
 .e2ee-actions button { text-align: left; padding: 8px 10px; font-size: 0.85rem; }
 .key-hint { color: #64748b; font-size: 0.82rem; overflow-wrap: anywhere; }
-.fingerprint { font: 0.75rem ui-monospace, monospace; overflow-wrap: anywhere; color: #475569; }
 #e2ee-status[data-status="error"] { color: #9a3412; }
 #e2ee-status[data-status="ready"] { color: #166534; }
 .message.crypto-error { border: 1px solid #e09a72; }

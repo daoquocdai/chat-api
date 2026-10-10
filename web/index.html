@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Mini-Hermes</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=20261010-ui">
 </head>
 <body>
   <main class="app">
@@ -22,7 +22,7 @@
     <section id="auth-view" class="auth-grid">
       <form id="register-form" class="card">
         <h2>Đăng ký</h2>
-        <label for="register-username">Username</label>
+        <label for="register-username">Tên tài khoản</label>
         <input id="register-username" name="username" autocomplete="username" required>
 
         <label for="register-password">Mật khẩu</label>
@@ -33,7 +33,7 @@
 
       <form id="login-form" class="card">
         <h2>Đăng nhập</h2>
-        <label for="login-username">Username</label>
+        <label for="login-username">Tên tài khoản</label>
         <input id="login-username" name="username" autocomplete="username" required>
 
         <label for="login-password">Mật khẩu</label>
@@ -49,22 +49,18 @@
           <span>Đang đăng nhập</span>
           <strong id="current-username"></strong>
         </div>
-        <section id="e2ee-panel" class="conversation-section" aria-labelledby="e2ee-heading">
-          <h2 id="e2ee-heading">Chat mã hóa</h2>
-          <p id="e2ee-status" role="status" data-status="initializing">Đang khôi phục khóa.</p>
-          <p class="key-hint">Đăng nhập bằng cùng mật khẩu để đọc lịch sử trên thiết bị khác. Bạn có thể dùng nhiều tab cùng lúc.</p>
-          <p id="e2ee-fingerprint" class="fingerprint"></p>
+        <section id="e2ee-panel" class="conversation-section" aria-label="Tình trạng gửi tin" hidden>
+          <p id="e2ee-status" role="status" data-status="initializing">Đang chuẩn bị chat...</p>
           <div id="e2ee-pending" hidden>
             <p id="e2ee-pending-info" class="key-hint"></p>
             <div id="e2ee-pending-list" class="e2ee-actions"></div>
           </div>
         </section>
         <section class="conversation-section" aria-labelledby="direct-heading">
-          <h2 id="direct-heading">Chat 1-1 · E2EE</h2>
+          <h2 id="direct-heading">Chat 1-1</h2>
           <div id="direct-thread-list" class="peer-list"></div>
           <div id="new-direct-section">
             <h3>Mở chat mới</h3>
-            <p class="key-hint">Chat 1-1 luôn dùng mã hóa đầu cuối.</p>
             <div id="peer-list" class="peer-list"></div>
           </div>
         </section>
@@ -78,7 +74,7 @@
             <label>Thành viên</label>
             <div id="group-users" class="group-users"></div>
             <button id="create-group-button" type="submit">Tạo nhóm</button>
-            <button id="recover-group-button" class="secondary" type="button" hidden>Đối chiếu nhóm đã tạo</button>
+            <button id="recover-group-button" class="secondary" type="button" hidden>Mở lại nhóm đã tạo</button>
           </form>
         </section>
       </aside>
@@ -89,8 +85,7 @@
             <span>Cuộc trò chuyện</span>
             <h2 id="peer-name">Chọn cuộc trò chuyện</h2>
             <p id="thread-status"></p>
-            <p id="peer-fingerprint" class="fingerprint" hidden></p>
-            <button id="e2ee-decrypt-retry" class="secondary" type="button" hidden>Thử giải mã lại tin đang lỗi</button>
+            <button id="e2ee-decrypt-retry" class="secondary" type="button" hidden>Thử lại</button>
           </div>
           <button id="members-button" class="secondary" type="button" hidden>Thành viên</button>
         </div>
@@ -131,6 +126,6 @@
   <script src="/e2ee-state.js?v=20261009-v2" defer></script>
   <script src="/e2ee.js?v=20261009-v2" defer></script>
   <script src="/realtime-core.js?v=20261009-v2" defer></script>
-  <script src="/app.js?v=20261009-v2" defer></script>
+  <script src="/app.js?v=20261010-ui" defer></script>
 </body>
 </html>

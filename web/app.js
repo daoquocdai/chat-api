@@ -42,16 +42,15 @@ const addMemberForm = document.querySelector("#add-member-form");
 const addMemberUser = document.querySelector("#add-member-user");
 const addMemberButton = document.querySelector("#add-member-button");
 const leaveButton = document.querySelector("#leave-button");
+const e2eePanel = document.querySelector("#e2ee-panel");
 const e2eeStatus = document.querySelector("#e2ee-status");
-const e2eeFingerprint = document.querySelector("#e2ee-fingerprint");
 const e2eePending = document.querySelector("#e2ee-pending");
 const e2eePendingInfo = document.querySelector("#e2ee-pending-info");
 const e2eePendingList = document.querySelector("#e2ee-pending-list");
-const peerFingerprint = document.querySelector("#peer-fingerprint");
 const e2eeDecryptRetry = document.querySelector("#e2ee-decrypt-retry");
 const e2eeLabels = {
-  initializing: "Đang khôi phục khóa.", ready: "Chat mã hóa sẵn sàng.",
-  error: "Không thể khôi phục khóa. Vui lòng đăng nhập lại.",
+  initializing: "Đang chuẩn bị chat...", ready: "Đã mã hóa đầu cuối.",
+  error: "Chưa thể mở cuộc trò chuyện. Vui lòng đăng nhập lại.",
 };
 
 const state = {
@@ -73,7 +72,29 @@ function showNotice(message) {
   noticeElement.textContent = message;
   noticeElement.hidden = !message;
 }
+function errorMessage(error) {
+  switch (error?.details?.error) {
+    case "invalid username or password": return "Tên tài khoản hoặc mật khẩu không đúng.";
+    case "username already exists": return "Tên tài khoản đã được sử dụng.";
+    case "user not found": return "Không tìm thấy tài khoản.";
+    case "username must contain between 1 and 50 Unicode characters and cannot contain NUL":
+      return "Tên tài khoản cần có từ 1 đến 50 ký tự hợp lệ.";
+    case "group name must contain between 1 and 100 Unicode characters and cannot contain NUL":
+      return "Tên nhóm cần có từ 1 đến 100 ký tự hợp lệ.";
+    case "a group supports at most 100 active members": return "Nhóm chỉ có thể có tối đa 100 thành viên.";
+  }
+  switch (error?.status) {
+    case 400: return "Thông tin chưa hợp lệ. Vui lòng kiểm tra lại.";
+    case 401: return "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.";
+    case 403: return "Bạn không có quyền thực hiện thao tác này.";
+    case 404: return "Không tìm thấy dữ liệu cần tải.";
+    case 409: return "Chưa thể thực hiện thao tác này. Vui lòng tải lại cuộc trò chuyện và thử lại.";
+    case 413: return "Nội dung quá dài. Vui lòng rút ngắn rồi thử lại.";
+  }
+  return "Chưa thể hoàn tất thao tác. Vui lòng thử lại.";
+}
 function showError(message) {
+  if (typeof message !== "string") message = errorMessage(message);
   errorElement.textContent = message;
   errorElement.hidden = !message;
 }
@@ -97,9 +118,10 @@ function canSendE2EE(cache) {
 }
 function renderE2EEPanel() {
   const local = state.e2ee?.snapshot() || { status: "initializing", pending: [] };
+  e2eePanel.hidden = local.status === "ready" && local.pending.length === 0;
+  e2eeStatus.hidden = local.status === "ready";
   e2eeStatus.dataset.status = local.status;
-  e2eeStatus.textContent = `${e2eeLabels[local.status] || e2eeLabels.error}${local.error ? " " + local.error : ""}`;
-  e2eeFingerprint.textContent = local.own_fingerprint ? `Fingerprint: ${local.own_fingerprint}` : "";
+  e2eeStatus.textContent = e2eeLabels[local.status] || e2eeLabels.error;
   e2eePending.hidden = local.pending.length === 0;
   e2eePendingInfo.textContent = `${local.pending.length} tin chưa được xác nhận.`;
   e2eePendingList.replaceChildren();
@@ -154,19 +176,14 @@ function renderThreadHeading() {
   peerName.textContent = thread ? threadTitle(thread) : "Chọn cuộc trò chuyện";
   const group = thread?.kind === "group";
   threadStatus.textContent = group
-    ? !cache.active ? "Bạn đã rời hoặc bị xóa khỏi nhóm; chỉ xem lịch sử đã được cấp quyền."
-      : cache.permissionsPending ? "Đang đối chiếu thành viên và quyền..."
+    ? !cache.active ? "Bạn không còn trong nhóm này."
+      : cache.permissionsPending ? "Đang cập nhật nhóm..."
       : `${thread.member_count} thành viên · ${thread.role === "admin" ? "Quản trị viên" : "Thành viên"}`
     : thread?.kind === "direct" || hasEncryptedMessages(cache)
-      ? `E2EE · ${e2eeLabels[state.e2ee?.snapshot().status] || e2eeLabels.initializing}`
+      ? e2eeLabels[state.e2ee?.snapshot().status] || e2eeLabels.initializing
       : "";
   membersButton.hidden = !group || !cache.active;
   if (!group || !cache.active) membersPanel.hidden = true;
-  const local = state.e2ee?.snapshot();
-  const pin = local?.peer_pins?.[thread?.peer?.id];
-  peerFingerprint.hidden = thread?.kind !== "direct";
-  peerFingerprint.textContent = thread?.kind === "direct"
-    ? `Peer UUID ${thread.peer?.id || "chưa rõ"}\nFingerprint IK: ${pin?.fingerprint || "chưa biết — đối chiếu qua kênh tin cậy khi đã có pin"}` : "";
   e2eeDecryptRetry.hidden = !cache || ![...cache.decryptedViews.values()].some((view) => view.status === "error");
   e2eeDecryptRetry.disabled = !state.e2ee?.canRead();
   updateSendButton();
@@ -277,9 +294,7 @@ function clearSession() {
   groupThreadList.replaceChildren();
   newDirectSection.hidden = true;
   groupUsers.replaceChildren();
-  peerFingerprint.textContent = "";
-  peerFingerprint.hidden = true;
-  e2eeFingerprint.textContent = "";
+  e2eePanel.hidden = true;
   e2eePending.hidden = true;
   e2eePendingInfo.textContent = "";
   e2eePendingList.replaceChildren();
@@ -538,7 +553,7 @@ async function loadThreads(catchUpCached = false) {
         state.threadListCatchup = false;
       } while (state.threadListDirty && currentSessionMatches(sessionVersion, token));
     } catch (error) {
-      if (currentSessionMatches(sessionVersion, token)) showError(error.message);
+      if (currentSessionMatches(sessionVersion, token)) showError(error);
     } finally {
       if (state.threadListRequest === request) state.threadListRequest = null;
     }
@@ -550,7 +565,7 @@ function displayName(userID) {
   if (userID === state.currentUserID) {
     return state.currentUsername;
   }
-  return peerByID(userID)?.username || "unknown";
+  return peerByID(userID)?.username || "Người dùng";
 }
 
 function mergeMessages(cache, messages) {
@@ -568,7 +583,7 @@ function mergeMessages(cache, messages) {
   } catch (error) {
     cache.payloadConflict = true;
     if (state.currentCache === cache) {
-      showError(error.message);
+      showError(error);
       renderMessages("preserve");
     }
     throw error;
@@ -653,8 +668,8 @@ function renderMessages(scrollMode = "preserve") {
       item.dataset.cryptoState = cryptoState;
       if (encrypted) item.classList.add(cryptoState === "error" ? "crypto-error" : cryptoState === "ready" ? "crypto-ready" : "crypto-pending");
       content.textContent = !encrypted ? message.content : cryptoState === "ready" ? view.plaintext
-        : cryptoState === "error" ? `Không thể giải mã: ${cache.payloadConflict ? "UUID hoặc payload bị xung đột." : view?.error || "Thiếu khóa hoặc state chưa lưu thành công."}`
-        : `Tin nhắn E2EE đang chờ giải mã. ${e2eeLabels[state.e2ee?.snapshot().status] || "Đang khởi tạo."}`;
+        : cryptoState === "error" ? "Không thể đọc tin nhắn. Hãy thử lại."
+        : "Đang tải tin nhắn...";
 
       const meta = document.createElement("small");
       const time = new Date(message.created_at).toLocaleString("vi-VN", {
@@ -720,7 +735,7 @@ async function loadInitialHistory(cache = state.currentCache) {
       const target = Math.max(highestMessageSeq(cache), Number(cache.summary?.last_seq || 0));
       if (target > cache.syncedSeq) await catchUpConversation(cache, target);
     } catch (error) {
-      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error);
     } finally {
       if (cache.initialHistoryRequest === request) cache.initialHistoryRequest = null;
     }
@@ -754,7 +769,7 @@ async function catchUpConversation(cache = state.currentCache, targetSeq = 0) {
       completed = true;
       if (state.currentCache === cache) renderMessages("new");
     } catch (error) {
-      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error.message);
+      if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) showError(error);
     } finally {
       if (cache.catchupRequest !== request) return;
       cache.catchupRequest = null;
@@ -986,7 +1001,7 @@ async function connectWebSocket() {
       clearSocketHealthTimer();
       state.socketConnecting = false;
       state.socketSummaryStale = true;
-      showError(error.message);
+      showError(error);
       scheduleReconnect(generation, sessionVersion, token);
     }
   }
@@ -1015,7 +1030,7 @@ async function loadOlderMessages() {
     }
   } catch (error) {
     if (membershipSnapshotMatches(snapshot) && state.currentCache === cache) {
-      showError(error.message);
+      showError(error);
     }
   } finally {
     if (cache.olderRequest === request) {
@@ -1098,7 +1113,7 @@ async function sendE2EEFromForm() {
     }
   } catch (error) {
     if (membershipSnapshotMatches(snapshot) && state.currentCache === cache && state.e2ee === client) {
-      showError(`${error.message} Nếu tin đã được mã hóa, dùng Gửi lại trong danh sách tin chưa xác nhận.`);
+      showError(`${errorMessage(error)} Dùng Gửi lại trong danh sách tin chưa xác nhận.`);
     }
   } finally {
     cache.e2eeSending = false;
@@ -1113,7 +1128,7 @@ async function runE2EEAction(work) {
   const sessionVersion = state.sessionVersion, token = state.token;
   showError("");
   try { await work(client); }
-  catch (error) { if (currentSessionMatches(sessionVersion, token)) showError(error.message); }
+  catch (error) { if (currentSessionMatches(sessionVersion, token)) showError(error); }
   finally {
     if (currentSessionMatches(sessionVersion, token) && state.e2ee === client) {
       renderE2EEPanel();
@@ -1180,7 +1195,7 @@ async function flushReadMarker(snapshot = conversationSnapshot()) {
       cache.pendingReadSeq = Math.max(cache.pendingReadSeq, target);
     }
     if (cacheSnapshotMatches(snapshot) && error.status === 403) void loadThreads();
-    if (currentConversationMatches(snapshot)) showError(error.message);
+    if (currentConversationMatches(snapshot)) showError(error);
   } finally {
     if (cache.readRequest === request) {
       cache.readRequest = null;
@@ -1221,7 +1236,7 @@ async function openDirect(peerID) {
   const cached = directThreadForPeer(peerID);
   if (cached) return openThread(cached.threadID);
   if (!state.e2ee?.canRead()) {
-    showError("Vui lòng đợi khôi phục khóa tài khoản trước khi mở chat.");
+    showError("Đang chuẩn bị cuộc trò chuyện. Vui lòng đợi một chút.");
     return;
   }
   if (state.currentCache) state.currentCache.draftContent = contentInput.value;
@@ -1246,7 +1261,7 @@ async function openDirect(peerID) {
     renderPeerList();
     if (version === state.conversationVersion) await openThread(thread.id);
   } catch (error) {
-    if (version === state.conversationVersion && currentSessionMatches(sessionVersion, token)) showError(error.message);
+    if (version === state.conversationVersion && currentSessionMatches(sessionVersion, token)) showError(error);
   }
 }
 
@@ -1296,7 +1311,7 @@ async function loadMembers(cache = state.currentCache) {
     } catch (error) {
       if (!cacheSnapshotMatches(snapshot)) return;
       if (error.status === 403) void loadThreads();
-      if (state.currentCache === cache) showError(error.message);
+      if (state.currentCache === cache) showError(error);
     } finally {
       if (cache.membersRequest === request) cache.membersRequest = null;
       if (cacheSnapshotMatches(snapshot) && cache.active && cache.membersDirty &&
@@ -1328,9 +1343,9 @@ async function changeMembership(cache, action, userID = "") {
   } catch (error) {
     if (!cacheSnapshotMatches(snapshot)) return;
     if (error.status === 503 && error.details?.thread_id) {
-      showNotice("Thay đổi thành viên đã lưu; realtime chưa được xác nhận. Đang đối chiếu trạng thái.");
+      showNotice("Thay đổi đã được lưu. Đang cập nhật nhóm...");
       void catchUpConversation(cache, Number(error.details.seq || 0));
-    } else if (state.currentCache === cache) showError(error.message);
+    } else if (state.currentCache === cache) showError(error);
   } finally {
     if (cache.memberMutation === request) cache.memberMutation = null;
     if (cacheSnapshotMatches(snapshot)) {
@@ -1354,10 +1369,10 @@ async function recoverCreatedGroup(creation) {
     recoverGroupButton.hidden = true;
     groupForm.reset();
     if (creation.conversationVersion === state.conversationVersion) await openThread(creation.threadID);
-    if (currentSessionMatches(sessionVersion, token)) showNotice("Nhóm đã được lưu. Đã đối chiếu và mở nhóm; không tạo lại nhóm.");
+    if (currentSessionMatches(sessionVersion, token)) showNotice("Đã mở nhóm.");
   } else {
     showNotice(creation.threadID
-      ? `Nhóm đã lưu với ID ${creation.threadID}. Chưa đối chiếu được; bấm Đối chiếu nhóm đã tạo khi API hoạt động lại.`
+      ? "Nhóm đã được lưu. Bấm Mở lại nhóm đã tạo để thử lại."
       : "Chưa xác nhận kết quả tạo nhóm. Hãy kiểm tra danh sách nhóm trước khi tải lại trang và tạo nhóm khác.");
     recoverGroupButton.hidden = false;
   }
@@ -1394,7 +1409,7 @@ groupForm.addEventListener("submit", async (event) => {
     } else {
       state.groupCreation = null;
       createGroupButton.disabled = false;
-      showError(error.message);
+      showError(error);
     }
   }
 });
@@ -1469,7 +1484,7 @@ async function finishLogin(username, credential, expectedVersion) {
   catch (error) {
     if (currentSessionMatches(version, token)) {
       clearSession();
-      showError(error.message);
+      showError(error);
     }
   }
 }
@@ -1496,7 +1511,7 @@ registerForm.addEventListener("submit", async (event) => {
     showNotice("Tài khoản đã được tạo. Đang đăng nhập...");
     await finishLogin(username, account, version);
   } catch (error) {
-    if (version === state.sessionVersion) showError(error.message);
+    if (version === state.sessionVersion) showError(error);
   } finally {
     registerForm.elements.password.value = "";
     setAuthBusy(false);
@@ -1510,7 +1525,7 @@ loginForm.addEventListener("submit", async (event) => {
   const username = MiniHermesE2EEClient.normalizeUsername(loginForm.elements.username.value);
   const password = loginForm.elements.password.value;
   setAuthBusy(true);
-  showError(""); showNotice("Đang đăng nhập và khôi phục khóa...");
+  showError(""); showNotice("Đang đăng nhập...");
   try {
     const params = await apiRequest("/auth/params?username=" + encodeURIComponent(username), {}, false);
     if (version !== state.sessionVersion) return;
@@ -1520,7 +1535,7 @@ loginForm.addEventListener("submit", async (event) => {
     await finishLogin(username, credential, version);
     if (state.currentUsername === username && state.e2ee?.canRead()) loginForm.reset();
   } catch (error) {
-    if (version === state.sessionVersion) showError(error.message);
+    if (version === state.sessionVersion) showError(error);
   } finally {
     loginForm.elements.password.value = "";
     setAuthBusy(false);
@@ -1582,7 +1597,7 @@ messageForm.addEventListener("submit", async (event) => {
     if (cacheSnapshotMatches(snapshot) && error.status === 403) void loadThreads();
     if (cacheSnapshotMatches(snapshot) && state.currentCache === cache) {
       showError(contentInput.value === pending.content
-        ? `${error.message} Tin chưa được xác nhận; bấm Gửi lại với nội dung cũ.`
+        ? `${errorMessage(error)} Tin chưa được xác nhận; bấm Gửi lại với nội dung cũ.`
         : pendingSendMismatchMessage);
     }
   } finally {
@@ -1650,7 +1665,7 @@ if (state.token && state.currentUserID === readSessionValue(sessionVaultUserKey)
   setAuthBusy(true);
   showNotice("Đang khôi phục phiên đăng nhập...");
   void restoreAuthenticatedSession().catch((error) => {
-    if (currentSessionMatches(version, token)) { clearSession(); showError(error.message); }
+    if (currentSessionMatches(version, token)) { clearSession(); showError(error); }
   }).finally(() => setAuthBusy(false));
 } else {
   clearSession();
